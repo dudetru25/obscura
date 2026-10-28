@@ -15,6 +15,7 @@ python3 -m venv .ci-python
 .ci-python/bin/python -m pip install --only-binary=:all: -r scripts/ci/render-requirements.txt
 export PYTHON_BIN="$PWD/.ci-python/bin/python"
 source scripts/ci/preflight.sh
+"$PYTHON_BIN" render-repros/capture-media-recording.py --chrome-bin "$CHROME_BIN" --out "$PWD/ci-output/media-chrome"
 # Keep Chrome's metric-sensitive reference fonts aligned with the embedded faces.
 export FONTCONFIG_FILE="$PWD/ci-output/fonts.conf"
 python3 - <<'FONTS' | tee ci-output/fonts.log
@@ -64,6 +65,7 @@ if (( suite_status != 0 )); then exit "$suite_status"; fi
 cargo build --locked --release -p obscura-cli --bins --features media
 export OBSCURA_BIN="$CARGO_TARGET_DIR/release/obscura"
 "$OBSCURA_BIN" --version
+"$PYTHON_BIN" render-repros/capture-media-recording.py --obscura-bin "$OBSCURA_BIN" --out "$PWD/ci-output/media-obscura"
 python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
 python3 - <<'CHECK'
 import json
