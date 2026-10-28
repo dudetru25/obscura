@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=js/media.js");
+    println!("cargo:rerun-if-changed=js/node_transfer.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -22,7 +23,8 @@ fn main() {
     let media_source = "";
     let bootstrap_source = include_str!("js/bootstrap.js")
         .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
-        .replace("/* MEDIA */", media_source);
+        .replace("/* MEDIA */", media_source)
+        .replace("/* NODE_TRANSFER */", include_str!("js/node_transfer.js"));
     let bootstrap_js = bootstrap_source.as_str();
 
     if is_cross {

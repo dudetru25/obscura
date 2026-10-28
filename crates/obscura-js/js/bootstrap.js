@@ -2452,8 +2452,8 @@ function _isDomNode(value) {
 // prototypes and numeric IDs are not ownership evidence: IDs belong to arenas.
 function _assertSameNativeTree(parent, node, method) {
   if (_cache.get(parent._nid) === parent && _cache.get(node._nid) === node) return;
-  const parentFrame = __obscuraCore.ops.op_node_creation_frame(parent);
-  const nodeFrame = __obscuraCore.ops.op_node_creation_frame(node);
+  const parentFrame = __obscuraCore.ops.op_node_owner_frame(parent);
+  const nodeFrame = __obscuraCore.ops.op_node_owner_frame(node);
   if (parentFrame < 0 || nodeFrame < 0 || parentFrame !== _realmFrameId || nodeFrame !== parentFrame) {
     throw _mutationError(method, "Cross-document adoption is not supported.", "WrongDocumentError", parent);
   }
@@ -2461,7 +2461,7 @@ function _assertSameNativeTree(parent, node, method) {
 function _assertInsertionNodes(context, nodes, method) {
   _assertSameNativeTree(context, context, method);
   for (const node of nodes) {
-    if (_isDomNode(node)) _assertSameNativeTree(context, node, method);
+    if (_isDomNode(node) && !_sameNativeTree(context, node)) _adoptionPlan(node);
   }
 }
 
@@ -2498,6 +2498,7 @@ function _mutationError(method, message, name, context) {
 
 function _isHostIncludingInclusiveAncestor(node, parent) {
   if (node === parent) return true;
+  if (!_sameNativeTree(node, parent)) return false;
   const type = node.nodeType;
   if (type !== 1 && type !== 9 && type !== 11) return false;
   // The native walk goes up from parent and through shadow hosts; leaves
@@ -2509,8 +2510,7 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 // (`replacing` true). Steps run in the spec's order because the order is
 // observable through which exception is thrown.
 function _ensureInsertionValidity(parent, node, child, method, replacing) {
-  _assertSameNativeTree(parent, node, method);
-  if (child !== null) _assertSameNativeTree(parent, child, method);
+  _assertSameNativeTree(parent, parent, method);
   const parentType = parent.nodeType;
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
     throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
@@ -2708,6 +2708,7 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
 // that still has a parent is removed from it first, which old-parent
 // observers see as a removal (adopt runs "remove" before inserting).
 function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  _adoptForInsertion(parent, node);
   _assertSameNativeTree(parent, node, method);
   if (node._shadowParent) {
     node._shadowParent.removeChild(node);
@@ -2760,6 +2761,7 @@ function _insertNode(parent, node, child, suppress, method) {
 
 function _preInsertNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, false);
+  _adoptForInsertion(parent, node);
   let reference = child;
   if (reference === node) reference = node.nextSibling;
   _insertNode(parent, node, reference, false, method);
@@ -2768,6 +2770,7 @@ function _preInsertNode(parent, node, child, method) {
 
 function _replaceChildNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, true);
+  _adoptForInsertion(parent, node);
   let reference = child.nextSibling;
   if (reference === node) reference = node.nextSibling;
   let previousSibling = child.previousSibling;
@@ -2793,6 +2796,7 @@ function _replaceChildNode(parent, node, child, method) {
 
 // "Replace all" (replaceChildren, textContent). `node` may be null.
 function _replaceAllChildren(parent, node, method) {
+  if (node !== null) _adoptForInsertion(parent, node);
   _assertSameNativeTree(parent, node === null ? parent : node, method);
   const removedNodes = Array.from(parent.childNodes);
   const observed = _hasMutationObservers();
@@ -2954,7 +2958,7 @@ class Node {
   }
   contains(o) {
     if (o === this) return true;
-    return o ? _dom("contains", this._nid, o._nid) === "true" : false;
+    return o && _sameNativeTree(this, o) ? _dom("contains", this._nid, o._nid) === "true" : false;
   }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
@@ -3027,7 +3031,8 @@ class Node {
       const order = own.compareDocumentPosition(target);
       return order & ~(ownAttr ? 16 : 0) & ~(otherAttr ? 8 : 0);
     }
-    if (this._nid === other._nid) return 0;
+    if (this === other) return 0;
+    if (!_sameNativeTree(this, other)) return 1 | 32 | (_nodeNativeFrame(this) < _nodeNativeFrame(other) ? 4 : 2);
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
     if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
@@ -3084,7 +3089,7 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this._nid === other._nid) return true;
+    if (this === other) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -3104,7 +3109,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return !!other && this._nid === other._nid; }
+  isSameNode(other) { return this === other; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -10940,10 +10945,11 @@ globalThis.MutationObserver = class MutationObserver {
     const existing = this._targets.find(registration => registration.target === target);
     if (existing) existing.options = init;
     else this._targets.push({ target, options: init });
-    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    _observeNodeOwner(this, target);
     if (!_mutationObserverRegistry.includes(this)) _mutationObserverRegistry.push(this);
   }
   disconnect() {
+    _disconnectNodeObservers(this);
     this._targets = [];
     this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
@@ -10988,8 +10994,8 @@ function _queueMutationRecord(type, target, init) {
       } else if (!options.childList) {
         continue;
       }
-      if (root !== target && root._nid !== target._nid) {
-        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
+      if (root !== target) {
+        if (!_sameNativeTree(root, target) || !options.subtree || !_isObservedAncestor(root, target)) continue;
       }
       if (oldValue) wantsOldValue = true;
       matched = true;
@@ -16352,7 +16358,7 @@ function _shadowRootForHost(host, includeClosed) {
   if (!includeClosed && parts[1] !== 'open') return null;
   const rootNid = +parts[0];
   let root = _cache.get(rootNid);
-  if (!(root instanceof ShadowRoot)) {
+  if (!root || root._host !== host) {
     root = new ShadowRoot(rootNid, host, { mode: parts[1] });
     _cache.set(rootNid, root);
   }
@@ -18196,7 +18202,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
     if (node.nodeType === 9 || node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
     }
-    const sourceFrame = __obscuraCore.ops.op_node_creation_frame(node);
+    const sourceFrame = __obscuraCore.ops.op_node_owner_frame(node);
     if (sourceFrame === _realmFrameId) return _stampNodeDocument(node.cloneNode(!!deep), this);
     const result = JSON.parse(__obscuraCore.ops.op_import_node(node, node._nid >>> 0, _realmFrameId, !!deep));
     if (result.error) throw new DOMException("The node cannot be imported into this document.", result.error);
@@ -18207,8 +18213,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   };
 }
 
-// Same-arena adoption keeps the wrapper and listener identity. Cross-arena
-// adoption must fail before removal until wrappers can route to their new owner.
+// Native adoption changes the owner while preserving the wrapper and listeners.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
   Document.prototype.adoptNode = function(node) {
     const method = _documentRealmMember(this, 'adoptNode');
@@ -18220,6 +18225,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
     if (node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
     }
+    if (!_sameNativeTree(this, node)) return _adoptAcrossDocuments(this, node);
     _assertSameNativeTree(this, node, "adoptNode");
     const parent = node.parentNode;
     if (parent) parent.removeChild(node);
@@ -18453,6 +18459,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
   };
 });
 
+/* NODE_TRANSFER */
+
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
@@ -18465,6 +18473,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['nodeAdoptionSource', _nodeAdoptionSource],
+  ['registerNodeObserver', _registerNodeObserver],
 ]));
 
 globalThis.__obscura_init = (function() {
@@ -19193,6 +19203,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
   }
 })();
+
+_installAdoptedNodeDispatch();
 
 (function _markBuiltinsNative() {
   var seen = new Set();
