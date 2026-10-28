@@ -12,8 +12,10 @@ cargo --version
 cargo nextest --version
 pkg-config --modversion vpx
 cargo nextest run --locked --release --features media -p obscura-js     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
-cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log
-cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log
+suite_status=0
+cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
+cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
+if (( suite_status != 0 )); then exit "$suite_status"; fi
 cargo build --locked --release -p obscura-cli --bins --features media
 export OBSCURA_BIN="$CARGO_TARGET_DIR/release/obscura"
 "$OBSCURA_BIN" --version
