@@ -296,13 +296,13 @@
   const createObjectURL = URL.createObjectURL;
   const revokeObjectURL = URL.revokeObjectURL;
   URL.createObjectURL = function(blob) {
-    const url = createObjectURL.call(this, blob);
+    const url = createObjectURL.apply(this, arguments);
     blobUrls.set(url, blob);
     return url;
   };
   URL.revokeObjectURL = function(url) {
     blobUrls.delete(String(url));
-    return revokeObjectURL.call(this, url);
+    return revokeObjectURL.apply(this, arguments);
   };
 
   class MediaError {
