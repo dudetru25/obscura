@@ -1,0 +1,8 @@
+# Existing render-repros harness dependencies, pinned for Jenkins.
+greenlet==3.2.4
+numpy==2.3.3
+pillow==11.3.0
+playwright==1.55.0
+pyee==13.0.0
+scipy==1.16.2
+typing_extensions==4.15.0
