@@ -4,7 +4,7 @@
 try {
     homelabPipeline(
         agentLabel: 'homelab-dev3-linux',
-        branch: 'fix/browser-api-compat',
+        branch: 'feat/media-playback',
         sourceRepository: 'https://github.com/dudetru25/obscura.git',
         scmCredentialId: scm.userRemoteConfigs[0].credentialsId,
         sourceRevisionParameter: 'SOURCE_SHA',
