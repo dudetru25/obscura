@@ -17,7 +17,16 @@ source_revision=$(git rev-parse HEAD)
 mkdir -p ci-output
 cargo --version
 cargo nextest --version
-pkg-config --modversion vpx
+# Use the archive beside the installed pkg-config metadata. Its libdir field
+# names /usr/lib, while this distro installs the archive in its multiarch directory.
+VPX_LIB_DIR=$(pkg-config --variable=pcfiledir vpx)
+[[ $VPX_LIB_DIR == /*/pkgconfig ]]
+VPX_LIB_DIR=${VPX_LIB_DIR%/pkgconfig}
+VPX_VERSION=$(pkg-config --modversion vpx)
+VPX_INCLUDE_DIR=$(pkg-config --variable=includedir vpx)
+[[ -f $VPX_LIB_DIR/libvpx.a && -s $VPX_LIB_DIR/libvpx.a && -r $VPX_LIB_DIR/libvpx.a ]]
+[[ $VPX_INCLUDE_DIR == /* && -r $VPX_INCLUDE_DIR/vpx/vpx_encoder.h ]]
+export VPX_LIB_DIR VPX_VERSION VPX_INCLUDE_DIR
 python3 -m venv .ci-python
 .ci-python/bin/python -m pip install --only-binary=:all: -r scripts/ci/render-requirements.txt
 export PYTHON_BIN="$PWD/.ci-python/bin/python"
@@ -60,15 +69,6 @@ for family, filename in [('Liberation Sans', 'liberation-sans.ttf'),
     if selected != expected:
         raise SystemExit(f'Reference font mismatch for {family}: expected {expected}')
 FONTS
-cargo nextest run --locked --release --features media     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work) | test(read_body_capped_) | test(textarea) | binary(textarea_semantics)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
-# Exercise the intermittent socket-close boundary repeatedly on the native worker.
-cargo nextest run --locked --release --features media -p obscura-js \
-    -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
-    2>&1 | tee ci-output/body-cap-stress.log
-suite_status=0
-cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
-cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
-if (( suite_status != 0 )); then exit "$suite_status"; fi
 cargo build --locked --release -p obscura-cli --bins --features media
 release_stage=$(mktemp -d "${TMPDIR:-/tmp}/obscura-release.XXXXXXXX")
 trap 'rm -r -- "$release_stage"' EXIT
@@ -98,6 +98,15 @@ tar --extract --gzip --file "$archive" --directory "$release_stage/extracted" --
 export OBSCURA_BIN="$release_stage/extracted/obscura"
 "$OBSCURA_BIN" --version
 "$PYTHON_BIN" render-repros/capture-media-recording.py --obscura-bin "$OBSCURA_BIN" --out "$PWD/ci-output/media-obscura"
+cargo nextest run --locked --release --features media     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work) | test(read_body_capped_) | test(textarea) | binary(textarea_semantics)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
+# Exercise the intermittent socket-close boundary repeatedly on the native worker.
+cargo nextest run --locked --release --features media -p obscura-js \
+    -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
+    2>&1 | tee ci-output/body-cap-stress.log
+suite_status=0
+cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
+cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
+if (( suite_status != 0 )); then exit "$suite_status"; fi
 python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
 python3 - <<'CHECK'
 import json
