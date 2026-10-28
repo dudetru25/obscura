@@ -8,6 +8,7 @@
   const streamStates = new WeakMap();
   const recorderStates = new WeakMap();
   const videoStates = new WeakMap();
+  const mediaRemovalObservers = new WeakMap();
   const blobUrls = new Map();
   const sources = new WeakMap();
   const trackKey = {};
@@ -320,6 +321,33 @@
   }
   globalThis.MediaError = MediaError;
 
+  function observeMediaRemovals(video) {
+    const document = video.ownerDocument;
+    if (!document || mediaRemovalObservers.has(document)) return;
+    const observer = new MutationObserver(records => {
+      const removed = new Set();
+      for (const record of records) {
+        for (const root of record.removedNodes) {
+          if (videoStates.has(root)) removed.add(root);
+          if (root.querySelectorAll) {
+            for (const element of root.querySelectorAll('video,audio')) {
+              if (videoStates.has(element)) removed.add(element);
+            }
+          }
+        }
+      }
+      if (!removed.size) return;
+      queue(() => {
+        for (const element of removed) {
+          if (element.isConnected) continue;
+          element.pause();
+          releaseSurface(element, videoStates.get(element));
+        }
+      });
+    });
+    observer.observe(document, { childList: true, subtree: true });
+    mediaRemovalObservers.set(document, observer);
+  }
   function videoState(video) {
     let state = videoStates.get(video);
     if (!state) {
@@ -327,8 +355,9 @@
         time: 0, anchor: 0, rate: 1, duration: NaN, width: 0, height: 0,
         frames: [], frame: -1, error: null, timer: null, load: null,
         volume: 1, muted: video.hasAttribute('muted'), seeking: false, queued: false,
-        needsLoad: false, decodedBytes: 0 };
+        needsLoad: false, decodedBytes: 0, surfaceReleased: true };
       videoStates.set(video, state);
+      observeMediaRemovals(video);
       video.addEventListener('keydown', event => {
         if (!event.isTrusted || event.defaultPrevented || event.key !== ' ' || !video.controls || document.activeElement !== video) return;
         event.preventDefault();
@@ -347,22 +376,30 @@
     }
     return source ? new URL(source, video.baseURI || location.href).href : '';
   }
+  function releaseSurface(video, state) {
+    __obscuraCore.ops.op_media_register_surface(video._nid >>> 0, 0, 0, new Uint8Array(), _realmFrameId);
+    state.surfaceReleased = true;
+  }
   function clearSurface(video, state) {
     state.frame = -1;
     delete video._ctx;
-    __obscuraCore.ops.op_media_register_surface(video._nid >>> 0, 0, 0, new Uint8Array(), _realmFrameId);
+    releaseSurface(video, state);
   }
   function paintFrame(video, state) {
     if (!state.frames.length) return;
     let index = 0;
     while (index + 1 < state.frames.length && state.frames[index + 1].time <= state.time * 1000) index++;
-    if (index === state.frame) return;
+    const needsSurface = !state.paused || video.isConnected;
+    if (index === state.frame && (!state.surfaceReleased || !needsSurface)) return;
     const bytes = state.frames[index].pixels;
-    if (!__obscuraCore.ops.op_media_register_surface(video._nid >>> 0, state.width, state.height, bytes, _realmFrameId)) {
+    // Detached paused elements still supply canvas pixels, without retaining
+    // a native paint surface or recreating one when currentTime is read.
+    if (needsSurface && !__obscuraCore.ops.op_media_register_surface(video._nid >>> 0, state.width, state.height, bytes, _realmFrameId)) {
       throw failure('The video frame exceeds the surface limit.', 'QuotaExceededError');
     }
     video._ctx = { _w: state.width, _h: state.height, _buf: bytes };
     state.frame = index;
+    if (needsSurface) state.surfaceReleased = false;
   }
   function synchronize(video, state) {
     if (!state.paused && state.ready >= 2) {
@@ -411,10 +448,13 @@
     if (bytes.length > MAX_BYTES) throw failure('The media resource exceeds the byte limit.', 'QuotaExceededError');
     return bytes;
   }
-  function loadVideo(video, force = false) {
+  function loadVideo(video, force = false, allowDefer = false) {
     const state = videoState(video);
     const source = selectedSource(video);
-    if (!force && !state.needsLoad && source === state.source && state.load) return state.load;
+    if (!force && !state.needsLoad && source === state.source && state.load) {
+      paintFrame(video, state);
+      return state.load;
+    }
     state.needsLoad = false;
     state.abort?.abort();
     clearTimeout(state.timer);
@@ -426,6 +466,11 @@
     clearSurface(video, state);
     const epoch = state.epoch;
     if (!source) { state.load = Promise.resolve(); return state.load; }
+    if (allowDefer && !video.autoplay && (video.getAttribute('preload') || '').toLowerCase() === 'none') {
+      state.network = 1;
+      state.load = null;
+      return Promise.resolve();
+    }
     state.abort = new AbortController();
     queue(() => { if (epoch === state.epoch) emit(video, 'loadstart'); });
     state.load = sourceBytes(source, state.abort.signal)
@@ -471,7 +516,7 @@
   HTMLMediaElement.prototype.canPlayType = function(type) {
     return String(type).trim() && supportedType(type) ? 'probably' : '';
   };
-  HTMLMediaElement.prototype.load = function() { loadVideo(this, true).then(undefined, () => {}); };
+  HTMLMediaElement.prototype.load = function() { loadVideo(this, true, true).then(undefined, () => {}); };
   HTMLMediaElement.prototype.play = function() {
     const video = this;
     const state = videoState(video);
@@ -560,12 +605,13 @@
   }
 
   _mediaAttributeChanged = (element, name) => {
-    if ((element.localName === 'video' || element.localName === 'audio') && (name === 'src' || name === 'children')) {
+    if ((element.localName === 'video' || element.localName === 'audio')
+        && (name === 'src' || name === 'children' || name === 'preload' || name === 'autoplay')) {
       const state = videoState(element);
       if (name === 'src') state.needsLoad = true;
       if (!state.queued) {
         state.queued = true;
-        queue(() => { state.queued = false; loadVideo(element).then(undefined, () => {}); });
+        queue(() => { state.queued = false; loadVideo(element, false, true).then(undefined, () => {}); });
       }
     } else if (element.localName === 'source' && (name === 'src' || name === 'type')) {
       const parent = element.parentElement;
