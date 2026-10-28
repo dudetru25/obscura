@@ -574,7 +574,10 @@
   };
   _mediaTreeChanged = root => {
     if (root.nodeType === 1 && (root.localName === 'video' || root.localName === 'audio')) _mediaAttributeChanged(root, 'children');
-    for (const element of root.querySelectorAll?.('video,audio') || []) _mediaAttributeChanged(element, 'children');
+    // Internal traversal must not resolve a public NodeList's realm: an iframe
+    // shim can be under construction and its defaultView would re-enter it.
+    const ids = _domParse('query_selector_all_scoped', root._nid, 'video,audio') || [];
+    for (const nid of ids) _mediaAttributeChanged(_wrapEl(nid), 'children');
     const parent = root.parentElement;
     if (parent && (parent.localName === 'video' || parent.localName === 'audio')) _mediaAttributeChanged(parent, 'children');
   };
