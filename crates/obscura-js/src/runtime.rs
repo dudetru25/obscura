@@ -15244,6 +15244,98 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_tracks_same_origin_iframe_targets_in_their_own_realm() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="local" style="width:75px;height:25px"></div>
+            </body></html>"#,
+        );
+        rt.set_viewport(300.0, 200.0);
+        rt.execute_script(
+            "observe-iframe-and-parent",
+            r#"
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<html><body><div id="foreign" style="width:120px;height:40px"></div></body></html>';
+                document.body.appendChild(frame);
+                globalThis.__localTarget = document.getElementById("local");
+                globalThis.__foreignTarget = frame.contentDocument.getElementById("foreign");
+                globalThis.__crossRealmRecords = [];
+                globalThis.__crossRealmIdentities = [];
+                globalThis.__crossRealmObserver = new ResizeObserver(function(entries, observer) {
+                    __crossRealmRecords.push(entries.map(entry => [
+                        entry.target.id, entry.contentRect.width, entry.contentRect.height,
+                    ]));
+                    __crossRealmIdentities.push(
+                        this === __crossRealmObserver && observer === __crossRealmObserver
+                        && entries.every(entry =>
+                            (entry.target === __localTarget || entry.target === __foreignTarget)
+                            && entry instanceof ResizeObserverEntry
+                            && entry.contentBoxSize[0] instanceof ResizeObserverSize
+                            && entry.borderBoxSize[0] instanceof ResizeObserverSize
+                            && entry.devicePixelContentBoxSize[0] instanceof ResizeObserverSize)
+                    );
+                });
+                __crossRealmObserver.observe(__localTarget);
+                __crossRealmObserver.observe(__foreignTarget);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords").unwrap(),
+            serde_json::json!([[["local", 75, 25], ["foreign", 120, 40]]])
+        );
+
+        for invalid in ["null", "{}", "document", "frame.contentDocument", "document.createTextNode('text')"] {
+            assert!(rt
+                .evaluate(&format!("__crossRealmObserver.observe({invalid})"))
+                .is_err());
+        }
+        assert!(rt
+            .evaluate("__crossRealmObserver.observe(__foreignTarget, {box:'invalid'})")
+            .is_err());
+        rt.evaluate("__foreignTarget.style.width = '200px'").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords").unwrap(),
+            serde_json::json!([
+                [["local", 75, 25], ["foreign", 120, 40]],
+                [["foreign", 200, 40]],
+            ])
+        );
+
+        rt.execute_script(
+            "unobserve-iframe-target",
+            "__crossRealmObserver.unobserve(__foreignTarget); \
+             __foreignTarget.style.width = '230px'; __localTarget.style.width = '90px';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords[2]").unwrap(),
+            serde_json::json!([["local", 90, 25]])
+        );
+        rt.evaluate("__crossRealmObserver.observe(__foreignTarget)").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords[3]").unwrap(),
+            serde_json::json!([["foreign", 230, 40]])
+        );
+        rt.execute_script(
+            "disconnect-cross-realm-observer",
+            "__crossRealmObserver.disconnect(); \
+             __foreignTarget.style.width = '250px'; __localTarget.style.width = '100px';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__crossRealmRecords.length, __crossRealmIdentities]").unwrap(),
+            serde_json::json!([4, [true, true, true, true]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn resize_observer_batches_unique_targets_into_one_native_layout_read() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">

@@ -9269,14 +9269,17 @@ globalThis.__resizeObservers = [];
 let _resizeRenderCheckpointPending = false;
 let _resizeRenderCheckpointRunning = false;
 let _resizeRenderCheckpointRerun = false;
-function _registerResizeObserver(observer) {
-  if (!globalThis.__resizeObservers.includes(observer)) {
-    globalThis.__resizeObservers.push(observer);
+function _roTargetView(target) {
+  return target.ownerDocument?.defaultView || globalThis;
+}
+function _registerResizeObserver(observer, view = globalThis) {
+  if (!view.__resizeObservers.includes(observer)) {
+    view.__resizeObservers.push(observer);
   }
 }
-function _unregisterResizeObserver(observer) {
-  const index = globalThis.__resizeObservers.indexOf(observer);
-  if (index >= 0) globalThis.__resizeObservers.splice(index, 1);
+function _unregisterResizeObserver(observer, view = globalThis) {
+  const index = view.__resizeObservers.indexOf(observer);
+  if (index >= 0) view.__resizeObservers.splice(index, 1);
 }
 function _scheduleResizeRenderCheckpoint() {
   if (!globalThis.__resizeObservers.length) return;
@@ -9356,10 +9359,11 @@ function _roNodeDepth(target) {
 }
 function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   let geometry = suppliedGeometry ?? null;
+  const view = _roTargetView(target);
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), view.__obscura_frameId >>> 0);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -9399,7 +9403,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
         // inline value so batching does not silently swap inline/block axes.
         writingMode: geometry.writingMode || target?.style?.writingMode || "",
       }
-    : getComputedStyle(target);
+    : view.getComputedStyle(target);
   const paddingTop = _roNumber(style.paddingTop);
   const paddingRight = _roNumber(style.paddingRight);
   const paddingBottom = _roNumber(style.paddingBottom);
@@ -9431,7 +9435,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   // Device-pixel content sizes snap the content edges, rather than merely
   // rounding a CSS size multiplied by DPR. Preserve that distinction for
   // fractional positions and dimensions.
-  const dpr = Math.max(0, Number(globalThis.devicePixelRatio) || 1);
+  const dpr = Math.max(0, Number(view.devicePixelRatio) || 1);
   const contentLeft = (Number(geometry.x) + borderLeft + paddingLeft) * dpr;
   const contentTop = (Number(geometry.y) + borderTop + paddingTop) * dpr;
   const deviceWidth = emptyInline ? 0 : Math.max(0,
@@ -9456,26 +9460,33 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
 
 function _roMeasurements(targets) {
   const measurements = new Map();
-  if (!targets.length) return measurements;
-  const bulk = __obscuraCore.ops.op_resize_observer_measurements;
-  if (typeof bulk === "function"
-      && targets.every(target => target?._nid != null)) {
-    try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
-      const geometries = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(geometries) && geometries.length === targets.length) {
-        for (let index = 0; index < targets.length; index++) {
-          measurements.set(
-            targets[index],
-            _roMeasurement(targets[index], geometries[index], true),
-          );
-        }
-        return measurements;
-      }
-    } catch (_error) {}
-  }
+  const frames = new Map();
   for (const target of targets) {
-    measurements.set(target, _roMeasurement(target));
+    const frameId = _roTargetView(target).__obscura_frameId >>> 0;
+    if (!frames.has(frameId)) frames.set(frameId, []);
+    frames.get(frameId).push(target);
+  }
+  const bulk = __obscuraCore.ops.op_resize_observer_measurements;
+  for (const [frameId, frameTargets] of frames) {
+    if (typeof bulk === "function"
+        && frameTargets.every(target => target?._nid != null)) {
+      try {
+        const raw = bulk(JSON.stringify(frameTargets.map(target => target._nid | 0)), frameId);
+        const geometries = raw ? JSON.parse(raw) : null;
+        if (Array.isArray(geometries) && geometries.length === frameTargets.length) {
+          for (let index = 0; index < frameTargets.length; index++) {
+            measurements.set(
+              frameTargets[index],
+              _roMeasurement(frameTargets[index], geometries[index], true),
+            );
+          }
+          continue;
+        }
+      } catch (_error) {}
+    }
+    for (const target of frameTargets) {
+      measurements.set(target, _roMeasurement(target));
+    }
   }
   return measurements;
 }
@@ -9511,6 +9522,7 @@ globalThis.ResizeObserver = class ResizeObserver {
     }
     this._callback = callback;
     this._targets = new Map();
+    this._realms = new Set();
     this._active = [];
     this._skipped = false;
   }
@@ -9552,13 +9564,27 @@ globalThis.ResizeObserver = class ResizeObserver {
       // Update before invoking callbacks. Callback-driven mutations are
       // compared against this delivery in the same bounded delivery cycle.
       observation.last = size.slice();
+      // A target realm can run this checkpoint. Expose entry sizes from the
+      // observer's realm even when its measurements came from another realm.
+      if (!(measurement.contentBoxSize[0] instanceof ResizeObserverSize)) {
+        const copySizes = sizes => sizes.map(size => new ResizeObserverSize(
+          _roConstructionKey, size.inlineSize, size.blockSize));
+        measurement = {
+          ...measurement,
+          contentRect: _ioRect(measurement.contentRect.x, measurement.contentRect.y,
+            measurement.contentRect.width, measurement.contentRect.height),
+          contentBoxSize: copySizes(measurement.contentBoxSize),
+          borderBoxSize: copySizes(measurement.borderBoxSize),
+          devicePixelContentBoxSize: copySizes(measurement.devicePixelContentBoxSize),
+        };
+      }
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
     this._active = [];
     try { this._callback.call(this, entries, this); } catch (_error) {}
   }
   observe(target, options = {}) {
-    if (!(target instanceof Element)) {
+    if (!_isDomNode(target) || target.nodeType !== 1) {
       throw new TypeError("ResizeObserver.observe requires an Element");
     }
     const box = options && options.box != null ? String(options.box) : "content-box";
@@ -9568,18 +9594,30 @@ globalThis.ResizeObserver = class ResizeObserver {
     }
     const current = this._targets.get(target);
     if (current && current.box === box) return;
-    this._targets.set(target, { box, last: null });
+    const view = _roTargetView(target);
+    this._targets.set(target, { box, last: null, view });
+    this._realms.add(view);
+    _registerResizeObserver(this, view);
     _registerResizeObserver(this);
     _scheduleResizeRenderCheckpoint();
   }
   unobserve(target) {
+    const observation = this._targets.get(target);
+    if (!observation) return;
     this._targets.delete(target);
+    const view = observation.view;
+    if (![...this._targets.values()].some(current => current.view === view)) {
+      this._realms.delete(view);
+      if (view !== globalThis) _unregisterResizeObserver(this, view);
+    }
     if (!this._targets.size) _unregisterResizeObserver(this);
   }
   disconnect() {
     this._targets.clear();
     this._active = [];
     this._skipped = false;
+    for (const view of this._realms) _unregisterResizeObserver(this, view);
+    this._realms.clear();
     _unregisterResizeObserver(this);
   }
 };
