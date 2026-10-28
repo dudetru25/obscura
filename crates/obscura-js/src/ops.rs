@@ -2112,6 +2112,8 @@ fn op_dom(
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
             if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            #[cfg(feature = "media")]
+            crate::media_ops::close_inactive(state);
             return "true".into();
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
@@ -2122,6 +2124,8 @@ fn op_dom(
                 if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
             }
             registry.cancel_inactive_frame_timers();
+            #[cfg(feature = "media")]
+            crate::media_ops::close_inactive(state);
             // The bootstrap unwraps this private mutation result before any
             // DOM caller sees it, and resets only the retired iframe identities.
             serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
@@ -7875,7 +7879,7 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 // Media jobs run outside the isolate. Serial admission bounds native codec
 // memory across pages without blocking the JavaScript event loop.
 #[cfg(feature = "media")]
-static MEDIA_JOB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub(crate) static MEDIA_JOB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 #[cfg(feature = "media")]
 #[op2]
@@ -7909,25 +7913,11 @@ async fn op_media_encode_webm(
 }
 
 #[cfg(feature = "media")]
-#[op2]
-#[buffer]
-async fn op_media_decode_webm(
-    #[buffer] bytes: JsBuffer,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    if bytes.is_empty() || bytes.len() > crate::media::MAX_BYTES {
-        return Err(deno_error::JsErrorBox::type_error("media_buffer_limit_exceeded"));
+pub(crate) fn release_media_surface(state: &mut ObscuraState, node: NodeId) {
+    state.canvas_surfaces.remove(&node);
+    if state.render_resources.set_video_dimensions(node, None) {
+        invalidate_render_resource_geometry(state);
     }
-    let permit = MEDIA_JOB.acquire().await
-        .map_err(|_| deno_error::JsErrorBox::generic("media_worker_unavailable"))?;
-    let mut input = Vec::new();
-    input.try_reserve_exact(bytes.len())
-        .map_err(|_| deno_error::JsErrorBox::generic("media_allocation_failed"))?;
-    input.extend_from_slice(&bytes);
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        crate::media::decode_webm(&input)
-    }).await.map_err(|_| deno_error::JsErrorBox::generic("media_worker_failed"))?;
-    result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
 }
 
 /// Video frames share the retained RGBA surface path with canvas. A 0x0 empty
@@ -7956,10 +7946,7 @@ fn op_media_register_surface(
             node.as_element().is_some_and(|name| name.local.as_ref() == "video")
         }) { return false; }
         if width == 0 && height == 0 && pixels.is_empty() {
-            state.canvas_surfaces.remove(&node);
-            if state.render_resources.set_video_dimensions(node, None) {
-                invalidate_render_resource_geometry(&mut state);
-            }
+            release_media_surface(&mut state, node);
             return true;
         }
         let Ok(expected) = crate::media::frame_bytes(width, height) else { return false; };
@@ -8077,7 +8064,9 @@ pub fn build_extension() -> Extension {
     #[cfg(feature = "media")]
     {
         ops.push(op_media_encode_webm());
-        ops.push(op_media_decode_webm());
+        ops.push(crate::media_ops::op_media_open());
+        ops.push(crate::media_ops::op_media_frame());
+        ops.push(crate::media_ops::op_media_close());
         ops.push(op_media_register_surface());
     }
     Extension {

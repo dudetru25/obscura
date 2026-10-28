@@ -5,6 +5,7 @@
 
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use vpx_sys as vpx;
 
@@ -13,7 +14,7 @@ pub(crate) const MAX_FRAMES: usize = 600;
 pub(crate) const MAX_DURATION_MS: f64 = 120_000.0;
 const MAX_DIMENSION: u32 = 4096;
 const MAX_PIXELS: usize = 4_194_304;
-const PACKED_HEADER: usize = 24;
+const DECODE_PACKET_BUDGET: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum MediaError {
@@ -37,6 +38,10 @@ pub(crate) enum MediaError {
     Decode,
     #[error("media_allocation_failed")]
     Allocation,
+    #[error("media_aborted")]
+    Cancelled,
+    #[error("media_frame_index_invalid")]
+    FrameIndex,
 }
 
 type Result<T> = std::result::Result<T, MediaError>;
@@ -406,7 +411,7 @@ fn cluster_end(body: &[u8], budget: &mut usize) -> Result<usize> {
     }
 }
 
-struct Frame<'a> { timestamp_ms: f64, bytes: &'a [u8] }
+struct Frame<'a> { timestamp_ms: f64, bytes: &'a [u8], visible: bool }
 
 fn block<'a>(body: &'a [u8], cluster_time: u64, scale_ns: u64, track: &VideoTrack,
     frames: &mut Vec<Frame<'a>>) -> Result<()> {
@@ -422,7 +427,7 @@ fn block<'a>(body: &'a [u8], cluster_time: u64, scale_ns: u64, track: &VideoTrac
         return Err(MediaError::Timestamps);
     }
     if frames.len() >= MAX_FRAMES { return Err(MediaError::FrameLimit); }
-    frames.push(Frame { timestamp_ms, bytes: &body[prefix + 3..] });
+    frames.push(Frame { timestamp_ms, bytes: &body[prefix + 3..], visible: body[prefix + 2] & 0x08 == 0 });
     Ok(())
 }
 
@@ -564,56 +569,147 @@ unsafe fn append_rgba(image: &vpx::vpx_image_t, output: &mut Vec<u8>, track: &Vi
     Ok(())
 }
 
-/// Return a compact buffer for JS playback: width/height/frame-count/reserved
-/// as four little-endian u32 values, f64 duration in milliseconds, then one
-/// f64 timestamp and width*height*4 RGBA bytes for every displayed frame.
-pub(crate) fn decode_webm(bytes: &[u8]) -> Result<Vec<u8>> {
-    let webm = demux_webm(bytes)?;
-    let frame_size = frame_bytes(webm.track.width, webm.track.height)?;
-    if (frame_size + 8).checked_mul(webm.frames.len()).and_then(|size| size.checked_add(PACKED_HEADER))
-        .is_none_or(|size| size > MAX_BYTES) { return Err(MediaError::BufferLimit); }
-    let mut output = vec![0u8; PACKED_HEADER];
-    let mut count = 0u32;
-    let (mut previous, mut step_ms) = (None, 1.0);
-    unsafe {
-        let config = vpx::vpx_codec_dec_cfg_t { threads: 1, w: webm.track.width, h: webm.track.height };
-        let mut context = std::mem::zeroed::<vpx::vpx_codec_ctx_t>();
-        if vpx::vpx_codec_dec_init_ver(&mut context, vpx::vpx_codec_vp8_dx(), &config, 0,
-            vpx::VPX_DECODER_ABI_VERSION as i32) != vpx::vpx_codec_err_t::VPX_CODEC_OK {
-            return Err(MediaError::Decode);
-        }
-        let mut codec = Codec(context);
+struct DecoderCodec {
+    context: Box<vpx::vpx_codec_ctx_t>,
+    // The public libvpx context retains config.dec. Keep its address stable
+    // even if a codec implementation does not copy the configuration internally.
+    _config: Box<vpx::vpx_codec_dec_cfg_t>,
+}
+
+// SAFETY: this wrapper exclusively owns its context/configuration and never
+// exposes an image pointer. It uses one codec thread, no application callbacks
+// or external buffers, and every libvpx call requires &mut self. Moving it
+// between blocking jobs cannot overlap codec access. It deliberately is not Sync.
+// libvpx's vpx_decoder.c dispatches through the owned context, with no caller
+// thread state; callers serialize initialization for non-multithread builds.
+unsafe impl Send for DecoderCodec {}
+
+impl DecoderCodec {
+    fn new(track: &VideoTrack) -> Result<Self> {
+        let config = Box::new(vpx::vpx_codec_dec_cfg_t { threads: 1, w: track.width, h: track.height });
+        let mut context = Box::new(unsafe { std::mem::zeroed::<vpx::vpx_codec_ctx_t>() });
+        let status = unsafe { vpx::vpx_codec_dec_init_ver(&mut *context, vpx::vpx_codec_vp8_dx(),
+            &*config, 0, vpx::VPX_DECODER_ABI_VERSION as i32) };
+        // libvpx cleans a failed initialization itself; only a successful
+        // context enters this Drop implementation.
+        if status != vpx::vpx_codec_err_t::VPX_CODEC_OK { return Err(MediaError::Decode); }
+        Ok(Self { context, _config: config })
+    }
+}
+
+impl Drop for DecoderCodec {
+    fn drop(&mut self) {
+        unsafe { vpx::vpx_codec_destroy(&mut *self.context); }
+    }
+}
+
+struct Packet {
+    range: std::ops::Range<usize>,
+    visible_index: Option<usize>,
+    keyframe: bool,
+}
+
+/// Owns compressed input and the bounded libvpx reference-frame set. RGBA is
+/// materialized only for the requested displayed frame, never for the whole clip.
+pub(crate) struct MediaDecoder {
+    input: Vec<u8>,
+    track: VideoTrack,
+    packets: Vec<Packet>,
+    displayed_packets: Vec<usize>,
+    timestamps: Vec<f64>,
+    duration_ms: f64,
+    codec: DecoderCodec,
+    cursor: usize,
+    current: Option<usize>,
+}
+
+impl MediaDecoder {
+    pub(crate) fn open(input: Vec<u8>) -> Result<Self> {
+        let webm = demux_webm(&input)?;
+        let mut packets = Vec::new();
+        let mut displayed_packets = Vec::new();
+        let mut timestamps = Vec::new();
+        packets.try_reserve_exact(webm.frames.len()).map_err(|_| MediaError::Allocation)?;
+        displayed_packets.try_reserve_exact(webm.frames.len()).map_err(|_| MediaError::Allocation)?;
+        timestamps.try_reserve_exact(webm.frames.len()).map_err(|_| MediaError::Allocation)?;
         for (index, frame) in webm.frames.iter().enumerate() {
             validate_vp8_frame(frame.bytes, &webm.track, index == 0)?;
-            if vpx::vpx_codec_decode(&mut codec.0, frame.bytes.as_ptr(), frame.bytes.len() as u32,
-                ptr::null_mut(), 0) != vpx::vpx_codec_err_t::VPX_CODEC_OK { return Err(MediaError::Decode); }
-            let mut iterator = ptr::null();
-            loop {
-                let image = vpx::vpx_codec_get_frame(&mut codec.0, &mut iterator);
-                if image.is_null() { break; }
-                if count as usize >= MAX_FRAMES { return Err(MediaError::FrameLimit); }
-                if let Some(before) = previous {
-                    if frame.timestamp_ms <= before { return Err(MediaError::Timestamps); }
-                    step_ms = frame.timestamp_ms - before;
+            let start = (frame.bytes.as_ptr() as usize).checked_sub(input.as_ptr() as usize)
+                .ok_or(MediaError::InvalidWebm)?;
+            let end = start.checked_add(frame.bytes.len()).filter(|end| *end <= input.len())
+                .ok_or(MediaError::InvalidWebm)?;
+            // The VP8 show_frame bit and the container's invisible flag must
+            // both allow display. Invisible packets still advance the codec.
+            let visible_index = if frame.visible && frame.bytes[0] & 0x10 != 0 {
+                if timestamps.last().is_some_and(|before| frame.timestamp_ms <= *before) {
+                    return Err(MediaError::Timestamps);
                 }
-                reserve(&mut output, 8 + frame_size)?;
-                output.extend_from_slice(&frame.timestamp_ms.to_le_bytes());
-                append_rgba(&*image, &mut output, &webm.track)?;
-                previous = Some(frame.timestamp_ms);
-                count += 1;
-            }
+                let visible_index = timestamps.len();
+                timestamps.push(frame.timestamp_ms);
+                displayed_packets.push(index);
+                Some(visible_index)
+            } else { None };
+            packets.push(Packet { range: start..end, visible_index, keyframe: frame.bytes[0] & 1 == 0 });
         }
+        let last = timestamps.last().copied().ok_or(MediaError::Decode)?;
+        let step = if timestamps.len() > 1 { last - timestamps[timestamps.len() - 2] } else { 1.0 };
+        let inferred = last + webm.track.default_duration_ns
+            .map(|duration| duration as f64 / 1_000_000.0).unwrap_or(step);
+        let duration_ms = webm.duration_ms.unwrap_or(inferred);
+        if !duration_ms.is_finite() || duration_ms <= last || duration_ms > MAX_DURATION_MS {
+            return Err(MediaError::Duration);
+        }
+        let codec = DecoderCodec::new(&webm.track)?;
+        drop(webm.frames);
+        let track = webm.track;
+        Ok(Self { input, track, packets, displayed_packets, timestamps, duration_ms,
+            codec, cursor: 0, current: None })
     }
-    let last = previous.ok_or(MediaError::Decode)?;
-    let inferred = last + webm.track.default_duration_ns.map(|duration| duration as f64 / 1_000_000.0)
-        .unwrap_or(step_ms);
-    let duration = webm.duration_ms.unwrap_or(inferred);
-    if duration <= last || duration > MAX_DURATION_MS { return Err(MediaError::Duration); }
-    output[..4].copy_from_slice(&webm.track.width.to_le_bytes());
-    output[4..8].copy_from_slice(&webm.track.height.to_le_bytes());
-    output[8..12].copy_from_slice(&count.to_le_bytes());
-    output[16..24].copy_from_slice(&duration.to_le_bytes());
-    Ok(output)
+
+    pub(crate) fn width(&self) -> u32 { self.track.width }
+    pub(crate) fn height(&self) -> u32 { self.track.height }
+    pub(crate) fn timestamps(&self) -> &[f64] { &self.timestamps }
+    pub(crate) fn duration_ms(&self) -> f64 { self.duration_ms }
+    pub(crate) fn encoded_bytes(&self) -> usize { self.input.len() }
+
+    fn current_pixels(&mut self, cancel: &AtomicBool) -> Result<Vec<u8>> {
+        if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
+        let mut iterator = ptr::null();
+        let image = unsafe { vpx::vpx_codec_get_frame(&mut *self.codec.context, &mut iterator) };
+        if image.is_null() { return Err(MediaError::Decode); }
+        let mut pixels = Vec::new();
+        unsafe { append_rgba(&*image, &mut pixels, &self.track)?; }
+        if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
+        Ok(pixels)
+    }
+
+    /// Returns None after at most eight packet decodes if the requested frame
+    /// has not been reached. The caller releases its shared codec permit before
+    /// requesting another step. Sequential playback never restarts the codec.
+    pub(crate) fn decode_to(&mut self, index: usize, cancel: &AtomicBool) -> Result<Option<Vec<u8>>> {
+        if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
+        let target = *self.displayed_packets.get(index).ok_or(MediaError::FrameIndex)?;
+        if self.current == Some(index) { return self.current_pixels(cancel).map(Some); }
+        if target < self.cursor {
+            let keyframe = self.packets[..=target].iter().rposition(|packet| packet.keyframe)
+                .ok_or(MediaError::Decode)?;
+            self.codec = DecoderCodec::new(&self.track)?;
+            self.cursor = keyframe;
+            self.current = None;
+        }
+        for _ in 0..DECODE_PACKET_BUDGET {
+            if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
+            let packet = self.packets.get(self.cursor).ok_or(MediaError::Decode)?;
+            let bytes = &self.input[packet.range.clone()];
+            let status = unsafe { vpx::vpx_codec_decode(&mut *self.codec.context, bytes.as_ptr(),
+                bytes.len() as u32, ptr::null_mut(), 0) };
+            if status != vpx::vpx_codec_err_t::VPX_CODEC_OK { return Err(MediaError::Decode); }
+            self.current = packet.visible_index;
+            self.cursor += 1;
+            if self.current == Some(index) { return self.current_pixels(cancel).map(Some); }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -629,14 +725,20 @@ mod tests {
     fn vp8_webm_roundtrip_preserves_frames_timing_and_color() {
         let bytes = encode_webm(32, 32, &[0.0, 50.0], 100.0, true, &colors()).unwrap();
         assert!(bytes.windows(4).any(|window| window == [0x1f, 0x43, 0xb6, 0x75]));
-        let decoded = decode_webm(&bytes).unwrap();
-        assert_eq!(&decoded[..12], &[32, 0, 0, 0, 32, 0, 0, 0, 2, 0, 0, 0]);
-        assert_eq!(f64::from_le_bytes(decoded[16..24].try_into().unwrap()), 100.0);
-        assert_eq!(f64::from_le_bytes(decoded[24..32].try_into().unwrap()), 0.0);
-        let second = 24 + 8 + 32 * 32 * 4;
-        assert_eq!(f64::from_le_bytes(decoded[second..second + 8].try_into().unwrap()), 50.0);
-        assert!(decoded[32] > 220 && decoded[33] < 30 && decoded[34] < 30);
-        assert!(decoded[second + 8] < 30 && decoded[second + 9] < 30 && decoded[second + 10] > 220);
+        let compressed_size = bytes.len();
+        let mut decoder = MediaDecoder::open(bytes).unwrap();
+        assert_eq!((decoder.width(), decoder.height()), (32, 32));
+        assert_eq!(decoder.timestamps(), &[0.0, 50.0]);
+        assert_eq!(decoder.duration_ms(), 100.0);
+        assert_eq!(decoder.encoded_bytes(), compressed_size);
+        let cancel = AtomicBool::new(false);
+        let red = decoder.decode_to(0, &cancel).unwrap().unwrap();
+        assert_eq!(red.len(), 32 * 32 * 4);
+        assert!(red[0] > 220 && red[1] < 30 && red[2] < 30);
+        let blue = decoder.decode_to(1, &cancel).unwrap().unwrap();
+        assert!(blue[0] < 30 && blue[1] < 30 && blue[2] > 220);
+        assert_eq!(decoder.decode_to(1, &cancel).unwrap().unwrap(), blue);
+        assert_eq!(decoder.decode_to(0, &cancel).unwrap().unwrap(), red);
     }
 
     #[test]
@@ -646,15 +748,77 @@ mod tests {
         let later = encode_webm(32, 32, &[50.0], 0.0, false, &pixels[4096..]).unwrap();
         assert_eq!(&later[..4], &[0x1f, 0x43, 0xb6, 0x75]);
         bytes.extend_from_slice(&later);
-        let decoded = decode_webm(&bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(decoded[8..12].try_into().unwrap()), 2);
-        assert_eq!(f64::from_le_bytes(decoded[16..24].try_into().unwrap()), 100.0);
+        let mut decoder = MediaDecoder::open(bytes.clone()).unwrap();
+        assert_eq!(decoder.timestamps(), &[0.0, 50.0]);
+        assert_eq!(decoder.duration_ms(), 100.0);
+        let cancel = AtomicBool::new(false);
+        let last = decoder.decode_to(1, &cancel).unwrap().unwrap();
+        let mut invisible = bytes.clone();
+        let block = invisible.windows(4).position(|window| window == [0x81, 0, 0, 0x80]).unwrap();
+        invisible[block + 3] |= 0x08;
+        let mut hidden_decoder = MediaDecoder::open(invisible).unwrap();
+        assert_eq!(hidden_decoder.timestamps(), &[50.0]);
+        assert_eq!(hidden_decoder.decode_to(0, &cancel).unwrap().unwrap(), last);
         let cluster = bytes.windows(4).position(|window| window == [0x1f, 0x43, 0xb6, 0x75]).unwrap();
         let size = cluster + 4;
         let width = bytes[size].leading_zeros() as usize + 1;
         bytes[size] = 0xff >> (width - 1);
         bytes[size + 1..size + width].fill(0xff);
-        assert_eq!(decode_webm(&bytes).unwrap(), decoded);
+        let mut decoder = MediaDecoder::open(bytes).unwrap();
+        assert_eq!(decoder.timestamps(), &[0.0, 50.0]);
+        assert_eq!(decoder.decode_to(1, &cancel).unwrap().unwrap(), last);
+    }
+
+    #[test]
+    fn decoder_yields_between_packet_windows_and_preserves_seek_pixels() {
+        let timestamps: Vec<_> = (0..19).map(|index| index as f64 * 40.0).collect();
+        let pixels: Vec<_> = (0..19).flat_map(|index| {
+            let color = if index == 18 { [0, 0, 255, 255] } else { [255, 0, 0, 255] };
+            std::iter::repeat_n(color, 32 * 32).flatten()
+        }).collect();
+        let bytes = encode_webm(32, 32, &timestamps, 760.0, true, &pixels).unwrap();
+        let mut decoder = MediaDecoder::open(bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(decoder.decode_to(usize::MAX, &cancel), Err(MediaError::FrameIndex));
+        cancel.store(true, Ordering::Release);
+        assert_eq!(decoder.decode_to(18, &cancel), Err(MediaError::Cancelled));
+        cancel.store(false, Ordering::Release);
+        assert_eq!(decoder.decode_to(18, &cancel).unwrap(), None);
+        assert_eq!(decoder.decode_to(18, &cancel).unwrap(), None);
+        let blue = decoder.decode_to(18, &cancel).unwrap().unwrap();
+        assert!(blue[0] < 30 && blue[2] > 220);
+        assert_eq!(decoder.decode_to(18, &cancel).unwrap().unwrap(), blue);
+        let red = decoder.decode_to(0, &cancel).unwrap().unwrap();
+        assert!(red[0] > 220 && red[2] < 30);
+        // Every sequential frame is available in one bounded step after the seek.
+        for index in 1..19 {
+            let frame = decoder.decode_to(index, &cancel).unwrap().unwrap();
+            assert_eq!(frame.len(), 32 * 32 * 4);
+            if index == 18 { assert_eq!(frame, blue); }
+        }
+    }
+
+    #[test]
+    fn full_hd_clip_returns_one_frame_beyond_the_eager_decoded_byte_limit() {
+        let mut red = Vec::new();
+        red.extend(std::iter::repeat_n([255, 0, 0, 255], 1920 * 1080).flatten());
+        let blue: Vec<_> = std::iter::repeat_n([0, 0, 255, 255], 1920 * 1080).flatten().collect();
+        let mut bytes = Vec::new();
+        for index in 0..17 {
+            bytes.extend(encode_webm(1920, 1080, &[index as f64 * 40.0], 0.0,
+                index == 0, if index == 16 { &blue } else { &red }).unwrap());
+        }
+        let compressed_size = bytes.len();
+        let mut decoder = MediaDecoder::open(bytes).unwrap();
+        assert_eq!(decoder.timestamps().len(), 17);
+        assert!(frame_bytes(decoder.width(), decoder.height()).unwrap() * 17 > MAX_BYTES);
+        assert_eq!(decoder.encoded_bytes(), compressed_size);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(decoder.decode_to(16, &cancel).unwrap(), None);
+        assert_eq!(decoder.decode_to(16, &cancel).unwrap(), None);
+        let pixels = decoder.decode_to(16, &cancel).unwrap().unwrap();
+        assert_eq!(pixels.len(), 1920 * 1080 * 4);
+        assert!(pixels[0] < 30 && pixels[2] > 220);
     }
 
     #[test]
@@ -674,27 +838,27 @@ mod tests {
         ] {
             assert_eq!(validate_encode(width, height, &times, duration, length), Err(error));
         }
-        assert_eq!(decode_webm(&[]), Err(MediaError::BufferLimit));
+        assert_eq!(MediaDecoder::open(Vec::new()).err(), Some(MediaError::BufferLimit));
         for bytes in [&b"not webm"[..], &[0x1a, 0x45, 0xdf, 0xa3, 0xff][..]] {
-            assert!(decode_webm(bytes).is_err());
+            assert!(MediaDecoder::open(bytes.to_vec()).is_err());
         }
         let valid = encode_webm(32, 32, &[0.0, 50.0], 100.0, true, &pixels).unwrap();
-        for cut in [1, 4, 5, valid.len() - 1] { assert!(decode_webm(&valid[..cut]).is_err()); }
+        for cut in [1, 4, 5, valid.len() - 1] { assert!(MediaDecoder::open(valid[..cut].to_vec()).is_err()); }
         let mut unsupported = valid.clone();
         let codec = unsupported.windows(5).position(|window| window == b"V_VP8").unwrap();
         unsupported[codec + 4] = b'9';
-        assert_eq!(decode_webm(&unsupported), Err(MediaError::UnsupportedWebm));
+        assert_eq!(MediaDecoder::open(unsupported).err(), Some(MediaError::UnsupportedWebm));
         let mut laced = valid.clone();
         let block = laced.windows(4).position(|window| window == [0x81, 0, 0, 0x80]).unwrap();
         laced[block + 3] |= 0x02;
-        assert_eq!(decode_webm(&laced), Err(MediaError::UnsupportedWebm));
+        assert_eq!(MediaDecoder::open(laced).err(), Some(MediaError::UnsupportedWebm));
         let mut corrupt_frame = valid.clone();
         let signature = corrupt_frame.windows(3).position(|window| window == [0x9d, 0x01, 0x2a]).unwrap();
         corrupt_frame[signature] = 0;
-        assert_eq!(decode_webm(&corrupt_frame), Err(MediaError::Decode));
+        assert_eq!(MediaDecoder::open(corrupt_frame).err(), Some(MediaError::Decode));
         let mut corrupted = valid.clone();
         let header = corrupted.windows(3).position(|window| window == [0x9d, 0x01, 0x2a]).unwrap();
         corrupted[header + 3..header + 5].copy_from_slice(&8192u16.to_le_bytes());
-        assert_eq!(decode_webm(&corrupted), Err(MediaError::Dimensions));
+        assert_eq!(MediaDecoder::open(corrupted).err(), Some(MediaError::Dimensions));
     }
 }

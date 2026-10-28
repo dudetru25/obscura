@@ -602,6 +602,8 @@ impl ObscuraJsRuntime {
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
     /// share the retained layout on pages with running animations.
     fn begin_javascript_task(&mut self) {
+        #[cfg(feature = "media")]
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
         // Some internal callers intentionally ignore script errors. Recover a
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
@@ -1059,6 +1061,8 @@ impl ObscuraJsRuntime {
 
     pub fn forget_frame_state(&mut self, frame_id: u32) {
         self.realm_states().borrow_mut().forget_frame(frame_id);
+        #[cfg(feature = "media")]
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
     /// Pending initial realms can already own children before Page adopts them.
@@ -1354,6 +1358,8 @@ impl ObscuraJsRuntime {
         }
         drop(gs);
         self.realm_states().borrow().cancel_inactive_frame_timers();
+        #[cfg(feature = "media")]
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
     pub fn set_url(&self, url: &str) {
