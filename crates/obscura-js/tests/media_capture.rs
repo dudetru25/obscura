@@ -13,6 +13,146 @@ fn runtime() -> ObscuraJsRuntime {
     runtime
 }
 
+fn runtime_with_video_fixture() -> ObscuraJsRuntime {
+    let mut runtime = runtime();
+    runtime.evaluate_script(r#"(() => {
+        globalThis.createVideoFixture = async (width = 4, height = 4, frameCount = 2) => {
+            let clock = 0;
+            Object.defineProperty(performance, 'now', {configurable:true, value:() => clock});
+            const canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            const context = canvas.getContext('2d');
+            const stream = canvas.captureStream(0), track = stream.getVideoTracks()[0];
+            const recorder = new MediaRecorder(stream), chunks = [];
+            recorder.start();
+            for (let index = 0; index < frameCount; index++) {
+                clock = index * 40;
+                context.fillStyle = index === frameCount - 1 ? '#0000ff' : '#ff0000';
+                context.fillRect(0,0,width,height);
+                const flushed = new Promise((resolve,reject) => {
+                    recorder.ondataavailable = event => {
+                        if (event.data.size) chunks.push(event.data);
+                        resolve();
+                    };
+                    recorder.onerror = event => reject(event.error);
+                });
+                track.requestFrame(); recorder.requestData();
+                await flushed;
+            }
+            const stopped = new Promise((resolve,reject) => {
+                recorder.onstop = resolve; recorder.onerror = event => reject(event.error);
+            });
+            recorder.stop(); track.stop(); await stopped;
+            return {blob:new Blob(chunks, {type:'video/webm'}), advance:ms => { clock += ms; }};
+        };
+        globalThis.loadVideoFixture = async (video, blob) => {
+            const loaded = new Promise((resolve,reject) => {
+                video.onloadeddata = resolve;
+                video.onerror = () => reject(new Error(video.error.message));
+            });
+            const url = URL.createObjectURL(blob);
+            video.src = url;
+            await loaded;
+            return url;
+        };
+        globalThis.nextMediaTask = () => new Promise(resolve => setTimeout(resolve, 0));
+    })()"#).expect("media fixture helpers must initialize");
+    runtime
+}
+
+#[tokio::test]
+async fn preload_none_defers_loading_until_play_is_requested() {
+    let mut runtime = runtime_with_video_fixture();
+    let result = runtime.evaluate_for_cdp(r#"(async () => {
+        const fixture = await createVideoFixture();
+        const video = document.createElement('video');
+        video.setAttribute('preload', 'none');
+        const events = [];
+        for (const type of ['loadedmetadata','loadeddata','playing']) {
+            video.addEventListener(type, () => events.push(type));
+        }
+        const url = URL.createObjectURL(fixture.blob);
+        video.src = url;
+        document.body.append(video);
+        await nextMediaTask(); await nextMediaTask();
+        const deferred = [video.readyState,video.networkState,video.error,events.slice()];
+        await video.play();
+        const playing = [video.readyState >= video.HAVE_CURRENT_DATA,video.paused,
+            video.videoWidth,video.videoHeight,events.includes('loadeddata'),events.includes('playing')];
+        video.pause(); URL.revokeObjectURL(url);
+        return {deferred,playing};
+    })()"#, true, true).await.expect("deferred media must start on play");
+    assert_eq!(result.value.unwrap(), json!({
+        "deferred":[0,1,null,[]],
+        "playing":[true,false,4,4,true,true],
+    }));
+}
+
+#[tokio::test]
+async fn removing_a_video_pauses_only_if_it_stays_detached() {
+    let mut runtime = runtime_with_video_fixture();
+    let result = runtime.evaluate_for_cdp(r#"(async () => {
+        const fixture = await createVideoFixture(4,4,4);
+        const video = document.createElement('video');
+        document.body.append(video);
+        const url = await loadVideoFixture(video, fixture.blob);
+        let pauses = 0;
+        video.addEventListener('pause', () => pauses++);
+        await video.play();
+        video.remove(); document.body.append(video);
+        await nextMediaTask();
+        fixture.advance(20);
+        const reinserted = [video.paused,video.currentTime > 0,pauses];
+        const beforeRemoval = video.currentTime;
+        video.remove();
+        await nextMediaTask(); await nextMediaTask();
+        fixture.advance(20);
+        const detached = [video.paused,video.currentTime === beforeRemoval,pauses];
+        document.body.append(video);
+        await nextMediaTask();
+        const preserved = [video.paused,video.currentTime === beforeRemoval];
+        await video.play(); fixture.advance(20);
+        const resumed = [video.paused,video.currentTime > beforeRemoval];
+        video.pause(); URL.revokeObjectURL(url);
+        return {reinserted,detached,preserved,resumed};
+    })()"#, true, true).await.expect("video removal and reinsertion must settle");
+    assert_eq!(result.value.unwrap(), json!({
+        "reinserted":[false,true,0],
+        "detached":[true,true,1],
+        "preserved":[true,true],
+        "resumed":[false,true],
+    }));
+}
+
+#[tokio::test]
+async fn full_hd_video_plays_beyond_the_whole_clip_decoded_buffer_limit() {
+    let mut runtime = runtime_with_video_fixture();
+    let result = runtime.evaluate_for_cdp_with_timeout(r#"(async () => {
+        const fixture = await createVideoFixture(1920,1080,17);
+        const video = document.createElement('video');
+        document.body.append(video);
+        const url = await loadVideoFixture(video, fixture.blob);
+        await video.play(); video.pause();
+        const sought = new Promise(resolve => video.addEventListener('seeked', resolve, {once:true}));
+        video.currentTime = .64;
+        await sought;
+        const canvas = document.createElement('canvas'); canvas.width = 1; canvas.height = 1;
+        const context = canvas.getContext('2d'); context.drawImage(video,0,0,1,1);
+        const pixel = Array.from(context.getImageData(0,0,1,1).data);
+        const result = {dimensions:[video.videoWidth,video.videoHeight],
+            time:video.currentTime,pixel,error:video.error};
+        URL.revokeObjectURL(url);
+        return result;
+    })()"#, true, true, 30_000).await.expect("full-HD playback must decode beyond sixteen frames");
+    let value = result.value.unwrap();
+    assert_eq!(value["dimensions"], json!([1920,1080]));
+    assert_eq!(value["time"], 0.64);
+    assert_eq!(value["error"], serde_json::Value::Null);
+    assert!(value["pixel"][0].as_u64().unwrap() < 50, "last frame must be blue: {value}");
+    assert!(value["pixel"][2].as_u64().unwrap() > 200, "last frame must be blue: {value}");
+    assert_eq!(value["pixel"][3], 255);
+}
+
 #[tokio::test]
 async fn canvas_recording_chunks_decode_and_play_with_real_frame_pixels() {
     let mut runtime = runtime();
