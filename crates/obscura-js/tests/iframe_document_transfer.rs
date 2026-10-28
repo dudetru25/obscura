@@ -18,7 +18,7 @@ async fn runtime_with_frame() -> ObscuraJsRuntime {
         document.body.append(frame);
     "#).unwrap();
     runtime.run_event_loop_bounded(100).await.unwrap();
-    assert_eq!(runtime.evaluate(r#"(() => {
+    assert_eq!(runtime.evaluate_script(r#"(() => {
         const child = frame.contentDocument;
         const style = child.createElement('style');
         style.id = 'child-created';
@@ -41,7 +41,7 @@ async fn runtime_with_frame() -> ObscuraJsRuntime {
 #[tokio::test(flavor = "current_thread")]
 async fn cloned_host_style_is_adopted_when_appended_to_iframe() {
     let mut runtime = runtime_with_frame().await;
-    let result = runtime.evaluate(r#"(() => {
+    let result = runtime.evaluate_script(r#"(() => {
         const child = frame.contentDocument;
         const source = document.getElementById('host-style');
         const original = source.outerHTML;
@@ -78,7 +78,7 @@ async fn cloned_host_style_is_adopted_when_appended_to_iframe() {
 #[tokio::test(flavor = "current_thread")]
 async fn iframe_import_node_clones_into_destination_document() {
     let mut runtime = runtime_with_frame().await;
-    let result = runtime.evaluate(r#"(() => {
+    let result = runtime.evaluate_script(r#"(() => {
         const child = frame.contentDocument;
         const source = document.getElementById('host-style');
         const original = source.outerHTML;
@@ -117,7 +117,7 @@ async fn iframe_import_node_clones_into_destination_document() {
 #[tokio::test(flavor = "current_thread")]
 async fn iframe_adopt_node_moves_descendants_and_preserves_listeners() {
     let mut runtime = runtime_with_frame().await;
-    let result = runtime.evaluate(r#"(() => {
+    let result = runtime.evaluate_script(r#"(() => {
         const child = frame.contentDocument;
         const source = document.createElement('section');
         source.id = 'adopted';

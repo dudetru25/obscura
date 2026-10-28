@@ -144,7 +144,8 @@ async fn full_hd_video_plays_beyond_the_whole_clip_decoded_buffer_limit() {
         URL.revokeObjectURL(url);
         return result;
     })()"#, true, true, 30_000).await.expect("full-HD playback must decode beyond sixteen frames");
-    let value = result.value.unwrap();
+    assert!(!result.thrown, "full-HD playback rejected: {}", result.description);
+    let value = result.value.expect("full-HD playback result");
     assert_eq!(value["dimensions"], json!([1920,1080]));
     assert_eq!(value["time"], 0.64);
     assert_eq!(value["error"], serde_json::Value::Null);
