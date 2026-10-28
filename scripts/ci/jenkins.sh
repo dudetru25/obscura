@@ -3,6 +3,8 @@
 set -euo pipefail
 export PATH="${HOME}/.cargo/bin:${PATH}"
 export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
+# DEV-3 registry downloads reject multiplexed HTTP/2 streams.
+export CARGO_HTTP_MULTIPLEXING=false
 export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/obscura/target"
 export PYTHONDONTWRITEBYTECODE=1
 mkdir -p ci-output
