@@ -11,34 +11,10 @@ mkdir -p ci-output
 cargo --version
 cargo nextest --version
 pkg-config --modversion vpx
-cargo nextest run --locked --release --features media     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work) | test(read_body_capped_) | test(textarea) | binary(textarea_semantics)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
-# Exercise the intermittent socket-close boundary repeatedly on the native worker.
-cargo nextest run --locked --release --features media -p obscura-js \
-    -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
-    2>&1 | tee ci-output/body-cap-stress.log
-suite_status=0
-cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
-cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
-if (( suite_status != 0 )); then exit "$suite_status"; fi
-cargo build --locked --release -p obscura-cli --bins --features media
-export OBSCURA_BIN="$CARGO_TARGET_DIR/release/obscura"
-"$OBSCURA_BIN" --version
-benchmark=ci-output/obscura-benchmark
-git init --quiet "$benchmark"
-git -C "$benchmark" fetch --quiet --depth=1 https://github.com/h4ckf0r0day/obscura-benchmark.git     2d08d9a8e860e423b47209434a9fba9c75e6eee6
-git -C "$benchmark" checkout --quiet --detach FETCH_HEAD
-python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
-python3 - <<'CHECK'
-import json
-from pathlib import Path
-results = json.loads(Path('ci-output/obstacle.json').read_text())['results']
-assert len(results) == 33 and all(item['pass'] is True for item in results), 'obstacle course requires 33/33'
-print('Obstacle course: 33/33')
-CHECK
 python3 -m venv .ci-python
 .ci-python/bin/python -m pip install --only-binary=:all: -r scripts/ci/render-requirements.txt
 export PYTHON_BIN="$PWD/.ci-python/bin/python"
-: "${CHROME_BIN:?Jenkins must select its existing Chrome reference binary}"
+source scripts/ci/preflight.sh
 # Keep Chrome's metric-sensitive reference fonts aligned with the embedded faces.
 export FONTCONFIG_FILE="$PWD/ci-output/fonts.conf"
 python3 - <<'FONTS' | tee ci-output/fonts.log
@@ -76,6 +52,30 @@ for family, filename in [('Liberation Sans', 'liberation-sans.ttf'),
     if selected != expected:
         raise SystemExit(f'Reference font mismatch for {family}: expected {expected}')
 FONTS
+cargo nextest run --locked --release --features media     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work) | test(read_body_capped_) | test(textarea) | binary(textarea_semantics)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
+# Exercise the intermittent socket-close boundary repeatedly on the native worker.
+cargo nextest run --locked --release --features media -p obscura-js \
+    -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
+    2>&1 | tee ci-output/body-cap-stress.log
+suite_status=0
+cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
+cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
+if (( suite_status != 0 )); then exit "$suite_status"; fi
+cargo build --locked --release -p obscura-cli --bins --features media
+export OBSCURA_BIN="$CARGO_TARGET_DIR/release/obscura"
+"$OBSCURA_BIN" --version
+benchmark=ci-output/obscura-benchmark
+git init --quiet "$benchmark"
+git -C "$benchmark" fetch --quiet --depth=1 https://github.com/h4ckf0r0day/obscura-benchmark.git     2d08d9a8e860e423b47209434a9fba9c75e6eee6
+git -C "$benchmark" checkout --quiet --detach FETCH_HEAD
+python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
+python3 - <<'CHECK'
+import json
+from pathlib import Path
+results = json.loads(Path('ci-output/obstacle.json').read_text())['results']
+assert len(results) == 33 and all(item['pass'] is True for item in results), 'obstacle course requires 33/33'
+print('Obstacle course: 33/33')
+CHECK
 bash render-repros/run.sh "$PWD/ci-output/fixtures"
 bash render-repros/representative-suite/run.sh "$PWD/ci-output/top"
 bash render-repros/representative-suite/run.sh "$PWD/ci-output/bottom" bottom
