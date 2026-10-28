@@ -1,0 +1,24 @@
+// The fork folder pins the reviewed homelab library and source revision.
+@Library('homelab') _
+
+try {
+    homelabPipeline(
+        agentLabel: 'homelab-dev3-linux',
+        branch: 'fix/browser-api-compat',
+        sourceRepository: 'https://github.com/dudetru25/obscura.git',
+        scmCredentialId: scm.userRemoteConfigs[0].credentialsId,
+        sourceRevisionParameter: 'SOURCE_SHA',
+        scriptPath: 'scripts/ci/Jenkinsfile.focused',
+        pipelineRevision: params.SOURCE_SHA,
+        timeoutMinutes: 30,
+        queueProfile: 'small-web',
+        checkCommand: 'bash scripts/ci/jenkins-focused.sh'
+    )
+} finally {
+    node('homelab-dev3-linux') {
+        ws("${pwd()}@build-${env.BUILD_NUMBER}") {
+            archiveArtifacts(artifacts: 'ci-output/**', excludes: 'ci-output/obscura-benchmark/**',
+                allowEmptyArchive: true, fingerprint: true)
+        }
+    }
+}
