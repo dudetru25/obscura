@@ -144,7 +144,8 @@ async fn full_hd_video_plays_beyond_the_whole_clip_decoded_buffer_limit() {
         URL.revokeObjectURL(url);
         return result;
     })()"#, true, true, 30_000).await.expect("full-HD playback must decode beyond sixteen frames");
-    let value = result.value.unwrap();
+    assert!(!result.thrown, "full-HD playback rejected: {}", result.description);
+    let value = result.value.expect("full-HD playback result");
     assert_eq!(value["dimensions"], json!([1920,1080]));
     assert_eq!(value["time"], 0.64);
     assert_eq!(value["error"], serde_json::Value::Null);
@@ -261,7 +262,7 @@ async fn invalid_media_fails_explicitly_and_source_reset_discards_old_frames() {
         "document.createElement('video').currentTime = NaN",
         "document.createElement('video').volume = 2",
     ] {
-        assert!(runtime.evaluate(expression).is_err(), "must reject {expression}");
+        assert!(runtime.evaluate_script(expression).is_err(), "must reject {expression}");
     }
     let result = runtime.evaluate_for_cdp(r#"(async () => {
         const fixture = await createVideoFixture(4,4,17);
