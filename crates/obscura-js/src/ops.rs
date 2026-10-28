@@ -6719,7 +6719,7 @@ fn node_creation_frame(
     (known == context && registry.frame_timers_active(owner) == Some(true)).then_some(owner)
 }
 
-#[op2]
+#[op2(fast)]
 fn op_node_creation_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
