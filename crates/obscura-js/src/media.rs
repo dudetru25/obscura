@@ -574,6 +574,9 @@ struct DecoderCodec {
     // The public libvpx context retains config.dec. Keep its address stable
     // even if a codec implementation does not copy the configuration internally.
     _config: Box<vpx::vpx_codec_dec_cfg_t>,
+    // libvpx owns this image until the next decode call. Keep its descriptor
+    // for repeated reads because get_frame consumes VP8's available output.
+    frame_image: Option<NonNull<vpx::vpx_image_t>>,
 }
 
 // SAFETY: this wrapper exclusively owns its context/configuration and never
@@ -593,7 +596,7 @@ impl DecoderCodec {
         // libvpx cleans a failed initialization itself; only a successful
         // context enters this Drop implementation.
         if status != vpx::vpx_codec_err_t::VPX_CODEC_OK { return Err(MediaError::Decode); }
-        Ok(Self { context, _config: config })
+        Ok(Self { context, _config: config, frame_image: None })
     }
 }
 
@@ -670,15 +673,24 @@ impl MediaDecoder {
     pub(crate) fn height(&self) -> u32 { self.track.height }
     pub(crate) fn timestamps(&self) -> &[f64] { &self.timestamps }
     pub(crate) fn duration_ms(&self) -> f64 { self.duration_ms }
-    pub(crate) fn encoded_bytes(&self) -> usize { self.input.len() }
 
     fn current_pixels(&mut self, cancel: &AtomicBool) -> Result<Vec<u8>> {
         if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
-        let mut iterator = ptr::null();
-        let image = unsafe { vpx::vpx_codec_get_frame(&mut *self.codec.context, &mut iterator) };
-        if image.is_null() { return Err(MediaError::Decode); }
+        let image = match self.codec.frame_image {
+            Some(image) => image,
+            None => {
+                let mut iterator = ptr::null();
+                let image = NonNull::new(unsafe {
+                    vpx::vpx_codec_get_frame(&mut *self.codec.context, &mut iterator)
+                }).ok_or(MediaError::Decode)?;
+                self.codec.frame_image = Some(image);
+                image
+            },
+        };
         let mut pixels = Vec::new();
-        unsafe { append_rgba(&*image, &mut pixels, &self.track)?; }
+        // No decode can overlap this conversion. The cached image is cleared
+        // before every decode and is dropped with its owning codec on a seek.
+        unsafe { append_rgba(image.as_ref(), &mut pixels, &self.track)?; }
         if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
         Ok(pixels)
     }
@@ -701,6 +713,8 @@ impl MediaDecoder {
             if cancel.load(Ordering::Acquire) { return Err(MediaError::Cancelled); }
             let packet = self.packets.get(self.cursor).ok_or(MediaError::Decode)?;
             let bytes = &self.input[packet.range.clone()];
+            self.codec.frame_image = None;
+            self.current = None;
             let status = unsafe { vpx::vpx_codec_decode(&mut *self.codec.context, bytes.as_ptr(),
                 bytes.len() as u32, ptr::null_mut(), 0) };
             if status != vpx::vpx_codec_err_t::VPX_CODEC_OK { return Err(MediaError::Decode); }
@@ -725,12 +739,10 @@ mod tests {
     fn vp8_webm_roundtrip_preserves_frames_timing_and_color() {
         let bytes = encode_webm(32, 32, &[0.0, 50.0], 100.0, true, &colors()).unwrap();
         assert!(bytes.windows(4).any(|window| window == [0x1f, 0x43, 0xb6, 0x75]));
-        let compressed_size = bytes.len();
         let mut decoder = MediaDecoder::open(bytes).unwrap();
         assert_eq!((decoder.width(), decoder.height()), (32, 32));
         assert_eq!(decoder.timestamps(), &[0.0, 50.0]);
         assert_eq!(decoder.duration_ms(), 100.0);
-        assert_eq!(decoder.encoded_bytes(), compressed_size);
         let cancel = AtomicBool::new(false);
         let red = decoder.decode_to(0, &cancel).unwrap().unwrap();
         assert_eq!(red.len(), 32 * 32 * 4);
@@ -808,11 +820,9 @@ mod tests {
             bytes.extend(encode_webm(1920, 1080, &[index as f64 * 40.0], 0.0,
                 index == 0, if index == 16 { &blue } else { &red }).unwrap());
         }
-        let compressed_size = bytes.len();
         let mut decoder = MediaDecoder::open(bytes).unwrap();
         assert_eq!(decoder.timestamps().len(), 17);
         assert!(frame_bytes(decoder.width(), decoder.height()).unwrap() * 17 > MAX_BYTES);
-        assert_eq!(decoder.encoded_bytes(), compressed_size);
         let cancel = AtomicBool::new(false);
         assert_eq!(decoder.decode_to(16, &cancel).unwrap(), None);
         assert_eq!(decoder.decode_to(16, &cancel).unwrap(), None);
