@@ -6,7 +6,14 @@ export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
 # DEV-3 registry downloads reject multiplexed HTTP/2 streams.
 export CARGO_HTTP_MULTIPLEXING=false
 export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/obscura/target"
+# The delivered media binaries must not require libvpx on consumer workers.
+export VPX_STATIC=1
 export PYTHONDONTWRITEBYTECODE=1
+[[ $(uname -s):$(uname -m) == Linux:x86_64 ]]
+command -v readelf >/dev/null
+[[ -r /usr/share/doc/libvpx-dev/copyright ]]
+source_revision=$(git rev-parse HEAD)
+[[ $source_revision =~ ^[a-f0-9]{40}$ ]]
 mkdir -p ci-output
 cargo --version
 cargo nextest --version
@@ -63,7 +70,32 @@ cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | 
 cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
 if (( suite_status != 0 )); then exit "$suite_status"; fi
 cargo build --locked --release -p obscura-cli --bins --features media
-export OBSCURA_BIN="$CARGO_TARGET_DIR/release/obscura"
+release_stage=$(mktemp -d "${TMPDIR:-/tmp}/obscura-release.XXXXXXXX")
+trap 'rm -r -- "$release_stage"' EXIT
+for binary in obscura obscura-worker; do
+    [[ -f $CARGO_TARGET_DIR/release/$binary && -x $CARGO_TARGET_DIR/release/$binary && ! -L $CARGO_TARGET_DIR/release/$binary ]]
+    install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$release_stage/$binary"
+    readelf --dynamic "$release_stage/$binary" > "ci-output/$binary-libraries.txt"
+    if grep -q 'Shared library: \[libvpx' "ci-output/$binary-libraries.txt"; then
+        printf 'The release still needs shared libvpx: %s\n' "$binary" >&2
+        exit 1
+    fi
+done
+cp LICENSE "$release_stage/LICENSE"
+cp /usr/share/doc/libvpx-dev/copyright "$release_stage/COPYRIGHT-libvpx"
+printf '%s\n' "$source_revision" > "$release_stage/SOURCE_REVISION"
+(
+    cd "$release_stage"
+    sha256sum obscura obscura-worker LICENSE COPYRIGHT-libvpx SOURCE_REVISION > SHA256SUMS
+)
+archive="$PWD/ci-output/obscura-$source_revision-x86_64-linux.tar.gz"
+tar --create --gzip --file "$archive" --directory "$release_stage" \
+    obscura obscura-worker LICENSE COPYRIGHT-libvpx SOURCE_REVISION SHA256SUMS
+(cd ci-output && sha256sum "${archive##*/}" > "${archive##*/}.sha256")
+mkdir "$release_stage/extracted"
+tar --extract --gzip --file "$archive" --directory "$release_stage/extracted" --no-same-owner --no-same-permissions
+(cd "$release_stage/extracted" && sha256sum --check SHA256SUMS)
+export OBSCURA_BIN="$release_stage/extracted/obscura"
 "$OBSCURA_BIN" --version
 "$PYTHON_BIN" render-repros/capture-media-recording.py --obscura-bin "$OBSCURA_BIN" --out "$PWD/ci-output/media-obscura"
 python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
