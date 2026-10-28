@@ -7765,6 +7765,116 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+// Media jobs run outside the isolate. Serial admission bounds native codec
+// memory across pages without blocking the JavaScript event loop.
+#[cfg(feature = "media")]
+static MEDIA_JOB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[cfg(feature = "media")]
+#[op2]
+#[buffer]
+async fn op_media_encode_webm(
+    width: u32,
+    height: u32,
+    #[string] timestamps_json: String,
+    duration_ms: f64,
+    include_header: bool,
+    #[buffer] rgba: JsBuffer,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if timestamps_json.len() > 32_768 {
+        return Err(deno_error::JsErrorBox::type_error("media_timestamps_invalid"));
+    }
+    let timestamps: Vec<f64> = serde_json::from_str(&timestamps_json)
+        .map_err(|_| deno_error::JsErrorBox::type_error("media_timestamps_invalid"))?;
+    crate::media::validate_encode(width, height, &timestamps, duration_ms, rgba.len())
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+    let permit = MEDIA_JOB.acquire().await
+        .map_err(|_| deno_error::JsErrorBox::generic("media_worker_unavailable"))?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(rgba.len())
+        .map_err(|_| deno_error::JsErrorBox::generic("media_allocation_failed"))?;
+    pixels.extend_from_slice(&rgba);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::media::encode_webm(width, height, &timestamps, duration_ms, include_header, &pixels)
+    }).await.map_err(|_| deno_error::JsErrorBox::generic("media_worker_failed"))?;
+    result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
+}
+
+#[cfg(feature = "media")]
+#[op2]
+#[buffer]
+async fn op_media_decode_webm(
+    #[buffer] bytes: JsBuffer,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if bytes.is_empty() || bytes.len() > crate::media::MAX_BYTES {
+        return Err(deno_error::JsErrorBox::type_error("media_buffer_limit_exceeded"));
+    }
+    let permit = MEDIA_JOB.acquire().await
+        .map_err(|_| deno_error::JsErrorBox::generic("media_worker_unavailable"))?;
+    let mut input = Vec::new();
+    input.try_reserve_exact(bytes.len())
+        .map_err(|_| deno_error::JsErrorBox::generic("media_allocation_failed"))?;
+    input.extend_from_slice(&bytes);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::media::decode_webm(&input)
+    }).await.map_err(|_| deno_error::JsErrorBox::generic("media_worker_failed"))?;
+    result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
+}
+
+/// Video frames share the retained RGBA surface path with canvas. A 0x0 empty
+/// buffer releases the selected video's surface after source reset or failure.
+#[cfg(feature = "media")]
+#[op2]
+fn op_media_register_surface(
+    state: &OpState,
+    nid: u32,
+    width: u32,
+    height: u32,
+    #[buffer] pixels: JsBuffer,
+    frame_id: u32,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = if frame_id == 0 {
+            Some(state.borrow::<SharedState>().clone())
+        } else {
+            state.try_borrow::<Rc<RefCell<RealmStates>>>()
+                .and_then(|registry| registry.borrow().by_frame_id(frame_id))
+        };
+        let Some(shared) = shared else { return false; };
+        let mut state = shared.borrow_mut();
+        let node = NodeId::new(nid);
+        if !state.dom.as_ref().and_then(|dom| dom.get_node(node)).is_some_and(|node| {
+            node.as_element().is_some_and(|name| name.local.as_ref() == "video")
+        }) { return false; }
+        if width == 0 && height == 0 && pixels.is_empty() {
+            state.canvas_surfaces.remove(&node);
+            if state.render_resources.set_video_dimensions(node, None) {
+                invalidate_render_resource_geometry(&mut state);
+            }
+            return true;
+        }
+        let Ok(expected) = crate::media::frame_bytes(width, height) else { return false; };
+        if pixels.len() != expected { return false; }
+        let previous = state.canvas_surfaces.get(&node);
+        if previous.is_none() && state.canvas_surfaces.len() >= 4096 { return false; }
+        let replacing = previous.map_or(0, |surface| surface.pixels.len());
+        let retained = state.canvas_surfaces.values().try_fold(0usize, |total, surface| {
+            total.checked_add(surface.pixels.len())
+        }).and_then(|total| total.checked_sub(replacing)).and_then(|total| total.checked_add(expected));
+        if retained.is_none_or(|total| total > 256 * 1024 * 1024) { return false; }
+        state.canvas_surfaces.insert(node, CanvasBackingSurface { width, height, pixels });
+        if state.render_resources.set_video_dimensions(node, Some((width, height))) {
+            invalidate_render_resource_geometry(&mut state);
+        }
+        if state.dom.as_ref().is_some_and(|dom| node_is_connected(dom, node)) {
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+        }
+        true
+    })).unwrap_or(false)
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7854,6 +7964,12 @@ pub fn build_extension() -> Extension {
         ops.push(op_scroll_to());
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
+    }
+    #[cfg(feature = "media")]
+    {
+        ops.push(op_media_encode_webm());
+        ops.push(op_media_decode_webm());
+        ops.push(op_media_register_surface());
     }
     Extension {
         name: "obscura_dom",

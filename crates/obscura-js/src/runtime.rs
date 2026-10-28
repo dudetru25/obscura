@@ -4618,8 +4618,13 @@ mod tests {
 
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
+        #[cfg(feature = "media")]
+        let media_source = include_str!("../js/media.js");
+        #[cfg(not(feature = "media"))]
+        let media_source = "";
         let source = include_str!("../js/bootstrap.js")
-            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
+            .replace("/* MEDIA */", media_source);
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {
             assert_eq!(super::SNAPSHOT.windows(source.len())

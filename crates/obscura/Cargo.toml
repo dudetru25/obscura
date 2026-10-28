@@ -13,6 +13,9 @@ api = ["obscura-browser", "obscura-net", "tokio"]
 stealth = ["api", "obscura-browser/stealth"]
 render = ["api", "obscura-browser/render"]
 
+# Optional VP8/WebM capture, recording and video playback.
+media = ["render", "obscura-browser/media"]
+
 [dependencies]
 obscura-browser = { path = "../obscura-browser", optional = true }
 obscura-net = { path = "../obscura-net", optional = true }

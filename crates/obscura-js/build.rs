@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(obscura_external_bootstrap)");
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
+    println!("cargo:rerun-if-changed=js/media.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -15,8 +16,13 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
+    #[cfg(feature = "media")]
+    let media_source = include_str!("js/media.js");
+    #[cfg(not(feature = "media"))]
+    let media_source = "";
     let bootstrap_source = include_str!("js/bootstrap.js")
-        .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"));
+        .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
+        .replace("/* MEDIA */", media_source);
     let bootstrap_js = bootstrap_source.as_str();
 
     if is_cross {
