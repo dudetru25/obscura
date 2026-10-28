@@ -190,6 +190,17 @@ sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 The rendering build uses rustls. The rendering-and-stealth build uses
 wreq/BoringSSL and therefore needs the additional build tools above.
 
+Optional `--features media` includes rendering and enables canvas capture,
+`MediaRecorder`, and VP8 video playback in WebM. It requires `pkg-config`,
+libvpx headers and libclang (`libvpx-dev libclang-dev` on Ubuntu/Debian).
+Build with `cargo build --release -p obscura-cli --bins --features media`.
+
+Media support accepts one VP8 video track without audio. Limits are 120 seconds,
+600 frames, 4096 pixels per dimension and 4 megapixels per frame. Encoded and
+decoded buffers are bounded at 128 MiB. Unsupported codecs, lacing, encrypted
+video and resolution changes fail explicitly. Builds without `media` retain
+the existing unsupported-media behavior.
+
 ## Quick Start
 
 ### Fetch a page
