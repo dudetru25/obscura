@@ -12,7 +12,6 @@
   const blobUrls = new Map();
   const sources = new WeakMap();
   const trackKey = {};
-  let decodedBytes = 0;
   let recordingBytes = 0;
   const queue = callback => setTimeout(callback, 0);
   const now = () => performance.now();
@@ -348,14 +347,17 @@
     observer.observe(document, { childList: true, subtree: true });
     mediaRemovalObservers.set(document, observer);
   }
+  const decoderFinalizer = new FinalizationRegistry(rid => __obscuraCore.ops.op_media_close(rid));
+
   function videoState(video) {
     let state = videoStates.get(video);
     if (!state) {
       state = { source: '', epoch: 0, ready: 0, network: 0, paused: true, ended: false,
         time: 0, anchor: 0, rate: 1, duration: NaN, width: 0, height: 0,
-        frames: [], frame: -1, error: null, timer: null, load: null,
+        rid: null, times: [], frame: -1, desiredFrame: -1, pendingFrame: null,
+        error: null, timer: null, tick: 0, pauseVersion: 0, seekVersion: 0, load: null,
         volume: 1, muted: video.hasAttribute('muted'), seeking: false, queued: false,
-        needsLoad: false, decodedBytes: 0, surfaceReleased: true };
+        needsLoad: false, surfaceReleased: true };
       videoStates.set(video, state);
       observeMediaRemovals(video);
       video.addEventListener('keydown', event => {
@@ -376,6 +378,18 @@
     }
     return source ? new URL(source, video.baseURI || location.href).href : '';
   }
+  function closeDecoder(video, state) {
+    decoderFinalizer.unregister(video);
+    if (state.rid !== null) __obscuraCore.ops.op_media_close(state.rid);
+    state.rid = null;
+    state.pendingFrame = null;
+    state.desiredFrame = -1;
+  }
+  function stopPlaybackTick(state) {
+    state.tick++;
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
   function releaseSurface(video, state) {
     __obscuraCore.ops.op_media_register_surface(video._nid >>> 0, 0, 0, new Uint8Array(), _realmFrameId);
     state.surfaceReleased = true;
@@ -385,24 +399,64 @@
     delete video._ctx;
     releaseSurface(video, state);
   }
-  function paintFrame(video, state) {
-    if (!state.frames.length) return;
-    let index = 0;
-    while (index + 1 < state.frames.length && state.frames[index + 1].time <= state.time * 1000) index++;
+  function installFrame(video, state, index, bytes) {
     const needsSurface = !state.paused || video.isConnected;
-    if (index === state.frame && (!state.surfaceReleased || !needsSurface)) return;
-    const bytes = state.frames[index].pixels;
-    // Detached paused elements still supply canvas pixels, without retaining
-    // a native paint surface or recreating one when currentTime is read.
     if (needsSurface && !__obscuraCore.ops.op_media_register_surface(video._nid >>> 0, state.width, state.height, bytes, _realmFrameId)) {
-      throw failure('The video frame exceeds the surface limit.', 'QuotaExceededError');
+      throw failure('media_surface_limit_exceeded', 'QuotaExceededError');
     }
+    // One current frame remains available to drawImage after a detached video
+    // pauses. A native surface is restored only when the element needs it.
     video._ctx = { _w: state.width, _h: state.height, _buf: bytes };
     state.frame = index;
     if (needsSurface) state.surfaceReleased = false;
   }
+  function restoreSurface(video, state) {
+    if (state.surfaceReleased && video._ctx && (!state.paused || video.isConnected)) {
+      installFrame(video, state, state.frame, video._ctx._buf);
+    }
+  }
+  function requestFrame(video, state, index) {
+    state.desiredFrame = index;
+    if (state.pendingFrame) return state.pendingFrame.promise;
+    if (index === state.frame) {
+      restoreSurface(video, state);
+      return Promise.resolve();
+    }
+    const epoch = state.epoch, rid = state.rid;
+    const request = {};
+    const drain = async () => {
+      while (epoch === state.epoch && rid === state.rid) {
+        const target = state.desiredFrame;
+        if (target === state.frame) { restoreSurface(video, state); return; }
+        const bytes = await __obscuraCore.ops.op_media_frame(rid, target);
+        if (epoch !== state.epoch || rid !== state.rid) throw failure('media_aborted', 'AbortError');
+        if (target !== state.desiredFrame || !bytes.length) continue;
+        if (bytes.length !== state.width * state.height * 4) throw failure('media_frame_payload_invalid');
+        installFrame(video, state, target, bytes);
+      }
+      throw failure('media_aborted', 'AbortError');
+    };
+    request.promise = drain().then(() => {
+      if (state.pendingFrame === request) state.pendingFrame = null;
+      if (epoch !== state.epoch || rid !== state.rid) throw failure('media_aborted', 'AbortError');
+      // A page microtask can change the desired frame after drain resolves but
+      // before this reaction runs. Carry those callers into the next request.
+      if (state.desiredFrame !== state.frame) return requestFrame(video, state, state.desiredFrame);
+    }, error => {
+      if (state.pendingFrame === request) state.pendingFrame = null;
+      throw error;
+    });
+    state.pendingFrame = request;
+    return request.promise;
+  }
+  function paintFrame(video, state) {
+    if (state.rid === null || !state.times.length) return Promise.resolve();
+    let index = 0;
+    while (index + 1 < state.times.length && state.times[index + 1] <= state.time * 1000) index++;
+    return requestFrame(video, state, index);
+  }
   function synchronize(video, state) {
-    if (!state.paused && state.ready >= 2) {
+    if (!state.paused && !state.seeking && state.ready >= 2) {
       const elapsed = Math.max(0, now() - state.anchor) * state.rate / 1000;
       state.time += elapsed;
       state.anchor = now();
@@ -410,59 +464,83 @@
         if (video.loop && state.duration > 0) state.time %= state.duration;
         else {
           state.time = state.duration;
-          state.paused = true; state.ended = true; clearTimeout(state.timer);
-          queue(() => { emit(video, 'timeupdate'); emit(video, 'pause'); emit(video, 'ended'); });
+          state.paused = true; state.ended = true; stopPlaybackTick(state);
+          const epoch = state.epoch;
+          queue(() => {
+            if (epoch !== state.epoch) return;
+            emit(video, 'timeupdate'); emit(video, 'pause'); emit(video, 'ended');
+          });
         }
       }
     }
-    paintFrame(video, state);
+    const epoch = state.epoch;
+    const painted = paintFrame(video, state);
+    painted.then(undefined, error => mediaFailure(video, state, epoch, error));
+    return painted;
   }
-  function playbackTick(video, state) {
-    if (state.paused) return;
-    synchronize(video, state);
-    if (!state.paused) {
+  function playbackTick(video, state, epoch = state.epoch, tick = state.tick) {
+    if (state.paused || epoch !== state.epoch || tick !== state.tick) return;
+    synchronize(video, state).then(() => {
+      if (state.paused || epoch !== state.epoch || tick !== state.tick) return;
       emit(video, 'timeupdate');
-      state.timer = setTimeout(() => playbackTick(video, state), 40);
-    }
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        playbackTick(video, state, epoch, tick);
+      }, 40);
+    }, () => {});
   }
   function mediaFailure(video, state, epoch, error) {
-    if (epoch !== state.epoch) return;
-    state.ready = 0; state.network = 3; state.paused = true;
-    state.error = new MediaError(trackKey, 4, String(error.message || error));
-    decodedBytes -= state.decodedBytes; state.decodedBytes = 0;
-    state.frames = []; state.width = 0; state.height = 0; state.duration = NaN;
+    if (epoch !== state.epoch || state.error) return;
+    const message = String(error.message || error);
+    const aborted = error.name === 'AbortError' || /media_(aborted|decoder_closed|document_unavailable)/.test(message);
+    const network = error.name === 'NetworkError';
+    const unsupported = error.name === 'QuotaExceededError'
+      || /media_(webm_unsupported|dimensions_invalid|.*limit_exceeded|allocation_failed)/.test(message)
+      || (!state.times.length && /media_(webm_invalid|object_url_unavailable)/.test(message));
+    const code = aborted ? 1 : network ? 2 : unsupported ? 4 : 3;
+    state.ready = 0; state.network = code === 4 ? 3 : 1; state.paused = true; state.seeking = false;
+    state.error = new MediaError(trackKey, code, message);
+    stopPlaybackTick(state);
+    closeDecoder(video, state);
+    state.times = []; state.width = 0; state.height = 0; state.duration = NaN;
     clearSurface(video, state);
     queue(() => { if (epoch === state.epoch) emit(video, 'error'); });
   }
   async function sourceBytes(source, signal) {
     const blob = blobUrls.get(source);
     if (blob) {
-      if (blob.size > MAX_BYTES) throw failure('The media resource exceeds the byte limit.', 'QuotaExceededError');
+      if (blob.size > MAX_BYTES) throw failure('media_buffer_limit_exceeded', 'QuotaExceededError');
       return new Uint8Array(await blob.arrayBuffer());
     }
-    if (source.startsWith('blob:')) throw failure('The media object URL is unavailable.');
-    const response = await fetch(source, { signal });
-    if (!response.ok) throw failure('The media resource request failed.');
-    if (Number(response.headers.get('content-length')) > MAX_BYTES) throw failure('The media resource exceeds the byte limit.', 'QuotaExceededError');
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.length > MAX_BYTES) throw failure('The media resource exceeds the byte limit.', 'QuotaExceededError');
+    if (source.startsWith('blob:')) throw failure('media_object_url_unavailable');
+    const networkFailure = error => {
+      if (error.name === 'AbortError') throw error;
+      throw failure(String(error.message || error), 'NetworkError');
+    };
+    const response = await fetch(source, { signal }).then(undefined, networkFailure);
+    if (!response.ok) throw failure('The media resource request failed.', 'NetworkError');
+    if (Number(response.headers.get('content-length')) > MAX_BYTES) throw failure('media_buffer_limit_exceeded', 'QuotaExceededError');
+    const bytes = new Uint8Array(await response.arrayBuffer().then(undefined, networkFailure));
+    if (bytes.length > MAX_BYTES) throw failure('media_buffer_limit_exceeded', 'QuotaExceededError');
     return bytes;
   }
   function loadVideo(video, force = false, allowDefer = false) {
     const state = videoState(video);
     const source = selectedSource(video);
     if (!force && !state.needsLoad && source === state.source && state.load) {
-      paintFrame(video, state);
-      return state.load;
+      const epoch = state.epoch;
+      const loaded = state.load.then(() => paintFrame(video, state));
+      loaded.then(undefined, error => mediaFailure(video, state, epoch, error));
+      return loaded;
     }
     state.needsLoad = false;
     state.abort?.abort();
-    clearTimeout(state.timer);
+    stopPlaybackTick(state);
+    closeDecoder(video, state);
     state.source = source; state.epoch++;
     state.ready = 0; state.network = source ? 2 : 0; state.error = null;
-    state.paused = true; state.ended = false; state.time = 0;
-    decodedBytes -= state.decodedBytes; state.decodedBytes = 0;
-    state.duration = NaN; state.width = 0; state.height = 0; state.frames = [];
+    state.paused = true; state.ended = false; state.time = 0; state.seeking = false;
+    state.duration = NaN; state.width = 0; state.height = 0; state.times = [];
     clearSurface(video, state);
     const epoch = state.epoch;
     if (!source) { state.load = Promise.resolve(); return state.load; }
@@ -474,41 +552,38 @@
     state.abort = new AbortController();
     queue(() => { if (epoch === state.epoch) emit(video, 'loadstart'); });
     state.load = sourceBytes(source, state.abort.signal)
-      .then(bytes => __obscuraCore.ops.op_media_decode_webm(bytes))
-      .then(packed => {
-        if (epoch !== state.epoch) throw failure('The media source changed.', 'AbortError');
-        const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-        if (packed.byteLength < 24) throw failure('The decoded media header is invalid.');
-        const width = view.getUint32(0, true), height = view.getUint32(4, true);
-        const count = view.getUint32(8, true), duration = view.getFloat64(16, true);
-        const frameBytes = width * height * 4;
-        if (!width || !height || width > 4096 || height > 4096 || width * height > 4 * 1024 * 1024
-            || !count || count > MAX_FRAMES || view.getUint32(12, true) !== 0
-            || !Number.isFinite(duration) || duration <= 0 || duration > MAX_DURATION
-            || packed.byteLength !== 24 + count * (8 + frameBytes) || packed.byteLength > MAX_BYTES) {
-          throw failure('The decoded media payload is invalid.');
+      .then(bytes => {
+        if (epoch !== state.epoch) throw failure('media_aborted', 'AbortError');
+        return __obscuraCore.ops.op_media_open(bytes, _realmFrameId, video._nid >>> 0);
+      })
+      .then(info => {
+        if (epoch !== state.epoch) {
+          __obscuraCore.ops.op_media_close(info.rid);
+          throw failure('media_aborted', 'AbortError');
         }
-        if (packed.byteLength + decodedBytes > MAX_BYTES) throw failure('The page exceeds the decoded media byte limit.', 'QuotaExceededError');
-        const frames = [];
-        let offset = 24, previous = -1;
-        for (let index = 0; index < count; index++) {
-          const time = view.getFloat64(offset, true); offset += 8;
-          if (!Number.isFinite(time) || time < 0 || time < previous || time > duration) throw failure('The decoded media timestamp is invalid.');
-          frames.push({ time, pixels: packed.subarray(offset, offset + frameBytes) });
-          offset += frameBytes; previous = time;
+        state.rid = info.rid;
+        decoderFinalizer.register(video, info.rid, video);
+        const { width, height, times, durationMs } = info;
+        if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0
+            || width > 4096 || height > 4096 || width * height > 4 * 1024 * 1024
+            || !Array.isArray(times) || !times.length || times.length > MAX_FRAMES
+            || !Number.isFinite(durationMs) || durationMs <= 0 || durationMs > MAX_DURATION
+            || times.some((time, index) => !Number.isFinite(time) || time < 0 || time >= durationMs
+              || index > 0 && time <= times[index - 1])) {
+          throw failure('media_metadata_invalid');
         }
-        state.width = width; state.height = height; state.duration = duration / 1000;
-        state.decodedBytes = packed.byteLength; decodedBytes += packed.byteLength;
-        state.frames = frames; state.ready = 4; state.network = 1;
-        paintFrame(video, state);
-        return new Promise((resolve, reject) => queue(() => {
-          if (epoch !== state.epoch) { reject(failure('The media source changed.', 'AbortError')); return; }
-          emit(video, 'durationchange'); emit(video, 'loadedmetadata');
-          emit(video, 'loadeddata'); emit(video, 'canplay'); emit(video, 'canplaythrough');
-          resolve();
-          if (video.autoplay) video.play().then(undefined, () => {});
-        }));
-      });
+        state.width = width; state.height = height; state.duration = durationMs / 1000;
+        state.times = times;
+        return paintFrame(video, state);
+      })
+      .then(() => new Promise((resolve, reject) => queue(() => {
+        if (epoch !== state.epoch) { reject(failure('media_aborted', 'AbortError')); return; }
+        state.ready = 4; state.network = 1;
+        emit(video, 'durationchange'); emit(video, 'loadedmetadata');
+        emit(video, 'loadeddata'); emit(video, 'canplay'); emit(video, 'canplaythrough');
+        resolve();
+        if (video.autoplay) video.play().then(undefined, () => {});
+      })));
     state.load.then(undefined, error => mediaFailure(video, state, epoch, error));
     return state.load;
   }
@@ -520,25 +595,38 @@
   HTMLMediaElement.prototype.play = function() {
     const video = this;
     const state = videoState(video);
-    return loadVideo(video).then(() => {
-      if (!state.frames.length || state.error) throw failure('The element has no supported source.');
+    const loaded = loadVideo(video);
+    const epoch = state.epoch, pauseVersion = state.pauseVersion;
+    return loaded.then(() => {
+      if (epoch !== state.epoch || pauseVersion !== state.pauseVersion) throw failure('Playback was interrupted.', 'AbortError');
+      if (!state.times.length || state.error) throw failure('The element has no supported source.');
       if (!state.paused) return;
       if (state.ended) { state.time = 0; state.ended = false; }
-      state.paused = false; state.anchor = now();
-      const epoch = state.epoch;
-      return new Promise((resolve, reject) => queue(() => {
-        if (state.paused || epoch !== state.epoch) { reject(failure('Playback was interrupted.', 'AbortError')); return; }
-        emit(video, 'play'); emit(video, 'playing');
-        playbackTick(video, state); resolve();
-      }));
+      return paintFrame(video, state).then(() => {
+        if (epoch !== state.epoch || pauseVersion !== state.pauseVersion) throw failure('Playback was interrupted.', 'AbortError');
+        if (!state.paused) return;
+        state.paused = false; state.anchor = now();
+        stopPlaybackTick(state);
+        return new Promise((resolve, reject) => queue(() => {
+          if (state.paused || epoch !== state.epoch || pauseVersion !== state.pauseVersion) { reject(failure('Playback was interrupted.', 'AbortError')); return; }
+          emit(video, 'play'); emit(video, 'playing');
+          playbackTick(video, state); resolve();
+        }));
+      });
     }, error => Promise.reject(error?.name === 'AbortError' ? error : failure('The element has no supported source.')));
   };
   HTMLMediaElement.prototype.pause = function() {
     const state = videoState(this);
+    state.pauseVersion++;
     synchronize(this, state);
+    stopPlaybackTick(state);
     if (state.paused) return;
-    state.paused = true; clearTimeout(state.timer);
-    queue(() => { emit(this, 'timeupdate'); emit(this, 'pause'); });
+    state.paused = true;
+    const epoch = state.epoch;
+    queue(() => {
+      if (epoch !== state.epoch) return;
+      emit(this, 'timeupdate'); emit(this, 'pause');
+    });
   };
   const mediaProperties = {
     paused: { get() { return videoState(this).paused; } },
@@ -554,11 +642,22 @@
       set(value) {
         value = Number(value);
         if (!Number.isFinite(value)) throw new TypeError('Current time must be finite');
-        const state = videoState(this);
+        const video = this, state = videoState(video);
         state.time = Math.max(0, Number.isFinite(state.duration) ? Math.min(value, state.duration) : value);
-        state.anchor = now(); state.ended = false; state.seeking = true;
-        paintFrame(this, state);
-        queue(() => { emit(this, 'seeking'); state.seeking = false; emit(this, 'timeupdate'); emit(this, 'seeked'); });
+        state.anchor = now(); state.ended = false;
+        if (!state.times.length || state.rid === null) return;
+        state.seeking = true;
+        stopPlaybackTick(state);
+        const epoch = state.epoch, seekVersion = ++state.seekVersion;
+        queue(() => {
+          if (epoch === state.epoch && seekVersion === state.seekVersion) emit(video, 'seeking');
+        });
+        paintFrame(video, state).then(() => queue(() => {
+          if (epoch !== state.epoch || seekVersion !== state.seekVersion) return;
+          state.seeking = false; state.anchor = now();
+          emit(video, 'timeupdate'); emit(video, 'seeked');
+          if (!state.paused) playbackTick(video, state);
+        }), error => mediaFailure(video, state, epoch, error));
       },
     },
     playbackRate: {
@@ -608,7 +707,12 @@
     if ((element.localName === 'video' || element.localName === 'audio')
         && (name === 'src' || name === 'children' || name === 'preload' || name === 'autoplay')) {
       const state = videoState(element);
-      if (name === 'src') state.needsLoad = true;
+      if (name === 'src') {
+        state.needsLoad = true;
+        state.epoch++;
+        state.abort?.abort();
+        closeDecoder(element, state);
+      }
       if (!state.queued) {
         state.queued = true;
         queue(() => { state.queued = false; loadVideo(element, false, true).then(undefined, () => {}); });

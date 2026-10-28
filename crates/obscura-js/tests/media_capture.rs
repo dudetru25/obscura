@@ -209,9 +209,13 @@ async fn canvas_recording_chunks_decode_and_play_with_real_frame_pixels() {
         const advanced = video.currentTime > 0 && !video.paused;
         video.pause();
         const paused = video.paused;
-        video.currentTime = .1;
+        const seek = time => new Promise(resolve => {
+            video.addEventListener('seeked', resolve, {once:true});
+            video.currentTime = time;
+        });
+        await seek(.1);
         const second = sample();
-        video.currentTime = 0;
+        await seek(0);
         const reset = sample();
         await video.play(); clock += 1000;
         const ended = video.ended && video.paused;
@@ -247,7 +251,7 @@ async fn canvas_recording_chunks_decode_and_play_with_real_frame_pixels() {
 
 #[tokio::test]
 async fn invalid_media_fails_explicitly_and_source_reset_discards_old_frames() {
-    let mut runtime = runtime();
+    let mut runtime = runtime_with_video_fixture();
     for expression in [
         "document.createElement('canvas').captureStream(-1)",
         "document.createElement('canvas').captureStream(Infinity)",
@@ -260,23 +264,31 @@ async fn invalid_media_fails_explicitly_and_source_reset_discards_old_frames() {
         assert!(runtime.evaluate(expression).is_err(), "must reject {expression}");
     }
     let result = runtime.evaluate_for_cdp(r#"(async () => {
-        const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 4;
-        const context = canvas.getContext('2d');
-        const stream = canvas.captureStream(0), track = stream.getVideoTracks()[0];
-        const recorder = new MediaRecorder(stream), chunks = [];
-        recorder.ondataavailable = event => chunks.push(event.data);
-        const stopped = new Promise((resolve,reject) => {
-            recorder.onstop = resolve; recorder.onerror = event => reject(event.error);
-        });
-        recorder.start(); context.fillStyle = '#ff0000'; context.fillRect(0,0,4,4); track.requestFrame();
-        recorder.stop(); track.stop(); await stopped;
+        const fixture = await createVideoFixture(4,4,17);
         const video = document.createElement('video'); document.body.append(video);
-        const valid = URL.createObjectURL(new Blob(chunks, {type:'video/webm'}));
-        const loaded = new Promise((resolve,reject) => {
+        const valid = await loadVideoFixture(video, fixture.blob);
+        const before = [video.readyState >= 2, video.videoWidth, video.videoHeight];
+        let seeked = 0;
+        video.addEventListener('seeked', () => seeked++);
+        video.currentTime = .64;
+        const reloaded = new Promise((resolve,reject) => {
             video.onloadeddata = resolve; video.onerror = reject;
         });
-        video.src = valid; await loaded;
-        const before = [video.readyState >= 2, video.videoWidth, video.videoHeight];
+        video.src = valid;
+        await reloaded;
+        const canvas = document.createElement('canvas'); canvas.width = 1; canvas.height = 1;
+        const context = canvas.getContext('2d'); context.drawImage(video,0,0,1,1);
+        const pixel = Array.from(context.getImageData(0,0,1,1).data);
+        const replaced = [video.currentTime,video.seeking,seeked,pixel[0] > 200,pixel[2] < 50];
+        const cycles = [];
+        for (let index = 0; index < 17; index++) {
+            video.removeAttribute('src'); video.load();
+            const loaded = new Promise((resolve,reject) => {
+                video.onloadeddata = resolve; video.onerror = reject;
+            });
+            video.src = valid; await loaded;
+            cycles.push([video.readyState >= 2,video.currentTime,video.error]);
+        }
         const invalid = URL.createObjectURL(new Blob([new Uint8Array([1,2,3])], {type:'video/webm'}));
         const errored = new Promise(resolve => { video.onerror = resolve; });
         video.src = invalid; await errored;
@@ -285,13 +297,15 @@ async fn invalid_media_fails_explicitly_and_source_reset_discards_old_frames() {
         video.removeAttribute('src'); video.load();
         const cleared = [video.readyState,video.networkState,video.error,video.currentTime];
         URL.revokeObjectURL(valid); URL.revokeObjectURL(invalid);
-        return {before,after,cleared};
+        return {before,replaced,cycles,after,cleared};
     })()"#, true, true).await.expect("error lifecycle must settle");
-    assert_eq!(result.value.unwrap(), json!({
-        "before":[true,4,4],
-        "after":[0,0,0,4,"NotSupportedError"],
-        "cleared":[0,0,null,0],
-    }));
+    assert!(!result.thrown, "source reset rejected: {}", result.description);
+    let value = result.value.expect("source reset result");
+    assert_eq!(value["before"], json!([true,4,4]));
+    assert_eq!(value["replaced"], json!([0,false,0,true,true]));
+    assert_eq!(value["cycles"], json!(vec![json!([true,0,null]);17]));
+    assert_eq!(value["after"], json!([0,0,0,4,"NotSupportedError"]));
+    assert_eq!(value["cleared"], json!([0,0,null,0]));
 }
 
 #[tokio::test]
