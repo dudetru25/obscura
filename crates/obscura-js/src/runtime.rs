@@ -15257,11 +15257,23 @@ mod tests {
         );
         rt.set_viewport(300.0, 200.0);
         rt.execute_script(
-            "observe-iframe-and-parent",
+            "create-observed-iframe",
             r#"
                 const frame = document.createElement("iframe");
                 frame.srcdoc = '<html><body><div id="foreign" style="width:120px;height:40px"></div></body></html>';
                 document.body.appendChild(frame);
+            "#,
+        ).unwrap();
+        // srcdoc navigation is a queued browser task. Observe its loaded document.
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[frame.contentDocument.getElementById('foreign') instanceof frame.contentWindow.Element, \
+                frame.contentDocument.getElementById('foreign') instanceof Element]").unwrap(),
+            serde_json::json!([true, false])
+        );
+        rt.execute_script(
+            "observe-iframe-and-parent",
+            r#"
                 globalThis.__localTarget = document.getElementById("local");
                 globalThis.__foreignTarget = frame.contentDocument.getElementById("foreign");
                 globalThis.__crossRealmRecords = [];
@@ -15293,11 +15305,11 @@ mod tests {
 
         for invalid in ["null", "{}", "document", "frame.contentDocument", "document.createTextNode('text')"] {
             assert!(rt
-                .evaluate(&format!("__crossRealmObserver.observe({invalid})"))
+                .evaluate_script(&format!("__crossRealmObserver.observe({invalid})"))
                 .is_err());
         }
         assert!(rt
-            .evaluate("__crossRealmObserver.observe(__foreignTarget, {box:'invalid'})")
+            .evaluate_script("__crossRealmObserver.observe(__foreignTarget, {box:'invalid'})")
             .is_err());
         rt.evaluate("__foreignTarget.style.width = '200px'").unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();

@@ -117,7 +117,7 @@ async fn invalid_media_fails_explicitly_and_source_reset_discards_old_frames() {
         "document.createElement('video').currentTime = NaN",
         "document.createElement('video').volume = 2",
     ] {
-        assert!(runtime.evaluate(expression).is_err(), "must reject {expression}");
+        assert!(runtime.evaluate_script(expression).is_err(), "must reject {expression}");
     }
     let result = runtime.evaluate_for_cdp(r#"(async () => {
         const canvas = document.createElement('canvas'); canvas.width = 4; canvas.height = 4;
