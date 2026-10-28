@@ -11,7 +11,7 @@ mkdir -p ci-output
 cargo --version
 cargo nextest --version
 pkg-config --modversion vpx
-cargo nextest run --locked --release --features media -p obscura-js     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
+cargo nextest run --locked --release --features media     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
 suite_status=0
 cargo nextest run --locked --release --features media --no-fail-fast     2>&1 | tee ci-output/full-media.log || suite_status=$?
 cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
