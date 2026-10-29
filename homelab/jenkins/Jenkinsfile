@@ -3,19 +3,19 @@
 
 try {
     homelabPipeline(
-        agentLabel: 'ci-dev-3-instabox-3',
+        agentLabel: 'homelab-dev3-linux',
         branch: 'fix/browser-api-compat',
         sourceRepository: 'https://github.com/dudetru25/obscura.git',
         scmCredentialId: scm.userRemoteConfigs[0].credentialsId,
         sourceRevisionParameter: 'SOURCE_SHA',
-        scriptPath: 'Jenkinsfile',
+        scriptPath: 'homelab/jenkins/Jenkinsfile',
         pipelineRevision: params.SOURCE_SHA,
         timeoutMinutes: 60,
         queueProfile: 'small-web',
-        checkCommand: 'CHROME_BIN="$HOME/.tools/chrome-155.0.8059.84/chrome" bash scripts/ci/jenkins.sh'
+        checkCommand: 'CHROME_BIN=/mnt/g/GithubProjects/.jenkins-workspace/.tools/chrome-155.0.8059.84/chrome bash homelab/jenkins/jenkins.sh'
     )
 } finally {
-    node('ci-dev-3-instabox-3') {
+    node('homelab-dev3-linux') {
         ws("${pwd()}@build-${env.BUILD_NUMBER}") {
             archiveArtifacts(artifacts: 'ci-output/**', excludes: 'ci-output/obscura-benchmark/**',
                 allowEmptyArchive: true, fingerprint: true)

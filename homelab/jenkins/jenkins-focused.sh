@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run media, email validation and iframe/ResizeObserver coverage in both build modes.
 set -euo pipefail
-source scripts/ci/environment.sh
+source homelab/jenkins/environment.sh
 suite_status=0
 for build_mode in default render; do
     feature_args=()

@@ -16,7 +16,7 @@ WORKDIR /build
 
 # Cache dependency compilation by copying manifests first
 COPY Cargo.toml Cargo.lock ./
-COPY scripts/ci/media-environment.sh scripts/ci/media-environment.sh
+COPY scripts/build/media-environment.sh scripts/build/media-environment.sh
 COPY vendor/ vendor/
 COPY crates/obscura-dom/Cargo.toml       crates/obscura-dom/Cargo.toml
 COPY crates/obscura-net/Cargo.toml       crates/obscura-net/Cargo.toml
@@ -36,14 +36,14 @@ RUN for crate in obscura-dom obscura-net obscura-browser obscura-cdp obscura-js 
     echo "fn main() {}" > crates/obscura-cli/src/main.rs && \
     echo "fn main() {}" > crates/obscura-cli/src/worker.rs
 
-RUN source scripts/ci/media-environment.sh && \
+RUN source scripts/build/media-environment.sh && \
     (cargo build --release --features render --bin obscura --bin obscura-worker 2>/dev/null || true)
 
 ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
-RUN source scripts/ci/media-environment.sh && \
+RUN source scripts/build/media-environment.sh && \
     echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
     touch crates/*/src/*.rs && cargo build --release --features render --bin obscura --bin obscura-worker
 

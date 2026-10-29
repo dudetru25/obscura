@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the fork's release acceptance within its existing Jenkins budget entry.
 set -euo pipefail
-source scripts/ci/environment.sh
+bash -n homelab/jenkins/jenkins.sh
+source homelab/jenkins/environment.sh
 python3 -m venv .ci-python
 .ci-python/bin/python -m pip install --only-binary=:all: -r scripts/ci/render-requirements.txt
 export PYTHON_BIN="$PWD/.ci-python/bin/python"

@@ -15,4 +15,4 @@ source_revision=$(git rev-parse HEAD)
 mkdir -p ci-output
 cargo --version
 cargo nextest --version
-source scripts/ci/media-environment.sh
+source scripts/build/media-environment.sh
