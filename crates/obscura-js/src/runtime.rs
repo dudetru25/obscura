@@ -602,7 +602,6 @@ impl ObscuraJsRuntime {
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
     /// share the retained layout on pages with running animations.
     fn begin_javascript_task(&mut self) {
-        #[cfg(feature = "media")]
         crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
         // Some internal callers intentionally ignore script errors. Recover a
         // heap-limit termination before any later task enters V8 even when the
@@ -1061,7 +1060,6 @@ impl ObscuraJsRuntime {
 
     pub fn forget_frame_state(&mut self, frame_id: u32) {
         self.realm_states().borrow_mut().forget_frame(frame_id);
-        #[cfg(feature = "media")]
         crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
@@ -1322,6 +1320,7 @@ impl ObscuraJsRuntime {
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
+        gs.canvas_surfaces.clear();
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
@@ -1350,7 +1349,6 @@ impl ObscuraJsRuntime {
             gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
-            gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1358,7 +1356,6 @@ impl ObscuraJsRuntime {
         }
         drop(gs);
         self.realm_states().borrow().cancel_inactive_frame_timers();
-        #[cfg(feature = "media")]
         crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
@@ -4624,13 +4621,9 @@ mod tests {
 
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
-        #[cfg(feature = "media")]
-        let media_source = include_str!("../js/media.js");
-        #[cfg(not(feature = "media"))]
-        let media_source = "";
         let source = include_str!("../js/bootstrap.js")
             .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
-            .replace("/* MEDIA */", media_source)
+            .replace("/* MEDIA */", include_str!("../js/media.js"))
             .replace("/* NODE_TRANSFER */", include_str!("../js/node_transfer.js"));
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {

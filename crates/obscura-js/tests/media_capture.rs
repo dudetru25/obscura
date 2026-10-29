@@ -1,5 +1,3 @@
-#![cfg(feature = "media")]
-
 use obscura_dom::parse_html;
 use obscura_js::runtime::ObscuraJsRuntime;
 use serde_json::json;
@@ -222,7 +220,7 @@ async fn canvas_recording_chunks_decode_and_play_with_real_frame_pixels() {
         const ended = video.ended && video.paused;
         URL.revokeObjectURL(url);
         return {events, chunks:chunks.length, header, hasCluster, mime:blob.type,
-            dimensions:[video.videoWidth,video.videoHeight,bounds.width,bounds.height],
+            dimensions:[video.videoWidth,video.videoHeight], bounds:[bounds.width,bounds.height],
             first,second,reset,advanced,paused,ended,mediaEvents,
             lifecycle:[recorder.state,track.readyState,stream.active],
             support:[MediaRecorder.isTypeSupported('video/webm;codecs=vp8'),
@@ -234,7 +232,9 @@ async fn canvas_recording_chunks_decode_and_play_with_real_frame_pixels() {
     assert_eq!(value["header"], json!([0x1a,0x45,0xdf,0xa3]));
     assert_eq!(value["hasCluster"], true);
     assert_eq!(value["mime"], "video/webm");
-    assert_eq!(value["dimensions"], json!([4,4,4,4]));
+    assert_eq!(value["dimensions"], json!([4,4]));
+    #[cfg(feature = "render")]
+    assert_eq!(value["bounds"], json!([4,4]));
     for sample in ["first", "reset"] {
         assert!(value[sample][0].as_u64().unwrap() > 200, "red decoded frame: {value}");
         assert!(value[sample][2].as_u64().unwrap() < 50, "red decoded frame: {value}");

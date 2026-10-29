@@ -10,9 +10,6 @@ default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth"]
 render = ["obscura-browser/render", "dep:base64"]
 
-# Optional VP8/WebM capture, recording and video playback.
-media = ["render", "obscura-browser/media"]
-
 [dependencies]
 obscura-browser = { workspace = true }
 obscura-dom = { workspace = true }

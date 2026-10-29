@@ -10,9 +10,6 @@ default = []
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
 render = ["obscura-js/render", "dep:image"]
 
-# Optional VP8/WebM capture, recording and video playback.
-media = ["render", "obscura-js/media"]
-
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }

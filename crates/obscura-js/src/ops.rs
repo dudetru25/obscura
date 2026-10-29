@@ -105,11 +105,10 @@ pub struct JsNetworkEvent {
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
 
-/// A live Canvas2D backing store retained from V8. `JsBuffer` owns a shared
+/// A live canvas or video backing store retained from V8. `JsBuffer` owns a shared
 /// reference to the ArrayBuffer backing store, so the pixels stay valid while
-/// the canvas wrapper and native page state share it. Paint only borrows these
+/// the element wrapper and native page state share it. Paint only borrows these
 /// bytes synchronously while JavaScript is not executing.
-#[cfg(feature = "render")]
 pub(crate) struct CanvasBackingSurface {
     pub width: u32,
     pub height: u32,
@@ -529,9 +528,8 @@ pub struct ObscuraState {
     /// `<style>` element merely to feed the renderer.
     #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
-    /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
+    /// Live canvas and video backing stores keyed by stable DOM identity. Pixel damage
     /// updates this resource independently of retained style/layout geometry.
-    #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
@@ -726,7 +724,6 @@ impl ObscuraState {
             style_query_cache: None,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
-            #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
@@ -2112,7 +2109,6 @@ fn op_dom(
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
             if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
-            #[cfg(feature = "media")]
             crate::media_ops::close_inactive(state);
             return "true".into();
         }
@@ -2124,7 +2120,6 @@ fn op_dom(
                 if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
             }
             registry.cancel_inactive_frame_timers();
-            #[cfg(feature = "media")]
             crate::media_ops::close_inactive(state);
             // The bootstrap unwraps this private mutation result before any
             // DOM caller sees it, and resets only the retired iframe identities.
@@ -7862,10 +7857,8 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 
 // Media jobs run outside the isolate. Serial admission bounds native codec
 // memory across pages without blocking the JavaScript event loop.
-#[cfg(feature = "media")]
 pub(crate) static MEDIA_JOB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-#[cfg(feature = "media")]
 #[op2]
 #[buffer]
 async fn op_media_encode_webm(
@@ -7896,9 +7889,9 @@ async fn op_media_encode_webm(
     result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
 }
 
-#[cfg(feature = "media")]
 pub(crate) fn release_media_surface(state: &mut ObscuraState, node: NodeId) {
     state.canvas_surfaces.remove(&node);
+    #[cfg(feature = "render")]
     if state.render_resources.set_video_dimensions(node, None) {
         invalidate_render_resource_geometry(state);
     }
@@ -7906,7 +7899,6 @@ pub(crate) fn release_media_surface(state: &mut ObscuraState, node: NodeId) {
 
 /// Video frames share the retained RGBA surface path with canvas. A 0x0 empty
 /// buffer releases the selected video's surface after source reset or failure.
-#[cfg(feature = "media")]
 #[op2]
 fn op_media_register_surface(
     state: &OpState,
@@ -7943,6 +7935,7 @@ fn op_media_register_surface(
         }).and_then(|total| total.checked_sub(replacing)).and_then(|total| total.checked_add(expected));
         if retained.is_none_or(|total| total > 256 * 1024 * 1024) { return false; }
         state.canvas_surfaces.insert(node, CanvasBackingSurface { width, height, pixels });
+        #[cfg(feature = "render")]
         if state.render_resources.set_video_dimensions(node, Some((width, height))) {
             invalidate_render_resource_geometry(&mut state);
         }
@@ -8019,6 +8012,11 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_media_encode_webm(),
+        crate::media_ops::op_media_open(),
+        crate::media_ops::op_media_frame(),
+        crate::media_ops::op_media_close(),
+        op_media_register_surface(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
@@ -8047,14 +8045,6 @@ pub fn build_extension() -> Extension {
         ops.push(op_scroll_to());
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
-    }
-    #[cfg(feature = "media")]
-    {
-        ops.push(op_media_encode_webm());
-        ops.push(crate::media_ops::op_media_open());
-        ops.push(crate::media_ops::op_media_frame());
-        ops.push(crate::media_ops::op_media_close());
-        ops.push(op_media_register_surface());
     }
     Extension {
         name: "obscura_dom",

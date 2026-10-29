@@ -3,9 +3,7 @@ pub mod frame;
 mod import_map;
 pub mod indexed_db;
 pub mod markdown;
-#[cfg(feature = "media")]
 mod media;
-#[cfg(feature = "media")]
 mod media_ops;
 mod node_transfer;
 pub mod module_loader;
