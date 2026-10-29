@@ -6,6 +6,9 @@
 // after deno_core finishes binding ops and before any page script runs. All
 // browser APIs below close over this reference.
 const __obscuraCore = globalThis.Deno.core;
+let _mediaAttributeChanged = null;
+let _mediaTreeChanged = null;
+let _mediaInitializeDocument = null;
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -2327,6 +2330,7 @@ function _runPostConnectionSteps(nodes) {
       const n = nodes[i];
       __prepareInsertedSubtree(n);
       if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+      if (_mediaTreeChanged) _mediaTreeChanged(n);
     }
   } finally {
     _postConnection = outer;
@@ -2673,6 +2677,7 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
   _seedDetachedTreeState(child);
   if (_foreignDocumentCount) _stampNodeDocument(child, _nodeDocumentForInsertion(parent));
   _detachStyleSheetsInSubtree(child);
+  if (_mediaAttributeChanged) _mediaAttributeChanged(parent, 'children');
   _reconcileWindowNamedProperties(removedWindowNames);
   if (observed) _queueTreeMutationRecord(parent, [], [child], previousSibling, nextSibling);
 }
@@ -4191,6 +4196,7 @@ class Element extends Node {
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
     _connectSrcdocFrames(this, html);
+    if (_mediaTreeChanged) _mediaTreeChanged(this);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -4334,6 +4340,7 @@ class Element extends Node {
       }
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
+    if (_mediaAttributeChanged) _mediaAttributeChanged(this, n);
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -4371,6 +4378,7 @@ class Element extends Node {
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute(value);
+    if (ns === "" && _mediaAttributeChanged) _mediaAttributeChanged(this, localName);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -4395,6 +4403,7 @@ class Element extends Node {
       _reconcileWindowNamedProperty(previousWindowName);
     }
     if (n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
+    if (_mediaAttributeChanged) _mediaAttributeChanged(this, n);
     if (n === "onload" && _isWindowReflectingBodyElement(this)) {
       _windowOnloadOverrideSet = false;
       _windowOnloadOverride = null;
@@ -4426,6 +4435,7 @@ class Element extends Node {
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
     if (ns === "" && n === "style") _elementStyleGet(this)?._replaceFromAttribute("");
+    if (ns === "" && _mediaAttributeChanged) _mediaAttributeChanged(this, n);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -9098,18 +9108,25 @@ if (typeof Response === 'undefined') {
       this._bodyAborted = false;
       this._bodyAbortReason = undefined;
     }
-    _consumeBody() {
+    async _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      const stream = this._bodyStream;
       this._bodyUsed = true;
       if (this._bodyAborted) throw this._bodyAbortReason;
+      if (stream) {
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) {}
+        reader.releaseLock();
+      }
+      return this._fetchBody ? await this._fetchBody.promise : this._bodyBytes;
     }
     get body() {
       if (this._bodyNull) return null;
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
             if (this._bodyAborted) { controller.error(this._bodyAbortReason); return; }
+            if (this._bodyUsed) { controller.close(); return; }
             const deliver = (bytes) => {
               if (bytes.length) controller.enqueue(bytes);
               controller.close();
@@ -9142,10 +9159,10 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    async text() { return _decodeBodyWithCharset(await this._consumeBody(), this.headers); }
+    async json() { return JSON.parse(_decodeBodyWithCharset(await this._consumeBody(), this.headers)); }
+    async arrayBuffer() { return _arrayBufferFromBytes(await this._consumeBody()); }
+    async blob() { return new Blob([await this._consumeBody()]); }
     clone() {
       const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
@@ -16643,6 +16660,8 @@ URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
 };
 
+/* MEDIA */
+
 // Window-level scrolling (issue #468). #431 gave elements functional
 // scrollTop/scrollLeft plus scroll methods, but left these three as no-ops, so
 // the dominant infinite-scroll idiom -- window.scrollTo(0, body.scrollHeight),
@@ -18475,6 +18494,7 @@ globalThis.__obscura_init = (function() {
     if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
     else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
   }
+  if (_mediaInitializeDocument) _mediaInitializeDocument(document);
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

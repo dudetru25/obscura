@@ -105,11 +105,10 @@ pub struct JsNetworkEvent {
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
 
-/// A live Canvas2D backing store retained from V8. `JsBuffer` owns a shared
+/// A live canvas or video backing store retained from V8. `JsBuffer` owns a shared
 /// reference to the ArrayBuffer backing store, so the pixels stay valid while
-/// the canvas wrapper and native page state share it. Paint only borrows these
+/// the element wrapper and native page state share it. Paint only borrows these
 /// bytes synchronously while JavaScript is not executing.
-#[cfg(feature = "render")]
 pub(crate) struct CanvasBackingSurface {
     pub width: u32,
     pub height: u32,
@@ -529,9 +528,8 @@ pub struct ObscuraState {
     /// `<style>` element merely to feed the renderer.
     #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
-    /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
+    /// Live canvas and video backing stores keyed by stable DOM identity. Pixel damage
     /// updates this resource independently of retained style/layout geometry.
-    #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
@@ -726,7 +724,6 @@ impl ObscuraState {
             style_query_cache: None,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
-            #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
@@ -2112,6 +2109,7 @@ fn op_dom(
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
             if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            crate::media_ops::close_inactive(state);
             return "true".into();
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
@@ -2122,6 +2120,7 @@ fn op_dom(
                 if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
             }
             registry.cancel_inactive_frame_timers();
+            crate::media_ops::close_inactive(state);
             // The bootstrap unwraps this private mutation result before any
             // DOM caller sees it, and resets only the retired iframe identities.
             serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
@@ -5554,8 +5553,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the GET headers before replying. Closing a socket with an
+            // unread request can reset it before the client reaches the cap.
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 16 * 1024, "fixture request headers are too large");
+                request.push(sock.read_u8().await.expect("read fixture request headers"));
+            }
             let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
             if with_content_length {
                 header.push_str(&format!("Content-Length: {body_len}\r\n"));
@@ -7765,6 +7771,97 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+// Media jobs run outside the isolate. Serial admission bounds native codec
+// memory across pages without blocking the JavaScript event loop.
+pub(crate) static MEDIA_JOB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[op2]
+#[buffer]
+async fn op_media_encode_webm(
+    width: u32,
+    height: u32,
+    #[string] timestamps_json: String,
+    duration_ms: f64,
+    include_header: bool,
+    #[buffer] rgba: JsBuffer,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    if timestamps_json.len() > 32_768 {
+        return Err(deno_error::JsErrorBox::type_error("media_timestamps_invalid"));
+    }
+    let timestamps: Vec<f64> = serde_json::from_str(&timestamps_json)
+        .map_err(|_| deno_error::JsErrorBox::type_error("media_timestamps_invalid"))?;
+    crate::media::validate_encode(width, height, &timestamps, duration_ms, rgba.len())
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+    let permit = MEDIA_JOB.acquire().await
+        .map_err(|_| deno_error::JsErrorBox::generic("media_worker_unavailable"))?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(rgba.len())
+        .map_err(|_| deno_error::JsErrorBox::generic("media_allocation_failed"))?;
+    pixels.extend_from_slice(&rgba);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::media::encode_webm(width, height, &timestamps, duration_ms, include_header, &pixels)
+    }).await.map_err(|_| deno_error::JsErrorBox::generic("media_worker_failed"))?;
+    result.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
+}
+
+pub(crate) fn release_media_surface(state: &mut ObscuraState, node: NodeId) {
+    state.canvas_surfaces.remove(&node);
+    #[cfg(feature = "render")]
+    if state.render_resources.set_video_dimensions(node, None) {
+        invalidate_render_resource_geometry(state);
+    }
+}
+
+/// Video frames share the retained RGBA surface path with canvas. A 0x0 empty
+/// buffer releases the selected video's surface after source reset or failure.
+#[op2]
+fn op_media_register_surface(
+    state: &OpState,
+    nid: u32,
+    width: u32,
+    height: u32,
+    #[buffer] pixels: JsBuffer,
+    frame_id: u32,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = if frame_id == 0 {
+            Some(state.borrow::<SharedState>().clone())
+        } else {
+            state.try_borrow::<Rc<RefCell<RealmStates>>>()
+                .and_then(|registry| registry.borrow().by_frame_id(frame_id))
+        };
+        let Some(shared) = shared else { return false; };
+        let mut state = shared.borrow_mut();
+        let node = NodeId::new(nid);
+        if !state.dom.as_ref().and_then(|dom| dom.get_node(node)).is_some_and(|node| {
+            node.as_element().is_some_and(|name| name.local.as_ref() == "video")
+        }) { return false; }
+        if width == 0 && height == 0 && pixels.is_empty() {
+            release_media_surface(&mut state, node);
+            return true;
+        }
+        let Ok(expected) = crate::media::frame_bytes(width, height) else { return false; };
+        if pixels.len() != expected { return false; }
+        let previous = state.canvas_surfaces.get(&node);
+        if previous.is_none() && state.canvas_surfaces.len() >= 4096 { return false; }
+        let replacing = previous.map_or(0, |surface| surface.pixels.len());
+        let retained = state.canvas_surfaces.values().try_fold(0usize, |total, surface| {
+            total.checked_add(surface.pixels.len())
+        }).and_then(|total| total.checked_sub(replacing)).and_then(|total| total.checked_add(expected));
+        if retained.is_none_or(|total| total > 256 * 1024 * 1024) { return false; }
+        state.canvas_surfaces.insert(node, CanvasBackingSurface { width, height, pixels });
+        #[cfg(feature = "render")]
+        if state.render_resources.set_video_dimensions(node, Some((width, height))) {
+            invalidate_render_resource_geometry(&mut state);
+        }
+        if state.dom.as_ref().is_some_and(|dom| node_is_connected(dom, node)) {
+            state.activity_generation = state.activity_generation.wrapping_add(1);
+        }
+        true
+    })).unwrap_or(false)
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7826,6 +7923,11 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_media_encode_webm(),
+        crate::media_ops::op_media_open(),
+        crate::media_ops::op_media_frame(),
+        crate::media_ops::op_media_close(),
+        op_media_register_surface(),
     ];
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.

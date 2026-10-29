@@ -53,3 +53,6 @@ hkdf = "0.12"
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.2"
 obscura-render = { workspace = true, optional = true }
+
+# Generate bindings against the installed libvpx headers to preserve its ABI.
+env-libvpx-sys = { version = "5.1.3", features = ["generate"] }

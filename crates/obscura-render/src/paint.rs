@@ -172,6 +172,7 @@ pub struct RenderResourceCache {
     max_bytes: usize,
     content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
     content_image_intrinsic_order: VecDeque<obscura_dom::tree::NodeId>,
+    video_dimensions: HashMap<obscura_dom::tree::NodeId, (u32, u32)>,
     max_content_image_intrinsics: usize,
     #[cfg(test)]
     content_image_layout_retries: usize,
@@ -220,6 +221,7 @@ impl RenderResourceCache {
             max_bytes,
             content_image_intrinsics: HashMap::new(),
             content_image_intrinsic_order: VecDeque::new(),
+            video_dimensions: HashMap::new(),
             max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
             #[cfg(test)]
             content_image_layout_retries: 0,
@@ -281,6 +283,19 @@ impl RenderResourceCache {
 
     pub fn retained_entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Decoded video dimensions belong to the page's resource cache, not DOM
+    /// width/height attributes. The caller invalidates geometry when changed.
+    pub fn set_video_dimensions(
+        &mut self,
+        node: obscura_dom::tree::NodeId,
+        dimensions: Option<(u32, u32)>,
+    ) -> bool {
+        match dimensions {
+            Some(dimensions) => self.video_dimensions.insert(node, dimensions) != Some(dimensions),
+            None => self.video_dimensions.remove(&node).is_some(),
+        }
     }
 
     pub fn retained_byte_len(&self) -> usize {
@@ -4979,7 +4994,7 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        if box_on_surface && name.local.as_ref() == "canvas" {
+        if box_on_surface && matches!(name.local.as_ref(), "canvas" | "video") {
             if let Some(surface) = canvas_surfaces.surface(nid) {
                 // A canvas bitmap is replaced content: CSS sizing and
                 // object-fit operate on the content box, never the padding or
@@ -5016,7 +5031,8 @@ fn paint_laid_dom_scrolled(
         }
         paint_css_outline(&mut pixmap, &rect, style, element_clip_mask, raster_scale);
 
-        if box_on_surface && matches!(name.local.as_ref(), "img" | "video") {
+        if box_on_surface && matches!(name.local.as_ref(), "img" | "video")
+            && !(name.local.as_ref() == "video" && canvas_surfaces.surface(nid).is_some()) {
             if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
@@ -9869,6 +9885,10 @@ fn collect_image_intrinsics(
     let mut out = std::collections::HashMap::new();
     let mut selected = HashMap::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+        if let Some(&(width, height)) = cache.video_dimensions.get(&nid) {
+            out.insert(nid, crate::ReplacedIntrinsic::from_dimensions(width as f32, height as f32));
+            continue;
+        }
         let source = tree.with_node(nid, |node| {
             match node.as_element()?.local.as_ref() {
                 "img" => Some(Source::Image),
@@ -16928,6 +16948,40 @@ mod tests {
                 && positioned.blue() > 240,
             "right object-position must select the blue stripe and opacity must composite it: {positioned:?}"
         );
+    }
+
+    #[test]
+    fn decoded_video_surface_replaces_poster_and_supplies_intrinsic_dimensions() {
+        struct VideoSurface {
+            node: obscura_dom::tree::NodeId,
+            pixels: Vec<u8>,
+        }
+        impl CanvasSurfaceSource for VideoSurface {
+            fn surface(&self, node: obscura_dom::tree::NodeId) -> Option<CanvasSurface<'_>> {
+                (node == self.node).then(|| CanvasSurface::from_rgba8(4, 2, &self.pixels)).flatten()
+            }
+        }
+        let tree = parse_html(
+            r#"<html><body style="margin:0;background:white"><video id="video" style="display:block"
+                poster="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='20'%20height='10'%3E%3Crect%20width='20'%20height='10'%20fill='blue'/%3E%3C/svg%3E"></video></body></html>"#,
+        );
+        let video = tree.get_element_by_id("video").unwrap();
+        let mut resources = RenderResourceCache::default();
+        assert!(resources.set_video_dimensions(video, Some((4, 2))));
+        let mut prepared = prepare_dom(&tree, (30.0, 20.0), None, &mut resources).unwrap();
+        let rect = prepared.document_rect(video).unwrap();
+        assert_eq!((rect.width, rect.height), (4.0, 2.0));
+        let surface = VideoSurface { node: video, pixels: [255, 0, 0, 255].repeat(8) };
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        let pixels = paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            &tree, &mut prepared, &mut resources, &scroll, [255, 255, 255, 255], &surface,
+        ).unwrap();
+        let frame = pixels.pixel(1, 1).unwrap();
+        assert!(frame.red() > 240 && frame.blue() < 20, "decoded frame must replace blue poster");
+        assert!(resources.set_video_dimensions(video, None));
+        let poster = prepare_dom(&tree, (30.0, 20.0), None, &mut resources).unwrap();
+        let rect = poster.document_rect(video).unwrap();
+        assert_eq!((rect.width, rect.height), (20.0, 10.0));
     }
 
     #[test]

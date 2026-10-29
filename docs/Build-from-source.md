@@ -2,7 +2,17 @@
 
 - Rust 1.75+ ([rustup.rs](https://rustup.rs))
 - C compiler (gcc or clang)
+- pkg-config, libvpx headers and library, and libclang for generated codec bindings
 - ~5 GB free disk space (V8 compiles from source on first build)
+
+On Ubuntu/Debian, install the native requirements with:
+
+```bash
+sudo apt-get install build-essential pkg-config libvpx-dev libclang-dev
+```
+
+Media recording and playback are included in every browser build, including
+builds without rendering. The `render` feature adds page layout and painting.
 
 Build time depends on the machine and cache state. Cargo reuses unchanged
 dependencies, but a release source edit can still require substantial compilation
@@ -42,12 +52,12 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 The second command keeps stealth while excluding layout, screenshots,
 screencasting, and PDF export.
 
-The stealth feature builds BoringSSL and generates Rust bindings. In addition
-to the default requirements, install CMake, Clang, and the libclang/LLVM
-development libraries. On Ubuntu/Debian:
+The stealth feature also builds BoringSSL. In addition to the default
+requirements, install CMake, Clang, and the LLVM development libraries.
+On Ubuntu/Debian:
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+sudo apt-get install cmake clang llvm-dev
 ```
 
 On macOS, install the Xcode Command Line Tools and CMake. On Windows, install

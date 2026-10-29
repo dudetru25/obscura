@@ -602,6 +602,7 @@ impl ObscuraJsRuntime {
     /// read. Keeping one sample across the task also lets repeated CSSOM reads
     /// share the retained layout on pages with running animations.
     fn begin_javascript_task(&mut self) {
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
         // Some internal callers intentionally ignore script errors. Recover a
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
@@ -1059,6 +1060,7 @@ impl ObscuraJsRuntime {
 
     pub fn forget_frame_state(&mut self, frame_id: u32) {
         self.realm_states().borrow_mut().forget_frame(frame_id);
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
     /// Pending initial realms can already own children before Page adopts them.
@@ -1318,6 +1320,7 @@ impl ObscuraJsRuntime {
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
+        gs.canvas_surfaces.clear();
         // A new document owns a fresh retained scene and resource cache.
         #[cfg(feature = "render")]
         {
@@ -1346,7 +1349,6 @@ impl ObscuraJsRuntime {
             gs.render_resource_rx = rx;
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
-            gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
             gs.scroll_generation = 0;
@@ -1354,6 +1356,7 @@ impl ObscuraJsRuntime {
         }
         drop(gs);
         self.realm_states().borrow().cancel_inactive_frame_timers();
+        crate::media_ops::close_inactive(&self.js_runtime.op_state().borrow());
     }
 
     pub fn set_url(&self, url: &str) {
@@ -4619,7 +4622,8 @@ mod tests {
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
         let source = include_str!("../js/bootstrap.js")
-            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
+            .replace("/* MEDIA */", include_str!("../js/media.js"));
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {
             assert_eq!(super::SNAPSHOT.windows(source.len())
@@ -19603,14 +19607,42 @@ mod tests {
                         bodyUsed: r.bodyUsed,
                         hasReader: !!(r.body && r.body.getReader),
                     };
-                    const reader = r.body.getReader();
+                    const stream = r.body;
+                    const reader = stream.getReader();
+                    const lockedBody = [r.body === stream, r.body.locked, r.bodyUsed];
                     const first = await reader.read();
                     const second = await reader.read();
                     const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
                     const consumed = r.bodyUsed;
-                    let doubleThrew = false;
-                    try { await r.text(); } catch (e) { doubleThrew = true; }
-                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                    const sameBodyAfterRead = r.body === stream;
+                    reader.releaseLock();
+                    const doubleThrew = await r.text().then(() => false, error => error instanceof TypeError);
+                    const methodBodies = [];
+                    const methodValues = [];
+                    for (const method of ["text", "json", "arrayBuffer", "blob"]) {
+                        for (const exposeFirst of [false, true]) {
+                            const response = new Response('{}');
+                            const before = exposeFirst ? response.body : null;
+                            const value = await response[method]();
+                            methodValues.push(method === "arrayBuffer" ? new TextDecoder().decode(value)
+                                : method === "blob" ? await value.text()
+                                : method === "json" ? JSON.stringify(value) : value);
+                            const body = response.body;
+                            const exhausted = await body.getReader().read();
+                            const doubleRead = await response[method]().then(() => false, error => error instanceof TypeError);
+                            methodBodies.push([
+                                before === null || before === body,
+                                response.body === body,
+                                response.bodyUsed,
+                                exhausted.done,
+                                exhausted.value === undefined,
+                                doubleRead,
+                            ]);
+                        }
+                    }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew,
+                        lockedBody, sameBodyAfterRead, methodBodies, methodValues,
+                        nullBody: new Response(null).body === null };
                 })()"#,
                 true,
                 true,
@@ -19625,6 +19657,10 @@ mod tests {
         assert_eq!(out["done"], true);
         assert_eq!(out["consumed"], true);
         assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["lockedBody"], serde_json::json!([true, true, true]));
+        assert_eq!(out["sameBodyAfterRead"], true);
+        assert_eq!(out["methodBodies"], serde_json::json!(vec![vec![true; 6]; 8]));
+        assert_eq!(out["methodValues"], serde_json::json!(vec!["{}"; 8]));
         assert_eq!(out["nullBody"], true);
     }
 
