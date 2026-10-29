@@ -98,6 +98,30 @@ async fn enter_splices_at_the_caret_or_replaces_the_selected_range() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn select_all_replaces_existing_text_in_editable_fields() {
+    let mut ctx = setup().await;
+    for (markup, modifiers, commands) in [
+        ("<input id=field type=text>", 2, vec!["selectAll"]),
+        ("<input id=field type=email>", 2, vec!["selectAll"]),
+        ("<textarea id=field></textarea>", 4, vec![]),
+        ("<input id=field type=text>", 2, vec![]),
+    ] {
+        evaluate(&mut ctx, &format!(
+            "document.body.innerHTML = {}; field.value = 'previous'; field.focus(); globalThis.inputCount = 0; field.addEventListener('input', () => inputCount++);",
+            json!(markup)
+        )).await;
+        cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+            "type": "keyDown", "key": "a", "code": "KeyA", "modifiers": modifiers, "commands": commands
+        })).await;
+        cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+            "type": "keyUp", "key": "a", "code": "KeyA", "modifiers": modifiers
+        })).await;
+        cdp(&mut ctx, "Input.insertText", json!({"text": "new@example.invalid"})).await;
+        assert_eq!(evaluate(&mut ctx, "[field.value, inputCount]").await, json!(["new@example.invalid", 1]), "{markup}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn typing_continues_after_the_inserted_newline() {
     let mut ctx = setup().await;
     cdp(&mut ctx, "Input.insertText", json!({"text": "a"})).await;

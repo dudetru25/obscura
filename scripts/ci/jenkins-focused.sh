@@ -13,6 +13,6 @@ for build_mode in default render; do
 done
 cargo nextest run --locked --release --features render -p obscura-cdp \
     --test integration --no-fail-fast \
-    -E 'test(/^input_mouse_event_parity::/)' \
+    -E 'test(/^input_mouse_event_parity::/) | test(textarea_enter_selection::select_all_replaces_existing_text_in_editable_fields)' \
     2>&1 | tee ci-output/focused-pointer.log || suite_status=$?
 exit "$suite_status"

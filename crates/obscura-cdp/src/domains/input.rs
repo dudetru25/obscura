@@ -417,6 +417,12 @@ pub async fn handle(
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+            let select_all_command = params
+                .get("commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands.iter().any(|command| command.as_str() == Some("selectAll"))
+                });
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -446,7 +452,12 @@ pub async fn handle(
                             return Ok(json!({}));
                         }
 
-                        if !text.is_empty() && text != "\r" && text != "\n" {
+                        let select_all = select_all_command
+                            || ((ctrl_key != meta_key)
+                                && !alt_key && !shift_key && key.eq_ignore_ascii_case("a"));
+                        if select_all {
+                            page.evaluate("(function() { var target = document.activeElement; if (target && (target.localName === 'input' || target.localName === 'textarea') && !globalThis.__obscura_isDisabled(target) && typeof target.select === 'function') target.select(); })()");
+                        } else if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
 
