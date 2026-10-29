@@ -10,7 +10,6 @@ default = []
 stealth = ["obscura-net/stealth", "obscura-js/stealth"]
 render = ["obscura-js/render", "dep:image"]
 
-
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }

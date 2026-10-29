@@ -180,11 +180,12 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 ```
 
 Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
-The stealth build also compiles BoringSSL and generates bindings, so it needs
-CMake, Clang, and the libclang/LLVM development libraries. On Ubuntu/Debian:
+All source builds need a C compiler, pkg-config, libvpx headers and libclang.
+The stealth build also compiles BoringSSL and needs CMake, Clang and LLVM.
+To install both sets of requirements on Ubuntu/Debian:
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+sudo apt-get install build-essential pkg-config libvpx-dev libclang-dev cmake clang llvm-dev
 ```
 
 The rendering build uses rustls. The rendering-and-stealth build uses

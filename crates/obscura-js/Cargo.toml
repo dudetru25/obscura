@@ -16,7 +16,6 @@ stealth = ["obscura-net/stealth"]
 # rasterizes screenshots. Off by default so the scraping build stays lean.
 render = ["dep:obscura-render", "obscura-render/paint"]
 
-
 [build-dependencies]
 deno_core = "0.412"
 
