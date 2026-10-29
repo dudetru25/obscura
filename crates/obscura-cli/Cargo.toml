@@ -18,8 +18,6 @@ default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
-# Optional VP8/WebM capture, recording and video playback.
-media = ["render", "obscura-browser/media", "obscura-cdp/media", "obscura-mcp/media"]
 
 [dependencies]
 obscura-browser = { workspace = true }

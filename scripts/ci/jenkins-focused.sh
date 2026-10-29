@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Run media regressions without certifying full browser acceptance.
+# Run media regressions with and without rendering; full acceptance is separate.
 set -euo pipefail
 source scripts/ci/environment.sh
-cargo nextest run --locked --release --features media -p obscura-js \
-    --lib --test media_capture --no-fail-fast \
-    -E 'test(~media::tests::) | binary(=media_capture)' \
-    2>&1 | tee ci-output/focused-regressions.log
+suite_status=0
+for build_mode in default render; do
+    feature_args=()
+    if [[ $build_mode == render ]]; then feature_args=(--features render); fi
+    cargo nextest run --locked --release --no-default-features "${feature_args[@]}" -p obscura-js \
+        --lib --test media_capture --no-fail-fast \
+        -E 'test(~media::tests::) | binary(=media_capture)' \
+        2>&1 | tee "ci-output/focused-$build_mode.log" || suite_status=$?
+done
+exit "$suite_status"

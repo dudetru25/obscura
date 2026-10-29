@@ -16,13 +16,9 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
-    #[cfg(feature = "media")]
-    let media_source = include_str!("js/media.js");
-    #[cfg(not(feature = "media"))]
-    let media_source = "";
     let bootstrap_source = include_str!("js/bootstrap.js")
         .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
-        .replace("/* MEDIA */", media_source);
+        .replace("/* MEDIA */", include_str!("js/media.js"));
     let bootstrap_js = bootstrap_source.as_str();
 
     if is_cross {

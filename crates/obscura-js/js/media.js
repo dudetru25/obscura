@@ -1,5 +1,5 @@
-// This source is included only by the optional media feature. Codecs remain
-// native operations; these objects own browser state, events and clocks.
+// All browser builds include this media runtime. Codecs remain native
+// operations; these objects own browser state, events and clocks.
 (function installMedia() {
   const MAX_BYTES = 128 * 1024 * 1024;
   const MAX_FRAMES = 600;
