@@ -15342,8 +15342,11 @@ mod tests {
                 document.body.appendChild(frame);
             "#,
         ).unwrap();
-        // srcdoc navigation is a queued browser task. Observe its loaded document.
-        rt.run_event_loop_bounded(100).await.unwrap();
+        // srcdoc navigation is queued. Wait for the target in the loaded realm.
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("Boolean(frame.contentDocument.getElementById('foreign'))")
+                .unwrap() == serde_json::json!(true)
+        }, 2_000).await, "the iframe target must load before observation");
         assert_eq!(
             rt.evaluate("[frame.contentDocument.getElementById('foreign') instanceof frame.contentWindow.Element, \
                 frame.contentDocument.getElementById('foreign') instanceof Element]").unwrap(),
