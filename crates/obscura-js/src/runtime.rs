@@ -10993,15 +10993,10 @@ mod tests {
         )
         .unwrap();
 
-        let started = std::time::Instant::now();
         rt.run_event_loop_until_quiescent(20, 10).await.unwrap();
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= std::time::Duration::from_millis(500)
-                && elapsed < std::time::Duration::from_millis(1_500),
-            "adaptive settle must wait for the active task boundary: {elapsed:?}",
-        );
+        // Assert task completion rather than comparing the page's Date-based
+        // performance clock with Rust's monotonic clock. The unyielding-drain
+        // regression below separately protects the watchdog's upper bound.
         assert_eq!(
             rt.evaluate("globalThis.__adaptiveLongTaskCompleted")
                 .unwrap(),
