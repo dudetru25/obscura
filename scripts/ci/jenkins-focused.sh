@@ -12,6 +12,7 @@ for build_mode in default render; do
         2>&1 | tee "ci-output/focused-$build_mode.log" || suite_status=$?
 done
 cargo nextest run --locked --release --features render -p obscura-cdp \
-    --test input_mouse_event_parity --no-fail-fast \
+    --test integration --no-fail-fast \
+    -E 'test(/^input_mouse_event_parity::/)' \
     2>&1 | tee ci-output/focused-pointer.log || suite_status=$?
 exit "$suite_status"
