@@ -79,7 +79,11 @@ cargo nextest run --locked --release --features render -p obscura-js \
     -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
     2>&1 | tee ci-output/body-cap-stress.log
 suite_status=0
-cargo nextest run --locked --release --no-fail-fast     2>&1 | tee ci-output/full-default.log || suite_status=$?
+# Renderer fixtures need paint; check its layout-only library separately.
+cargo nextest run --locked --release --workspace --exclude obscura-render --no-fail-fast \
+    2>&1 | tee ci-output/full-default.log || suite_status=$?
+cargo check --locked --release -p obscura-render --no-default-features \
+    2>&1 | tee ci-output/render-layout-check.log || suite_status=$?
 cargo nextest run --locked --release --features render --no-fail-fast     2>&1 | tee ci-output/full-render.log || suite_status=$?
 if (( suite_status != 0 )); then exit "$suite_status"; fi
 python3 "$benchmark/obstacle-course/run.py" --json --runs 1 --warmup 0 > ci-output/obstacle.json
