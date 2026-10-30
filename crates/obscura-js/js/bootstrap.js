@@ -175,7 +175,7 @@ const _dom = (cmd, a1, a2) => {
     result = mutation.result;
     for (const [id, nid] of mutation.__obscuraFrameRetirements) {
       const element = _cache.get(nid);
-      if (element && element._frameId === id) _resetIframeElement(element);
+      if (element && element._frameId === id) _resetIframeElement(element, 'detach');
     }
   }
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
@@ -15466,8 +15466,8 @@ globalThis.__obscura_liveFrameIds = function () {
 // Drop everything this realm holds for a frame the host has discarded. One
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
-globalThis.__obscura_forgetFrame = function (frameId) {
-  _dom('retire_frame', frameId);
+globalThis.__obscura_forgetFrame = function (frameId, reason = 'navigation') {
+  _dom('retire_frame', frameId, reason);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -15589,8 +15589,8 @@ function _ensureInitialFrameRealm(element, srcdoc) {
   return frameId !== 0;
 }
 
-function _resetIframeElement(element) {
-  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
+function _resetIframeElement(element, reason = 'navigation') {
+  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId, reason);
   element._frameId = 0;
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;

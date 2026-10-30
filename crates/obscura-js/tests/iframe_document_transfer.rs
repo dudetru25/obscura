@@ -355,6 +355,14 @@ async fn repeated_adoption_preserves_owned_state_and_observers_after_id_reuse() 
     runtime.run_event_loop_bounded(100).await.unwrap();
     assert_eq!(runtime.evaluate_script("adoptionState.notices.length").unwrap().as_f64(), Some(3.0));
     runtime.evaluate_script(r#"(() => {
+        const owner = frame.contentDocument;
+        const nested = owner.createElement('iframe'); owner.body.append(nested);
+        globalThis.nestedAdoptedNode = document.createElement('input');
+        nested.contentDocument.body.append(nestedAdoptedNode);
+        const detached = owner.createElement('iframe'); owner.body.append(detached);
+        globalThis.retainedCleanupNode = document.createElement('p');
+        detached.contentDocument.body.append(retainedCleanupNode);
+        detached.remove();
         globalThis.escapedNode = frame.contentDocument.createElement('p');
         escapedNode.textContent = 'escaped';
         document.body.append(escapedNode);
@@ -367,9 +375,19 @@ async fn repeated_adoption_preserves_owned_state_and_observers_after_id_reuse() 
             escapedNode.textContent, frame.contentDocument.getElementById('fresh').textContent];
     })()"#).expect("source-frame navigation must not invalidate a node now owned by the parent"),
         json!([true,true,"still owned by parent","new document"]));
-    let error = runtime.evaluate_script("adoptionState.input.setAttribute('data-stale', 'yes')")
-        .expect_err("a wrapper owned by the replaced destination document must fail closed");
-    assert!(error.contains("InvalidStateError"), "{error}");
+    for node in ["adoptionState.input", "nestedAdoptedNode"] {
+        let error = runtime.evaluate_script(&format!("{node}.setAttribute('data-stale', 'yes')"))
+            .expect_err("a wrapper owned by the replaced destination document tree must fail closed");
+        assert!(error.contains("InvalidStateError"), "{node}: {error}");
+    }
+    assert_eq!(runtime.evaluate_script(r#"(() => {
+        retainedCleanupNode.setAttribute('data-cleanup', 'yes');
+        retainedCleanupNode.remove();
+        return [retainedCleanupNode.getAttribute('data-cleanup'), retainedCleanupNode.parentNode === null,
+            frame.contentDocument.getElementById('fresh').textContent,
+            frame.contentDocument.querySelector('[data-stale]') === null];
+    })()"#).expect("navigation must preserve unrelated detached-document cleanup"),
+        json!(["yes", true, "new document", true]));
 }
 
 #[tokio::test(flavor = "current_thread")]

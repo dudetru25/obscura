@@ -1227,6 +1227,32 @@ impl RealmStates {
         }
     }
 
+    // Navigation invalidates adopted wrappers in the replaced document tree.
+    // Detached documents keep their generation so retained nodes can clean up.
+    fn invalidate_frame_documents(&self, frame_id: u32) {
+        if frame_id == 0 { return; }
+        let active: std::collections::HashSet<u32> = self.frame_timers.keys().copied()
+            .filter(|id| self.frame_timers_active(*id) != Some(false)).collect();
+        let mut replaced = vec![frame_id];
+        for _ in 0..self.frame_timers.len() {
+            let before = replaced.len();
+            for (id, timers) in &self.frame_timers {
+                if !active.contains(id) || replaced.contains(id) { continue; }
+                let parent = timers.owner.as_ref().and_then(|(parent, _, _)| parent.upgrade());
+                let parent_id = parent.and_then(|parent| self.entries.iter()
+                    .find(|(_, _, state)| Rc::ptr_eq(state, &parent)).map(|(_, id, _)| *id));
+                if parent_id.is_some_and(|id| replaced.contains(&id)) { replaced.push(*id); }
+            }
+            if replaced.len() == before { break; }
+        }
+        for id in replaced {
+            if let Some(state) = self.by_frame_id(id) {
+                let mut state = state.borrow_mut();
+                state.document_generation = state.document_generation.wrapping_add(1);
+            }
+        }
+    }
+
     fn cancel_frame_timers(&self, frame_id: u32) {
         if let Some(timers) = self.frame_timers.get(&frame_id) { timers.cancel.cancel(); }
         self.cancel_inactive_frame_timers();
@@ -2138,7 +2164,12 @@ fn op_dom(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
-            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            if let Ok(id) = arg1.parse::<u32>() {
+                let registry = registry.borrow();
+                let detached = arg2 == "detach" && registry.frame_timers_active(id) == Some(false);
+                if !detached { registry.invalidate_frame_documents(id); }
+                registry.cancel_frame_timers(id);
+            }
             crate::media_ops::close_inactive(state);
             return "true".into();
         }
