@@ -11,35 +11,45 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-// Serves an HTML page that fetches /api/start.json, which redirects to the
-// JSON response at /api/data.json.
-async fn serve() -> String {
+// Initial inline fetches must carry native metadata before navigation commits.
+async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        for _ in 0..12 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf).await.unwrap();
-                let req = String::from_utf8_lossy(&buf[..]);
-                if req.starts_with("GET /api/start.json") {
-                    let resp = "HTTP/1.1 302 Found\r\nLocation: /api/data.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                    return;
-                }
-                if req.starts_with("GET /api/missing.json") {
-                    let body = r#"{"error":"missing"}"#;
-                    let response = format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-                let (ct, body) = if req.starts_with("GET /api/data.json") {
-                    ("application/json", "{\"value\":42}")
-                } else {
-                    (
-                        "text/html",
-                        r#"<html><head></head><body>
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for listener in [listener, peer] {
+        let observed = observed.clone();
+        tokio::spawn(async move {
+            for _ in 0..12 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let length = socket.read(&mut buf).await.unwrap();
+                    let request = String::from_utf8_lossy(&buf[..length]);
+                    let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let headers = request.lines().skip(1).filter_map(|line| line.split_once(':'))
+                        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim())).collect::<std::collections::HashMap<_, _>>();
+                    let site = headers.get("sec-fetch-site").copied().unwrap_or("");
+                    let cookie = headers.get("cookie").is_some_and(|value|
+                        value.split(';').any(|item| item.trim() == "metadata-session=fixture"));
+                    if path.starts_with("/api/") {
+                        observed.lock().unwrap().push(json!({"path":path,"site":site,"cookie":cookie}));
+                    }
+                    let redirect = match path {
+                        "/api/start.json" if site == "same-origin" && cookie => Some("/api/data.json".to_string()),
+                        "/api/same-site-start" => Some(format!("http://{peer_addr}/api/same-site-hop")),
+                        "/api/cross-site-start" => Some(format!("http://localhost:{}/api/cross-site-hop", peer_addr.port())),
+                        "/api/same-site-hop" | "/api/cross-site-hop" => Some(format!("http://{addr}/api/site-return.json")),
+                        _ => None,
+                    };
+                    let (status, content_type, body) = match path {
+                        "/api/start.json" if redirect.is_none() => (403, "application/json", r#"{"error":"cookie-auth metadata missing"}"#.to_string()),
+                        "/api/data.json" => (200, "application/json", r#"{"value":42}"#.to_string()),
+                        "/api/missing.json" => (404, "application/json", r#"{"error":"missing"}"#.to_string()),
+                        "/api/site-return.json" => (200, "application/json", json!({"site":site,"cookie":cookie}).to_string()),
+                        _ => (200, "text/html", r#"<html><head></head><body>
 <div id="r">stage1</div>
 <script>
 window.__done = new Promise(function (resolve) {
@@ -49,18 +59,24 @@ window.__done = new Promise(function (resolve) {
     .catch(function (e) { resolve("err:" + e); });
 });
 </script>
-</body></html>"#,
-                    )
-                };
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(resp.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{addr}/")
+</body></html>"#.to_string()),
+                    };
+                    let response = if let Some(location) = redirect {
+                        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nAccess-Control-Allow-Origin: http://{addr}\r\nAccess-Control-Allow-Credentials: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        let cookie_header = if content_type == "text/html" {
+                            "Set-Cookie: metadata-session=fixture; HttpOnly; SameSite=Lax; Path=/\r\n"
+                        } else {
+                            ""
+                        };
+                        format!("HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\n{cookie_header}Access-Control-Allow-Origin: http://{addr}\r\nAccess-Control-Allow-Credentials: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+    }
+    (format!("http://{addr}/"), observed)
 }
 
 async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session_id: &str) -> Value {
@@ -110,7 +126,7 @@ fn response_request_id(ctx: &CdpContext, url_needle: &str) -> Option<String> {
 #[tokio::test(flavor = "current_thread")]
 async fn js_fetch_emits_network_request_and_response() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    let base = serve().await;
+    let (base, observed) = serve().await;
     let mut ctx = CdpContext::new();
     let page_id = ctx.create_page();
     let session_id = "session-1";
@@ -128,6 +144,11 @@ async fn js_fetch_emits_network_request_and_response() {
         session_id,
     )
     .await;
+
+    assert_eq!(*observed.lock().unwrap(), vec![
+        json!({"path":"/api/start.json","site":"same-origin","cookie":true}),
+        json!({"path":"/api/data.json","site":"same-origin","cookie":true}),
+    ], "inline fetch must send cookie-auth metadata without an interception repair");
 
     // The final fetched JSON URL must appear as a requestWillBeSent event.
     let request_urls = ctx
@@ -157,6 +178,23 @@ async fn js_fetch_emits_network_request_and_response() {
         Some("{\"value\":42}"),
         "Network.getResponseBody must return the script-fetched JSON"
     );
+
+    for (id, kind, expected_site, peer_cookie) in [
+        (3, "same-site", "same-site", true),
+        (4, "cross-site", "cross-site", false),
+    ] {
+        observed.lock().unwrap().clear();
+        let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":format!("fetch('/api/{kind}-start',{{credentials:'include'}}).then(response=>response.json())"),
+            "awaitPromise":true,"returnByValue":true,
+        }), session_id).await;
+        assert_eq!(response["result"]["value"], json!({"site":expected_site,"cookie":true}));
+        assert_eq!(*observed.lock().unwrap(), vec![
+            json!({"path":format!("/api/{kind}-start"),"site":"same-origin","cookie":true}),
+            json!({"path":format!("/api/{kind}-hop"),"site":expected_site,"cookie":peer_cookie}),
+            json!({"path":"/api/site-return.json","site":expected_site,"cookie":true}),
+        ], "the redirect URL list must retain its least-trusted site");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -206,7 +244,7 @@ async fn stealth_context() -> (CdpContext, String, String) {
     let page = ctx.create_page();
     let session = "stealth-session".to_string();
     ctx.sessions.insert(session.clone(), page);
-    let base = serve().await;
+    let (base, _observed) = serve().await;
     cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), &session).await;
     (ctx, session, base)
 }
