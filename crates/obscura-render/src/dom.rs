@@ -5494,12 +5494,36 @@ fn layout_dom_once(
                             && rendered_parent(tree, id)
                                 .and_then(|parent| styles.get(&parent))
                                 .is_some_and(|parent| {
-                                    parent.display == crate::Display::Flex
+                                    let column_flex = parent.display == crate::Display::Flex
                                         && !parent.internal_flex_container
                                         && matches!(parent.flex_direction, Some(
                                             taffy::FlexDirection::Column
                                                 | taffy::FlexDirection::ColumnReverse
-                                        ))
+                                        ));
+                                    let alignment = style.align_self
+                                        .or(parent.align_items)
+                                        .unwrap_or(taffy::AlignItems::NORMAL);
+                                    let normal_alignment = if parent.display == crate::Display::Grid
+                                        && (style.has_replaced_sizing || style.aspect_ratio.is_some())
+                                    {
+                                        taffy::AlignItems::START
+                                    } else {
+                                        taffy::AlignItems::STRETCH
+                                    };
+                                    let stretched_block_axis = !style.margin_auto[0]
+                                        && !style.margin_auto[2]
+                                        && alignment.resolve_normal(normal_alignment)
+                                            == taffy::AlignItems::STRETCH
+                                        && (parent.display == crate::Display::Grid
+                                            || (parent.display == crate::Display::Flex
+                                                && !parent.internal_flex_container
+                                                && !matches!(parent.flex_direction, Some(
+                                                    taffy::FlexDirection::Column
+                                                        | taffy::FlexDirection::ColumnReverse
+                                                ))
+                                                && parent.flex_wrap.unwrap_or(taffy::FlexWrap::NoWrap)
+                                                    == taffy::FlexWrap::NoWrap));
+                                    column_flex || stretched_block_axis
                                 })
                     });
             let reused_computed_style = fresh_styles
