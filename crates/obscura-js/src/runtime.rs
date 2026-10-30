@@ -5424,16 +5424,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn retired_document_state_follows_javascript_context_lifetime() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let frame_id = rt.evaluate(r#"(() => {
+        let frame_id = rt.evaluate_script(r#"(() => {
             globalThis.retainedFrame = document.createElement('iframe');
             document.body.append(retainedFrame);
             globalThis.retainedDocument = retainedFrame.contentDocument;
-            return retainedFrame._frameId;
-        })()"#).unwrap().as_u64().unwrap() as u32;
+            return [retainedFrame._frameId];
+        })()"#).unwrap()[0].as_u64().unwrap() as u32;
         let owner = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
         let weak = Rc::downgrade(&owner);
         drop(owner);
-        rt.evaluate("retainedFrame.remove(); retainedFrame = null").unwrap();
+        rt.evaluate_script("retainedFrame.remove(); retainedFrame = null").unwrap();
         rt.forget_frame_state(frame_id);
         rt.forget_frame_state(frame_id);
         rt.run_event_loop_bounded(100).await.unwrap();
@@ -5447,7 +5447,7 @@ mod tests {
             assert_eq!(registry.live_count(), 0, "document ownership must not reactivate a frame");
             assert_eq!(registry.frame_timers_active(frame_id), Some(false));
         }
-        rt.evaluate("retainedDocument = null").unwrap();
+        rt.evaluate_script("retainedDocument = null").unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         rt.collect_garbage();
         assert!(weak.upgrade().is_none(), "collected JS documents must release their native DOM");
@@ -18710,7 +18710,7 @@ mod tests {
             rt.evaluate("Boolean(frame.contentDocument.getElementById('frame-hero'))").unwrap()
                 == serde_json::json!(true)
         }, 2_000).await, "the image's owning iframe must load");
-        let frame_id = rt.evaluate("frame._frameId").unwrap().as_u64().unwrap() as u32;
+        let frame_id = rt.evaluate_script("[frame._frameId]").unwrap()[0].as_u64().unwrap() as u32;
         let frame_state = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
         let frame_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = frame_calls.clone();
