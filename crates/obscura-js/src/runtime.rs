@@ -7633,12 +7633,26 @@ mod tests {
     #[test]
     fn parsed_xlink_attribute_is_available_through_both_apis() {
         let mut rt = setup_runtime(
-            r##"<html><body><svg><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
+            r##"<html><body><svg id="s" xmlns="http://www.w3.org/2000/svg"><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
         );
-        let v = rt
-            .evaluate("(function(){var u=document.getElementById('u');return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',');})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("#icon|#icon|id,xlink:href"));
+        let v = rt.evaluate(r#"(() => {
+            const u = document.getElementById('u'), s = document.getElementById('s');
+            const xmlns = 'http://www.w3.org/2000/xmlns/';
+            const attr = s.attributes.getNamedItem('xmlns');
+            const parsed = [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'),
+                s.getAttributeNames(), attr?.name, attr?.localName, attr?.prefix, attr?.namespaceURI];
+            s.setAttribute('xmlns', 'urn:updated');
+            const updated = [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'), s.getAttributeNames()];
+            s.removeAttributeNS(xmlns, 'xmlns');
+            return { xlink: [u.getAttribute('xlink:href'), u.getAttributeNS('http://www.w3.org/1999/xlink','href'), u.getAttributeNames()],
+                parsed, updated, removed: [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'), s.getAttributeNames()] };
+        })()"#).unwrap();
+        assert_eq!(v, serde_json::json!({
+            "xlink": ["#icon", "#icon", ["id", "xlink:href"]],
+            "parsed": ["http://www.w3.org/2000/svg", "http://www.w3.org/2000/svg", ["id", "xmlns"], "xmlns", "xmlns", null, "http://www.w3.org/2000/xmlns/"],
+            "updated": ["urn:updated", "urn:updated", ["id", "xmlns"]],
+            "removed": [null, null, ["id"]]
+        }));
     }
 
     #[test]
