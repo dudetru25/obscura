@@ -104,10 +104,13 @@ fn plan(
         // These elements own asynchronous or native resources in addition to
         // DOM state. Until those lifecycles can transfer, reject before either
         // arena changes instead of losing resources or targeting an old ID.
+        // Detached links with no native sheet may transfer; the captured JS
+        // preflight also rejects detached links whose loading has started.
         for node in &nodes {
             if dom.get_node(*node).and_then(|node| node.as_element().map(|name| name.local.to_string()))
                 .is_some_and(|tag| matches!(tag.as_str(), "iframe" | "frame" | "object" | "embed"
-                    | "canvas" | "video" | "audio" | "img" | "link")) {
+                    | "canvas" | "video" | "audio" | "img")
+                    || tag == "link" && (dom.is_connected(*node) || dom.external_stylesheet(*node).is_some())) {
                 return Err(AdoptionError::Unsupported);
             }
         }

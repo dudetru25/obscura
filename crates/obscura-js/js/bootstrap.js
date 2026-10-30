@@ -527,6 +527,9 @@ function _resolveResourceUrl(src) {
 }
 
 const _linkedStylesheetNodes = new WeakMap();
+// A detached clone has no fetch lifecycle to transfer. A link that has ever
+// started loading stays in its owning realm, including while its fetch is pending.
+const _startedLinkedStylesheets = new WeakSet();
 const _linkElementSheets = new WeakMap();
 
 function _linkedStylesheetHref(link, explicitHref) {
@@ -537,6 +540,7 @@ function _linkedStylesheetHref(link, explicitHref) {
 function _registerLinkedStylesheet(link, explicitHref) {
   if (!link) return null;
   const href = _linkedStylesheetHref(link, explicitHref);
+  _startedLinkedStylesheets.add(link);
   _linkedStylesheetNodes.set(link, true);
   let sheet = _linkElementSheets.get(link);
   if (!sheet) {
@@ -694,9 +698,9 @@ async function _loadLinkedStylesheet(c) {
     if (c.disabled) c.setAttribute('disabled', '');
     else c.removeAttribute('disabled');
   }
-  const fullUrl = _resolveResourceUrl(href);
-  let pageOrigin = "";
-  try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
+  _startedLinkedStylesheets.add(c);
+  const fullUrl = _urlResolveOp(href, _documentBase() || "about:blank") || href;
+  const pageOrigin = _realmOrigin();
   try {
     const loaded = await _fetchLinkedCss(fullUrl, pageOrigin);
     __obscuraCore.ops.op_external_stylesheet_set(
@@ -2329,7 +2333,7 @@ function _runPostConnectionSteps(nodes) {
       state.cursor = null;
       const n = nodes[i];
       __prepareInsertedSubtree(n);
-      if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+      if (n.nodeType === 1 && n.localName === 'link') _loadLinkedStylesheet(n);
       if (_mediaTreeChanged) _mediaTreeChanged(n);
     }
   } finally {

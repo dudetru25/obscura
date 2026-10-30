@@ -23,6 +23,9 @@ function _sameNativeTree(left, right) {
 function _adoptionPlan(node) {
   const result = JSON.parse(__obscuraCore.ops.op_adoption_nodes(node, node._nid >>> 0, _realmFrameId));
   if (result.error) throw new DOMException('The subtree cannot be adopted into this document.', result.error);
+  const prepare = __obscuraCore.ops.op_node_owner_member(node, 'nodeAdoptionSource');
+  if (!prepare) throw new DOMException('The source document is no longer available.', 'InvalidStateError');
+  _nodeDispatchApply(prepare, node, [result.nodes, true]);
   return result.nodes;
 }
 function _adoptForInsertion(parent, node) {
@@ -49,7 +52,7 @@ function _disconnectNodeObservers(observer) {
   observer._nodeRegistries?.clear();
 }
 
-function _nodeAdoptionSource(ids) {
+function _nodeAdoptionSource(ids, validateOnly = false) {
   const root = this;
   const nodes = [];
   for (const nid of ids) {
@@ -67,9 +70,13 @@ function _nodeAdoptionSource(ids) {
     if (!id || !id.writable || !('value' in id)) {
       throw new DOMException('The node wrapper cannot transfer ownership.', 'NotSupportedError');
     }
+    if (type === 1 && node.localName === 'link' && _startedLinkedStylesheets.has(node)) {
+      throw new DOMException('A stylesheet loading lifecycle cannot transfer ownership.', 'NotSupportedError');
+    }
     if (type === 1) _shadowRootForHost(node, true);
     nodes.push(node);
   }
+  if (validateOnly) return;
   const parent = root.parentNode;
   const previous = root.previousSibling, next = root.nextSibling;
   const windowNames = _windowNamedNamesInTree(root);
