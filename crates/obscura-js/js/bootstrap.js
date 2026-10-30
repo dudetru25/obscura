@@ -7470,7 +7470,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(this._nid >>> 0, _realmFrameId)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -7494,7 +7494,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {

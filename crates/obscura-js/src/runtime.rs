@@ -18657,6 +18657,69 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        rt.execute_script("create-frame-image", r#"
+            const parentImageState = JSON.stringify([
+                image.complete, image.naturalWidth, image.naturalHeight, image.currentSrc, __imageEvents
+            ]);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<html><body><img id="frame-hero"></body></html>';
+            document.body.appendChild(frame);
+        "#).unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("Boolean(frame.contentDocument.getElementById('frame-hero'))").unwrap()
+                == serde_json::json!(true)
+        }, 2_000).await, "the image's owning iframe must load");
+        let frame_id = rt.evaluate("frame.contentWindow.__obscura_frameId").unwrap().as_u64().unwrap() as u32;
+        let frame_state = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
+        let frame_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = frame_calls.clone();
+        let png = two_by_three_png();
+        frame_state.borrow_mut().render_resources = obscura_render::RenderResourceCache::with_loader(
+            move |url: &str| {
+                assert_eq!(url, "http://example.com/assets/frame-hero.png");
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script("observe-frame-image", r#"
+            const frameImage = frame.contentDocument.getElementById("frame-hero");
+            globalThis.__frameImageEvents = [];
+            globalThis.__frameDecodeState = "pending";
+            frameImage.addEventListener("load", () => __frameImageEvents.push("load"));
+            frameImage.addEventListener("error", () => __frameImageEvents.push("error"));
+            frameImage.src = "../assets/frame-hero.png";
+            globalThis.__frameImageInitial = [frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight];
+            frameImage.decode().then(
+                () => { __frameDecodeState = "resolved"; },
+                error => { __frameDecodeState = error.name; }
+            );
+        "#).unwrap();
+        assert_eq!(rt.evaluate("__frameImageInitial").unwrap(), serde_json::json!([false, 0, 0]));
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("__frameDecodeState === 'resolved'").unwrap() == serde_json::json!(true)
+        }, 2_000).await, "the frame-owned image must finish decoding");
+        assert_eq!(rt.evaluate(r#"[
+            frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight,
+            frameImage.currentSrc, __frameImageEvents, __frameDecodeState
+        ]"#).unwrap(), serde_json::json!([
+            true, 2, 3, "http://example.com/assets/frame-hero.png", ["load"], "resolved"
+        ]));
+        rt.execute_script("reread-frame-image", r#"
+            frameImage.decode();
+            frameImage.complete; frameImage.naturalWidth; frameImage.naturalHeight;
+        "#).unwrap();
+        assert_eq!(frame_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rt.evaluate("__frameImageEvents").unwrap(), serde_json::json!(["load"]));
+        rt.execute_script("reload-frame-image", r#"frameImage.src = "../assets/frame-hero.png";"#).unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("__frameImageEvents.length === 2").unwrap() == serde_json::json!(true)
+        }, 2_000).await, "a cached frame request must emit its own load event");
+        assert_eq!(frame_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rt.evaluate(r#"JSON.stringify([
+            image.complete, image.naturalWidth, image.naturalHeight, image.currentSrc, __imageEvents
+        ]) === parentImageState"#).unwrap(), serde_json::json!(true));
     }
 
     #[cfg(feature = "render")]

@@ -8662,8 +8662,10 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u32) -> String {
+    let Some(shared) = live_import_state(state, frame_id) else {
+        return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" }).to_string();
+    };
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -8748,10 +8750,13 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id: u32) -> String {
     let shared = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        live_import_state(&state, frame_id)
+    };
+    let Some(shared) = shared else {
+        return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" }).to_string();
     };
     let node_id = NodeId::new(nid);
     let (
