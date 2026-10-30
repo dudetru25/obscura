@@ -21,7 +21,7 @@ async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     for listener in [listener, peer] {
         let observed = observed.clone();
         tokio::spawn(async move {
-            for _ in 0..12 {
+            for _ in 0..24 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
                 tokio::spawn(async move {
@@ -223,10 +223,6 @@ async fn js_fetch_post_body_is_observable_without_interception() {
     let page_id = ctx.create_page();
     let session = "body-session";
     ctx.sessions.insert(session.to_string(), page_id);
-    cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), session).await;
-    assert!(ctx.pending_events.iter().filter(|event| event.method == "Network.requestWillBeSent")
-        .all(|event| event.params["request"].get("postData").is_none()), "initial GET requests must omit postData");
-
     let unicode_body = r#"{"message":"hello, café"}"#;
     let cases = [
         ("POST", serde_json::to_string(unicode_body).unwrap(), Some(unicode_body), Some(unicode_body)),
@@ -236,12 +232,25 @@ async fn js_fetch_post_body_is_observable_without_interception() {
     ];
     let mut id = 2;
     for (method, body, expected_wire, expected_post_data) in cases {
+        let injection = cdp(&mut ctx, id, "Page.addScriptToEvaluateOnNewDocument", json!({
+            "source":format!("globalThis.__bodyResponse=fetch('/api/body.json',{{method:'{method}',body:{body}}}).then(response=>response.json());"),
+        }), session).await;
+        id += 1;
         ctx.pending_events.clear();
+        // Navigation runs the existing network-event serializer. Direct
+        // dispatch does not run the WebSocket server's post-command drain.
+        cdp(&mut ctx, id, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), session).await;
+        id += 1;
         let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({
-            "expression":format!("fetch('/api/body.json',{{method:'{method}',body:{body}}}).then(response=>response.json())"),
+            "expression":"globalThis.__bodyResponse",
             "awaitPromise":true,"returnByValue":true,
         }), session).await;
         id += 1;
+        cdp(&mut ctx, id, "Page.removeScriptToEvaluateOnNewDocument", json!({"identifier":injection["identifier"]}), session).await;
+        id += 1;
+        assert!(ctx.pending_events.iter().filter(|event| event.method == "Network.requestWillBeSent"
+            && event.params["request"]["method"] == "GET")
+            .all(|event| event.params["request"].get("postData").is_none()), "GET requests must omit postData");
         assert_eq!(response["result"]["value"], json!({"body":expected_wire}), "the real server must receive the expected body");
         let request = ctx.pending_events.iter().find(|event| event.method == "Network.requestWillBeSent"
             && event.params["request"]["url"].as_str().is_some_and(|url| url.ends_with("/api/body.json")))
@@ -280,9 +289,11 @@ async fn js_fetch_post_body_is_observable_without_interception() {
         }), session), continuation)
     }).await.expect("the intercepted POST and body rewrite must complete");
     assert_eq!(response["result"]["value"], json!({"body":replacement_body}), "the server must receive the continued body rather than the original body");
-    assert!(ctx.pending_events.iter().any(|event| event.method == "Network.responseReceived"
-        && event.params["requestId"] == request_id && event.params["response"]["status"] == 200),
-        "continuation must preserve the request's response identity");
+    let page = ctx.get_session_page_mut(&Some(session.to_string())).unwrap();
+    page.sync_js_network_events();
+    assert!(page.network_events.iter().any(|event|
+        event.request_id == request_id && event.status == 200 && event.intercepted),
+        "continuation must preserve the transport request's response identity");
 }
 
 #[tokio::test(flavor = "current_thread")]
