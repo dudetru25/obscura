@@ -1227,6 +1227,45 @@ impl Page {
         true
     }
 
+    /// Read the embedding content box in its owner realm, without transform scaling.
+    #[cfg(feature = "render")]
+    fn frame_embedding_viewport(&mut self, frame_id: u32, parent_frame_id: u32) -> Option<(f64, f64)> {
+        let expression = format!(r#"(() => {{
+            const element = globalThis.__obscura_frameElements[{frame_id}];
+            if (!element || element._frameId !== {frame_id} || !element.isConnected) return null;
+            const style = getComputedStyle(element);
+            if (style.display === 'none') return [0, 0];
+            return [Math.max(0, element.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0)),
+                Math.max(0, element.clientHeight - (parseFloat(style.paddingTop) || 0) - (parseFloat(style.paddingBottom) || 0))];
+        }})()"#);
+        let js = self.js.as_mut()?;
+        let value = if parent_frame_id == 0 {
+            js.evaluate(&expression)
+        } else {
+            self.frames.iter().find(|frame| frame.frame_id() == parent_frame_id)?
+                .evaluate(js, &expression)
+        }.ok()?;
+        let [width, height] = serde_json::from_value::<[f64; 2]>(value).ok()?;
+        (width.is_finite() && height.is_finite() && width >= 0.0 && height >= 0.0)
+            .then_some((width, height))
+    }
+
+    fn sync_frame_viewports(&mut self) {
+        #[cfg(feature = "render")]
+        for index in 0..self.frames.len() {
+            let (frame_id, parent_frame_id) = {
+                let frame = &self.frames[index];
+                (frame.frame_id(), frame.parent_frame_id())
+            };
+            let Some((width, height)) = self.frame_embedding_viewport(frame_id, parent_frame_id)
+                else { continue };
+            let Some(js) = self.js.as_mut() else { return };
+            if let Err(error) = self.frames[index].set_viewport(js, width, height) {
+                tracing::debug!("frame viewport update failed: {error}");
+            }
+        }
+    }
+
     /// Creates, fetches, and runs the front frame. The record remains Page-
     /// owned at each await, so cancellation resumes the current URL and leaves
     /// every untouched sibling in order.
@@ -1269,12 +1308,12 @@ impl Page {
                 None => Vec::new(),
             };
 
+            let viewport = (frame.viewport_width as f64, frame.viewport_height as f64);
+            #[cfg(feature = "render")]
+            let viewport = self.frame_embedding_viewport(frame.frame_id, frame.parent_frame_id)
+                .unwrap_or(viewport);
             if let Some(js) = self.js.as_mut() {
-                if let Err(error) = realm.set_viewport(
-                    js,
-                    frame.viewport_width as f64,
-                    frame.viewport_height as f64,
-                ) {
+                if let Err(error) = realm.set_viewport(js, viewport.0, viewport.1) {
                     tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
                 }
                 // New-document scripts must be installed before the published
@@ -1637,6 +1676,7 @@ impl Page {
         }
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
+        self.sync_frame_viewports();
         queued_new || scripts_ran || delivered
     }
 
@@ -1654,6 +1694,7 @@ impl Page {
         index: usize,
         expression: &str,
     ) -> Result<serde_json::Value, String> {
+        self.sync_frame_viewports();
         let realm = self.frames.get(index).ok_or("no such frame")?;
         let js = self.js.as_mut().ok_or("no runtime")?;
         realm.evaluate(js, expression)
@@ -1674,6 +1715,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_viewport(viewport.0 as f64, viewport.1 as f64);
         }
+        self.sync_frame_viewports();
     }
 
     /// Set or clear the CDP physical-screen override independently of layout.
@@ -4369,6 +4411,7 @@ impl Page {
         expression: &str,
         timeout: std::time::Duration,
     ) -> serde_json::Value {
+        self.sync_frame_viewports();
         if let Some(js) = &mut self.js {
             match js.evaluate_with_timeout(expression, timeout) {
                 Ok(val) => val,
@@ -4388,10 +4431,14 @@ impl Page {
 
     /// Run a script and preserve JavaScript execution errors. The caller owns its deadline.
     pub fn evaluate_script(&mut self, script: &str) -> Result<serde_json::Value, String> {
-        self.js.as_mut().ok_or("JavaScript runtime unavailable")?.evaluate_script(script)
+        self.sync_frame_viewports();
+        let result = self.js.as_mut().ok_or("JavaScript runtime unavailable")?.evaluate_script(script);
+        self.sync_frame_viewports();
+        result
     }
 
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {
+        self.sync_frame_viewports();
         if let Some(js) = &mut self.js {
             match js.evaluate(expression) {
                 Ok(val) => val,
@@ -4469,6 +4516,7 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.sync_frame_viewports();
         if let Some(js) = &mut self.js {
             let evaluation = js.start_cdp_evaluation(expression, return_by_value, await_promise)?;
             self.await_cdp_evaluation(evaluation, return_by_value, await_timeout_ms, "Runtime.evaluate").await
@@ -4550,6 +4598,7 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        self.sync_frame_viewports();
         let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
         let evaluation = js.start_cdp_call(
             function_declaration,
@@ -4569,7 +4618,10 @@ impl Page {
         method: &str,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
         let pending = match evaluation {
-            obscura_js::runtime::CdpEvaluation::Complete(info) => return Ok(info),
+            obscura_js::runtime::CdpEvaluation::Complete(info) => {
+                self.sync_frame_viewports();
+                return Ok(info);
+            }
             obscura_js::runtime::CdpEvaluation::Pending(pending) => pending,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -7195,6 +7247,42 @@ mod tests {
             "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
             [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_viewport_tracks_its_embedding_content_box() {
+        let mut page = import_map_test_page("frame-viewport", "https://parent.test",
+            "<!doctype html><html><body></body></html>");
+        page.evaluate_script(r#"(() => {
+            const f = document.createElement('iframe'); f.id = 'sized';
+            f.style.cssText = 'width:640px;height:240px;padding:4px;border:3px solid;transform:scale(.5)';
+            f.srcdoc = '<style>body{margin:0}#box{width:50vw;height:25vh}</style><div id="box"></div><script>globalThis.resizes=0;addEventListener("resize",()=>resizes++);globalThis.wide=matchMedia("(min-width:700px)");globalThis.changes=[];wide.addEventListener("change",e=>changes.push(e.matches))</script>';
+            document.body.appendChild(f); return 1;
+        })()"#).unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        let dimensions = r#"(() => {
+            const f = document.getElementById('sized'), w = f.contentWindow, d = f.contentDocument;
+            const box = d.getElementById('box').getBoundingClientRect();
+            return [w.innerWidth, w.innerHeight, w.visualViewport.width, w.visualViewport.height,
+                d.documentElement.clientWidth, box.width, box.height, w.wide.matches, w.resizes, w.changes];
+        })()"#;
+        assert_eq!(page.evaluate_script(dimensions).unwrap(),
+            serde_json::json!([640, 240, 640, 240, 640, 320, 60, false, 0, []]));
+        page.evaluate_script("document.getElementById('sized').style.width='800px'; 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(dimensions).unwrap(),
+            serde_json::json!([800, 240, 800, 240, 800, 400, 60, true, 1, [true]]));
+        page.evaluate_script("document.getElementById('sized').style.display='none'; 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(dimensions).unwrap(),
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, false, 2, [true, false]]));
+        page.evaluate_script("document.getElementById('sized').style.cssText+=';display:inline;width:0;height:0'; 1").unwrap();
+        pump_srcdoc_frames(&mut page).await;
+        assert_eq!(page.evaluate_script(dimensions).unwrap(),
+            serde_json::json!([0, 0, 0, 0, 0, 0, 0, false, 2, [true, false]]));
+        assert_eq!(page.evaluate_script("[innerWidth,innerHeight]").unwrap(),
+            serde_json::json!([1280, 720]));
     }
 
     #[tokio::test(flavor = "current_thread")]

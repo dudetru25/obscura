@@ -5543,12 +5543,12 @@ class Element extends Node {
     return this._dataset;
   }
   get offsetWidth() {
-    if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
+    if (this._isViewportRoot()) return globalThis.innerWidth ?? 1280;
     const metrics = this._renderBoxMetrics();
     return metrics ? metrics.offsetWidth : this.getBoundingClientRect().width;
   }
   get offsetHeight() {
-    if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    if (this._isViewportRoot()) return globalThis.innerHeight ?? 720;
     const metrics = this._renderBoxMetrics();
     return metrics ? metrics.offsetHeight : this.getBoundingClientRect().height;
   }
@@ -5605,12 +5605,12 @@ class Element extends Node {
     // In standards mode only the root element exposes the viewport. Body is
     // an ordinary box; treating it as another viewport breaks libraries that
     // measure the page's body or a full-viewport sizing sentinel.
-    if (this.tagName === 'HTML') return globalThis.innerWidth || 1280;
+    if (this.tagName === 'HTML') return globalThis.innerWidth ?? 1280;
     const metrics = this._renderClientMetrics();
     return metrics ? metrics.width : 100;
   }
   get clientHeight() {
-    if (this.tagName === 'HTML') return globalThis.innerHeight || 720;
+    if (this.tagName === 'HTML') return globalThis.innerHeight ?? 720;
     const metrics = this._renderClientMetrics();
     return metrics ? metrics.height : 20;
   }
