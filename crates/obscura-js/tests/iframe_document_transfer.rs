@@ -5,11 +5,18 @@ use obscura_js::runtime::ObscuraJsRuntime;
 use serde_json::json;
 
 async fn runtime_with_frame() -> ObscuraJsRuntime {
+    runtime_with_frame_at("https://iframe.example.invalid/").await
+}
+
+async fn runtime_with_frame_at(url: &str) -> ObscuraJsRuntime {
     let mut runtime = ObscuraJsRuntime::new();
     runtime.set_dom(parse_html(r#"<!doctype html><html><head>
         <style id="host-style" data-transfer="source">#target { width:47px; height:13px }</style>
         </head><body><p id="host-sentinel">parent</p></body></html>"#));
-    runtime.set_url("https://iframe.example.invalid/");
+    runtime.set_url(url);
+    runtime.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+        std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+    )));
     runtime.set_viewport(300.0, 200.0);
     runtime.run_page_init();
     runtime.execute_script("create-transfer-frame", r#"
@@ -40,20 +47,48 @@ async fn runtime_with_frame() -> ObscuraJsRuntime {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cloned_host_style_is_adopted_when_appended_to_iframe() {
-    let mut runtime = runtime_with_frame().await;
-    let result = runtime.evaluate_script(r#"(() => {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await.expect("the adopted link must request its stylesheet").unwrap();
+        let mut request = [0u8; 4096];
+        let count = stream.read(&mut request).await.unwrap();
+        let css = "#target { width:61px; height:19px }";
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{css}", css.len());
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(request[..count].to_vec()).unwrap()
+    });
+    let mut runtime = runtime_with_frame_at(&format!("{origin}/host/page")).await;
+    let result = runtime.evaluate_for_cdp(r#"(async () => {
         const child = frame.contentDocument;
         const source = document.getElementById('host-style');
         const original = source.outerHTML;
         const mirror = source.cloneNode(true);
         mirror.id = 'mirror';
-        child.head.append(mirror);
+        const base = child.createElement('base');
+        base.href = new URL('/frame/', location.href).href;
+        child.head.append(base);
+        const sourceLink = document.createElement('link');
+        sourceLink.rel = 'stylesheet'; sourceLink.href = 'mirror.css';
+        const linkMirror = sourceLink.cloneNode(true);
+        linkMirror.id = 'link-mirror';
+        const loaded = new Promise((resolve, reject) => {
+            linkMirror.onload = resolve;
+            linkMirror.onerror = () => reject(new Error('the adopted stylesheet must load'));
+        });
+        child.head.append(mirror, linkMirror);
+        await loaded;
+        globalThis.loadedMirror = linkMirror;
         const computed = frame.contentWindow.getComputedStyle(child.getElementById('target'));
         return {
             identity: child.getElementById('mirror') === mirror,
             ownership: [mirror.ownerDocument === child, mirror.firstChild.ownerDocument === child],
             sourceUnchanged: source === document.getElementById('host-style') && source.outerHTML === original,
             hostMirror: document.getElementById('mirror') === null,
+            link: [linkMirror.ownerDocument === child, child.getElementById('link-mirror') === linkMirror,
+                sourceLink.ownerDocument === document, sourceLink.parentNode === null],
             attributes: mirror.getAttribute('data-transfer'),
             text: child.getElementById('mirror').textContent,
             styles: Array.from(child.head.querySelectorAll('style'), style => style.id),
@@ -61,18 +96,27 @@ async fn cloned_host_style_is_adopted_when_appended_to_iframe() {
             sentinels: [document.getElementById('host-sentinel').textContent,
                 child.getElementById('child-sentinel').textContent, child.getElementById('target').textContent],
         };
-    })()"#).expect("a host-cloned style must append into the iframe's native document");
-    assert_eq!(result, json!({
+    })()"#, true, true).await.expect("host-cloned style and link nodes must append and load in the iframe");
+    let request = server.await.unwrap();
+    assert!(request.starts_with("GET /frame/mirror.css HTTP/1.1\r\n"), "{request}");
+    assert_eq!(result.value.unwrap(), json!({
         "identity": true,
         "ownership": [true, true],
         "sourceUnchanged": true,
         "hostMirror": true,
+        "link": [true, true, true, true],
         "attributes": "source",
         "text": "#target { width:47px; height:13px }",
         "styles": ["child-style", "mirror"],
-        "computed": ["47px", "13px"],
+        "computed": ["61px", "19px"],
         "sentinels": ["parent", "untouched", "child"],
     }));
+    runtime.evaluate_script("loadedMirror.remove()").unwrap();
+    let error = runtime.evaluate_script("document.head.append(loadedMirror)")
+        .expect_err("a detached loaded stylesheet must retain its owning lifecycle");
+    assert!(error.contains("NotSupportedError"), "{error}");
+    assert_eq!(runtime.evaluate_script("[loadedMirror.ownerDocument === frame.contentDocument, loadedMirror.parentNode === null]").unwrap(),
+        json!([true, true]));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -336,10 +380,19 @@ async fn unsupported_adoption_and_invalid_insertion_leave_source_intact() {
         document.body.append(resourceRoot);
         globalThis.ordinaryRoot = document.createElement('section');
         ordinaryRoot.textContent = 'kept'; document.body.append(ordinaryRoot);
+        globalThis.pendingLink = document.createElement('link');
+        pendingLink.rel = 'stylesheet';
+        pendingLink.href = 'data:text/css,p%7Bcolor:red%7D';
+        document.head.append(pendingLink);
+        pendingLink.remove();
+        globalThis.connectedLink = document.createElement('link');
+        document.head.append(connectedLink);
     })()"#).unwrap();
     for (expression, error_name) in [
         ("frame.contentDocument.body.append(resourceRoot)", "NotSupportedError"),
         ("frame.contentDocument.adoptNode(resourceRoot)", "NotSupportedError"),
+        ("frame.contentDocument.head.append(ordinaryRoot, pendingLink)", "NotSupportedError"),
+        ("frame.contentDocument.adoptNode(connectedLink)", "NotSupportedError"),
         ("frame.contentDocument.body.insertBefore(ordinaryRoot, document.body)", "NotFoundError"),
         ("frame.contentDocument.appendChild(ordinaryRoot)", "HierarchyRequestError"),
     ] {

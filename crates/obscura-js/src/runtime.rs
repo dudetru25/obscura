@@ -9987,6 +9987,45 @@ mod tests {
     }
 
     #[test]
+    fn text_constraint_validation_rejects_missing_and_incomplete_codes() {
+        let mut rt = setup_runtime(r#"<html><body><form>
+            <input id="code" required pattern="[0-9]{6}">
+            </form></body></html>"#);
+        let result = rt.evaluate(r#"
+            const input = document.getElementById('code');
+            const validity = input.validity;
+            let invalid = 0;
+            input.addEventListener('invalid', () => invalid++);
+            const cases = ['', '123', '123456', 'a123456b', '12345x'].map(value => {
+                input.value = value;
+                return [validity.valueMissing, validity.patternMismatch, input.checkValidity()];
+            });
+            input.value = '';
+            input.setAttribute('disabled', '');
+            const disabled = [input.willValidate, input.checkValidity()];
+            input.removeAttribute('disabled');
+            input.readOnly = true;
+            const readonly = [input.willValidate, input.checkValidity()];
+            input.readOnly = false;
+            input.removeAttribute('required');
+            const optional = [validity.valueMissing, validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '[');
+            input.value = 'anything';
+            const malformed = [validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '');
+            const emptyPattern = [validity.patternMismatch, input.checkValidity()];
+            return { cases, disabled, readonly, optional, malformed, emptyPattern, invalid };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "cases": [[true, false, false], [false, true, false], [false, false, true],
+                [false, true, false], [false, true, false]],
+            "disabled": [false, true], "readonly": [false, true],
+            "optional": [false, false, true], "malformed": [false, true],
+            "emptyPattern": [true, false], "invalid": 5
+        }));
+    }
+
+    #[test]
     fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"

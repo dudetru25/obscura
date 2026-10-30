@@ -17170,6 +17170,56 @@ mod tests {
     }
 
     #[test]
+    fn stretched_block_size_preserves_descendant_percentages() {
+        for host in [
+            "display:flex",
+            "display:grid;grid-template-rows:minmax(0,1fr)",
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                html,body{{margin:0}}
+                #host{{{host};height:300px;width:400px}}
+                #item{{display:flex;min-height:0;min-width:0}}
+                .column{{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}}
+                #inspector{{display:flex;flex-direction:column;height:100%;min-height:0;overflow:hidden}}
+                #scroll{{flex:1 1 0;min-height:0;overflow:auto}}
+                #control{{display:block;height:30px}}
+                #long{{height:600px}}
+                </style><div id="host"><div id="item"><div class="column"><form class="column">
+                <div id="inspector"><div id="scroll"><button id="control">Outline</button><div id="long"></div></div></div>
+                </form></div></div></div>"#));
+            let laid = layout_dom(&tree, (800.0, 800.0));
+            let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+            for id in ["item", "inspector", "scroll"] {
+                assert_eq!(rect(id).height, 300.0, "{host} {id}: {:?}", rect(id));
+            }
+            let control = rect("control");
+            let scroll = rect("scroll");
+            assert!(control.y >= scroll.y && control.y + control.height <= scroll.y + scroll.height,
+                "the control must remain within its scroll viewport: {control:?} {scroll:?}");
+        }
+        for (host, item) in [
+            ("display:flex;height:300px", "align-self:start"),
+            ("display:grid;height:300px", "align-self:start"),
+            ("display:flex;height:300px", "margin-block:auto"),
+            ("display:grid;height:300px", "margin-block:auto"),
+            ("display:flex", ""),
+            ("display:grid", ""),
+        ] {
+            let tree = parse_html(&format!(r#"<style>
+                html,body{{margin:0}}
+                #host{{{host};width:400px}}
+                #item{{{item}}}
+                #percent{{height:100%}}
+                #leaf{{height:25px}}
+                </style><div id="host"><div id="item"><div id="percent"><div id="leaf"></div></div></div></div>"#));
+            let laid = layout_dom(&tree, (800.0, 800.0));
+            let percent = laid.rects[&tree.get_element_by_id("percent").unwrap()];
+            assert_eq!(percent.height, 25.0,
+                "non-stretched or indefinite items must remain content-sized: {host} {item}");
+        }
+    }
+
+    #[test]
     fn explicit_size_containment_bounds_a_flex_scroll_viewport() {
         let tree = parse_html(include_str!("../../../render-repros/contained-flex-grid.html"));
         let laid = layout_dom(&tree, (800.0, 800.0));
