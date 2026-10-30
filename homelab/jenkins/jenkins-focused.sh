@@ -15,7 +15,7 @@ cargo nextest run --locked --release --features render -p obscura-cdp \
     --test integration --no-fail-fast \
     -E 'test(/^input_mouse_event_parity::/) | test(textarea_enter_selection::select_all_replaces_existing_text_in_editable_fields)' \
     2>&1 | tee ci-output/focused-pointer.log || suite_status=$?
-cargo nextest run --locked --release --features render -p obscura-render \
+cargo nextest run --locked --release --features paint -p obscura-render \
     --lib --no-fail-fast -E 'test(stretched_block_size_preserves_descendant_percentages)' \
     2>&1 | tee ci-output/focused-inspector.log || suite_status=$?
 exit "$suite_status"

@@ -97,6 +97,7 @@ async fn cloned_host_style_is_adopted_when_appended_to_iframe() {
                 child.getElementById('child-sentinel').textContent, child.getElementById('target').textContent],
         };
     })()"#, true, true).await.expect("host-cloned style and link nodes must append and load in the iframe");
+    assert!(!result.thrown, "stylesheet transfer rejected: {}", result.description);
     let request = server.await.unwrap();
     assert!(request.starts_with("GET /frame/mirror.css HTTP/1.1\r\n"), "{request}");
     assert_eq!(result.value.unwrap(), json!({
