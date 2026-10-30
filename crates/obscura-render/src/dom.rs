@@ -2782,6 +2782,10 @@ fn cascade_node_style(
                 _ => {}
             }
         }
+        // Closed dialogs have no box unless author display rules override the UA rule.
+        if elem.local.as_ref() == "dialog" && node.get_attribute("open").is_none() {
+            style.display = crate::Display::None;
+        }
         // UA rule `[hidden]:not([hidden=until-found]) { display: none }`.
         // Applied before the author cascade so a matching author `display`
         // still wins (UA origin, per the HTML rendering spec). Sites ship
