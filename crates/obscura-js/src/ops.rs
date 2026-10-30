@@ -3571,6 +3571,25 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+// Fetch Metadata retains the least-trusted site reached by the URL list.
+// Returning to the initiator after a redirect must not restore same-origin.
+fn scripted_fetch_site(page_origin: &str, current_url: &str, redirects: &[url::Url]) -> &'static str {
+    let (Ok(source), Ok(target)) = (url::Url::parse(page_origin), url::Url::parse(current_url)) else {
+        return "cross-site";
+    };
+    let mut site = "same-origin";
+    for hop in redirects.iter().chain(std::iter::once(&target)) {
+        if source.origin() == hop.origin() {
+            continue;
+        }
+        if !same_site(&source, hop) {
+            return "cross-site";
+        }
+        site = "same-site";
+    }
+    site
+}
+
 /// Fetch "append a request `Origin` header": cross-origin requests and any
 /// request whose method is neither GET nor HEAD carry the requester's origin.
 fn sends_origin_header(method: &str, cross_origin: bool) -> bool {
@@ -4399,6 +4418,9 @@ async fn fetch_url_inner(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
+        if !current_headers.keys().any(|name| name.eq_ignore_ascii_case("sec-fetch-site")) {
+            req = req.header("Sec-Fetch-Site", scripted_fetch_site(&page_origin, &current_url, &redirected_from));
+        }
         if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
         }
@@ -4728,6 +4750,8 @@ async fn stealth_fetch_all(
         for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
+        req_headers.entry("sec-fetch-site".to_string()).or_insert_with(||
+            scripted_fetch_site(&page_origin, &current_url, &redirected_from).to_string());
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let cookie_context = credentials_allowed.then(|| {
