@@ -18635,7 +18635,7 @@ mod tests {
         let loader_calls = calls.clone();
         let png = two_by_three_png();
         let mut rt = parser_image_runtime(
-            r#"<img id="hero" src="../assets/hero.png">"#,
+            r#"<img id="hero" src="../assets/hero.png" alt="Hero image">"#,
             move |_url: &str| {
                 loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(png.clone())
@@ -18651,7 +18651,8 @@ mod tests {
                     image instanceof HTMLImageElement,
                     image.complete,
                     image.naturalWidth,
-                    image.naturalHeight
+                    image.naturalHeight,
+                    image.alt
                 ];
                 image.addEventListener("load", () => __imageEvents.push("load"));
                 image.addEventListener("error", () => __imageEvents.push("error"));
@@ -18664,7 +18665,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rt.evaluate("__imageInitial").unwrap(),
-            serde_json::json!([true, false, 0, 0])
+            serde_json::json!([true, false, 0, 0, "Hero image"])
         );
 
         rt.run_event_loop_bounded(100).await.unwrap();
@@ -18703,7 +18704,7 @@ mod tests {
                 image.complete, image.naturalWidth, image.naturalHeight, image.currentSrc, __imageEvents
             ]);
             const frame = document.createElement("iframe");
-            frame.srcdoc = '<html><body><img id="frame-hero"></body></html>';
+            frame.srcdoc = '<html><body><img id="frame-hero" alt="Frame image"></body></html>';
             document.body.appendChild(frame);
         "#).unwrap();
         assert!(rt.resolve_promises_until(|rt| {
@@ -18729,13 +18730,13 @@ mod tests {
             frameImage.addEventListener("load", () => __frameImageEvents.push("load"));
             frameImage.addEventListener("error", () => __frameImageEvents.push("error"));
             frameImage.src = "../assets/frame-hero.png";
-            globalThis.__frameImageInitial = [frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight];
+            globalThis.__frameImageInitial = [frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight, frameImage.alt];
             frameImage.decode().then(
                 () => { __frameDecodeState = "resolved"; },
                 error => { __frameDecodeState = error.name; }
             );
         "#).unwrap();
-        assert_eq!(rt.evaluate("__frameImageInitial").unwrap(), serde_json::json!([false, 0, 0]));
+        assert_eq!(rt.evaluate("__frameImageInitial").unwrap(), serde_json::json!([false, 0, 0, "Frame image"]));
         assert!(rt.resolve_promises_until(|rt| {
             rt.evaluate("__frameDecodeState === 'resolved'").unwrap() == serde_json::json!(true)
         }, 2_000).await, "the frame-owned image must finish decoding");
@@ -18755,6 +18756,26 @@ mod tests {
         assert!(rt.resolve_promises_until(|rt| {
             rt.evaluate("__frameImageEvents.length === 2").unwrap() == serde_json::json!(true)
         }, 2_000).await, "a cached frame request must emit its own load event");
+        rt.execute_script("reflect-image-alt", r#"
+            globalThis.__imageAltReflection = [image, frameImage].map(target => {
+                const assigned = ["Gallery caption", 42, null, undefined].map(value => {
+                    target.alt = value;
+                    return [target.alt, target.getAttribute("alt")];
+                });
+                target.setAttribute("alt", "Updated image");
+                const fromAttribute = target.alt;
+                target.removeAttribute("alt");
+                return [assigned, fromAttribute, target.alt, target.hasAttribute("alt")];
+            });
+        "#).unwrap();
+        let expected_alt_reflection = serde_json::json!([
+            [["Gallery caption", "Gallery caption"], ["42", "42"],
+             ["null", "null"], ["undefined", "undefined"]],
+            "Updated image", "", false
+        ]);
+        assert_eq!(rt.evaluate("__imageAltReflection").unwrap(), serde_json::json!([
+            expected_alt_reflection.clone(), expected_alt_reflection
+        ]));
         assert_eq!(frame_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(rt.evaluate(r#"JSON.stringify([
