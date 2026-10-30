@@ -5428,7 +5428,7 @@ mod tests {
             globalThis.retainedFrame = document.createElement('iframe');
             document.body.append(retainedFrame);
             globalThis.retainedDocument = retainedFrame.contentDocument;
-            return retainedFrame.contentWindow.__obscura_frameId;
+            return retainedFrame._frameId;
         })()"#).unwrap().as_u64().unwrap() as u32;
         let owner = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
         let weak = Rc::downgrade(&owner);
@@ -18710,7 +18710,7 @@ mod tests {
             rt.evaluate("Boolean(frame.contentDocument.getElementById('frame-hero'))").unwrap()
                 == serde_json::json!(true)
         }, 2_000).await, "the image's owning iframe must load");
-        let frame_id = rt.evaluate("frame.contentWindow.__obscura_frameId").unwrap().as_u64().unwrap() as u32;
+        let frame_id = rt.evaluate("frame._frameId").unwrap().as_u64().unwrap() as u32;
         let frame_state = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
         let frame_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = frame_calls.clone();
