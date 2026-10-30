@@ -793,6 +793,16 @@ async fn scaled_iframe_drag_keeps_pointer_capture_and_child_coordinates() {
         return child.getComputedStyle(child.document.querySelector('button')).opacity;
     })()"#, &sid).await;
     assert_eq!(hover["result"]["value"], "1", "hover must update the child render owner");
+    cdp(&mut ctx, 102, "Input.dispatchMouseEvent", json!({"type":"mouseMoved",
+        "x":geometry["outside"]["x"],"y":geometry["outside"]["y"],"buttons":0}), &sid).await;
+    let left = evaluate(&mut ctx, 103, r#"Number((() => {
+        const child = document.getElementById('pointer-frame').contentWindow;
+        return child.getComputedStyle(child.document.querySelector('button')).opacity;
+    })())"#, &sid).await;
+    assert_eq!(left["result"]["value"].as_f64(), Some(0.4), "leaving an uncaptured frame must clear its hover owner");
+    cdp(&mut ctx, 104, "Input.dispatchMouseEvent", json!({"type":"mouseMoved",
+        "x":geometry["down"]["x"],"y":geometry["down"]["y"],"buttons":0}), &sid).await;
+    evaluate(&mut ctx, 105, "document.getElementById('pointer-frame').contentWindow.pointerLog.length=0", &sid).await;
     for (id, event_type, point, buttons) in [
         (3, "mousePressed", "down", 1),
         (4, "mouseMoved", "outside", 1),

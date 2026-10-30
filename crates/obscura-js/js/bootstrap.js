@@ -4205,6 +4205,10 @@ globalThis.__obscura_pointerInput = function(x, y, init) {
     }
   }
   if (!point || !target) return null;
+  if (state.point && state.point.document !== point.document && points.some(item => item.document === state.point.document)) {
+    state.point.view.__obscura_setHovered(null);
+  }
+  state.point = point;
   if (!state.buttons || !state.activeDocument) state.activeDocument = point.document;
   state.buttons = init.buttons;
   if (state.current) state.current.point = point;
@@ -4213,7 +4217,6 @@ globalThis.__obscura_pointerInput = function(x, y, init) {
 globalThis.__obscura_endPointer = function() {
   const state = _pointerStates.get(1);
   if (!state) return;
-  const previous = state.current;
   state.pending = null;
   state.buttons = 0;
   state.suppressMouse = false;
@@ -4222,7 +4225,6 @@ globalThis.__obscura_endPointer = function() {
   const point = globalThis.__obscura_pointerInput(state.x, state.y,
     Object.assign({}, state.init, { buttons: 0, button: -1, pressure: 0 }));
   if (point) {
-    if (previous && previous.document !== point.document && points.some(item => item.document === previous.document)) previous.view.__obscura_setHovered(null);
     point.view.__obscura_setHovered(point.target);
   }
 };
@@ -4232,6 +4234,7 @@ globalThis.__obscura_forgetPointerFrame = function(view) {
   // Collect before native retirement or registry deletion can invalidate access.
   const documents = new Set(_pointerViews(view, 0, 0, true).map(point => point.document));
   for (const state of _pointerStates.values()) {
+    if (state.point && documents.has(state.point.document)) state.point = null;
     if (documents.has(state.activeDocument)) state.activeDocument = null;
     if (state.pending && documents.has(state.pending.document)) state.pending = null;
     const current = state.current;
