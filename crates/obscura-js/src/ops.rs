@@ -9465,7 +9465,7 @@ fn op_computed_style(
 
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
+fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) -> bool {
     let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let changed = state.dom.as_ref().is_some_and(|dom| {
@@ -9477,6 +9477,7 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
+    changed
 }
 
 /// `Element.checkVisibility()` in one native call. Walking ancestors through

@@ -11866,7 +11866,9 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
 };
 globalThis.__obscura_setHovered = function(el) {
   if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
-    __obscuraCore.ops.op_set_hovered(el?._nid | 0, _realmFrameId);
+    if (__obscuraCore.ops.op_set_hovered(el?._nid | 0, _realmFrameId)) {
+      _domMutationEpoch++;
+    }
   }
 };
 
