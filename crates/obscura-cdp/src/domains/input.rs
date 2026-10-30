@@ -174,6 +174,19 @@ fn modifier_flags(modifiers: u64) -> (bool, bool, bool, bool) {
     )
 }
 
+// Execute mouse input in its live same-origin owner realm. The bootstrap
+// resolves capture before hit testing and translates the top-level coordinates.
+fn mouse_input_js(code: &str, x: f64, y: f64, init: &Value) -> String {
+    format!(r#"(function() {{
+        var point = globalThis.__obscura_pointerInput({x}, {y}, {init});
+        if (!point) return;
+        return (function(globalThis, document, x, y, MouseEvent, PointerEvent, Event, inputTarget) {{
+            return {code};
+        }})(point.view, point.document, point.x, point.y,
+            point.view.MouseEvent, point.view.PointerEvent, point.view.Event, point.target);
+    }})()"#)
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -190,16 +203,26 @@ pub async fn handle(
             let buttons = params
                 .get("buttons")
                 .and_then(|v| v.as_u64())
-                .unwrap_or_else(|| mouse_button_mask(button));
+                .unwrap_or_else(|| {
+                    if event_type == "mouseMoved" || event_type == "mouseReleased" {
+                        0
+                    } else {
+                        mouse_button_mask(button)
+                    }
+                });
             let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+            let pointer_init = json!({"buttons": buttons,
+                "button": if event_type == "mouseMoved" { -1 } else { i32::from(button_code) },
+                "pressure": if buttons == 0 { 0.0 } else { 0.5 },
+                "altKey": alt_key, "ctrlKey": ctrl_key, "metaKey": meta_key, "shiftKey": shift_key});
 
             if event_type == "mouseMoved" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
+                            var target = inputTarget || (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
                             if (!target) return;\
                             var old = globalThis.__obscura_hover_target || null;\
                             globalThis.__obscura_hover_target = target;\
@@ -210,24 +233,26 @@ pub async fn handle(
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseover', Object.assign({{}}, init, {{relatedTarget:old}}))));\
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mouseenter', Object.assign({{}}, init, {{bubbles:false,relatedTarget:old}}))));\
                             }}\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
+                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', Object.assign({{}}, init, {{composed:true,button:-1,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure}}}))));\
+                            if (!globalThis.top.__obscura_pointerState(1).suppressMouse) target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', init)));\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = "x",
+                        y = "y",
                         button_code = button_code,
                         buttons = buttons,
                         alt_key = alt_key,
                         ctrl_key = ctrl_key,
                         meta_key = meta_key,
                         shift_key = shift_key,
+                        pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
-                    page.evaluate(&code);
+                    page.evaluate_script(&mouse_input_js(&code, x, y, &pointer_init))?;
                 }
             } else if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = inputTarget || (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
@@ -253,7 +278,8 @@ pub async fn handle(
                             }}\
                             var focusTarget = target.closest && target.closest('input,select,textarea,button,a[href],[tabindex],[contenteditable]');\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:{pointer_pressure},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(pointer);\
+                            globalThis.top.__obscura_pointerState(1).suppressMouse = !target.dispatchEvent(pointer);\
+                            if (globalThis.top.__obscura_pointerState(1).suppressMouse) return;\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!evt.defaultPrevented) {{\
@@ -262,8 +288,8 @@ pub async fn handle(
                                 else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
                             }}\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = "x",
+                        y = "y",
                         button_code = button_code,
                         buttons = buttons,
                         click_count = click_count,
@@ -273,20 +299,22 @@ pub async fn handle(
                         shift_key = shift_key,
                         pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
-                    page.evaluate(&code);
+                    page.evaluate_script(&mouse_input_js(&code, x, y, &pointer_init))?;
                 }
             } else if event_type == "mouseReleased" {
                 let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = inputTarget || (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
                             var pointer = globalThis.__obscura_markTrusted(new PointerEvent('pointerup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(pointer);\
+                            var suppressMouse = globalThis.top.__obscura_pointerState(1).suppressMouse;\
+                            globalThis.top.__obscura_endPointer();\
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                            target.dispatchEvent(evt);\
+                            if (!suppressMouse) target.dispatchEvent(evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
@@ -363,8 +391,8 @@ pub async fn handle(
                                 else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
                             }}\
                         }})()",
-                        x = x,
-                        y = y,
+                        x = "x",
+                        y = "y",
                         button_code = button_code,
                         click_count = click_count,
                         alt_key = alt_key,
@@ -372,7 +400,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_script(&mouse_input_js(&code, x, y, &pointer_init))?;
                     // Document navigation runs after the input acknowledgement.
                     // Same-document routing still needs a frame notification.
                     if !page.has_pending_navigation() && page.sync_virtual_url() {
