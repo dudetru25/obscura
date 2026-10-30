@@ -55,6 +55,7 @@ async fn serve_fixture() -> String {
           </form>
           <a id="hash-link" href="#active">active</a>
           <div id="hover-host"><button id="hover-child">delete</button></div>
+          <iframe id="pointer-frame" style="position:absolute;left:100px;top:400px;width:300px;height:200px;border:10px solid black;padding:6px;transform:scale(.5);transform-origin:0 0" srcdoc="&lt;!doctype html&gt;&lt;style&gt;html,body{margin:0}button{position:absolute;left:20px;top:30px;width:80px;height:40px;border:0;padding:0}&lt;/style&gt;&lt;button id='drag'&gt;drag&lt;/button&gt;&lt;script&gt;window.pointerLog=[];for(const type of ['pointerdown','mousedown','gotpointercapture','pointermove','mousemove','pointerup','lostpointercapture','mouseup','click'])document.addEventListener(type,event=&gt;pointerLog.push({type,target:event.target.id,x:event.clientX,y:event.clientY,trusted:event.isTrusted}));document.querySelector('button').addEventListener('pointerdown',event=&gt;{event.target.setPointerCapture(event.pointerId);window.capturedOnDown=event.target.hasPointerCapture(event.pointerId)});&lt;/script&gt;"></iframe>
         </body></html>"##;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -764,4 +765,62 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         json!(["radio-b:mousedown", "radio-b:mouseup", "radio-b:click", "radio-b:input", "radio-b:change"]),
         "the newly selected radio alone receives activation events"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scaled_iframe_drag_keeps_pointer_capture_and_child_coordinates() {
+    let (mut ctx, sid) = setup().await;
+    let geometry = evaluate(&mut ctx, 2, r#"JSON.stringify((() => {
+        const frame = document.getElementById('pointer-frame');
+        const rect = frame.getBoundingClientRect();
+        const style = getComputedStyle(frame);
+        const sx = rect.width / frame.offsetWidth, sy = rect.height / frame.offsetHeight;
+        const left = frame.clientLeft + parseFloat(style.paddingLeft);
+        const top = frame.clientTop + parseFloat(style.paddingTop);
+        const outside = { x: rect.right + 40, y: rect.bottom + 25 };
+        return { down: { x: rect.left + (left + 40) * sx, y: rect.top + (top + 50) * sy },
+            outside, expected: { x: (outside.x - rect.left) / sx - left,
+                y: (outside.y - rect.top) / sy - top },
+            ready: frame.contentDocument.querySelector('button').textContent };
+    })())"#, &sid).await;
+    let geometry: Value = serde_json::from_str(geometry["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(geometry["ready"], "drag");
+    for (id, event_type, point, buttons) in [
+        (3, "mousePressed", "down", 1),
+        (4, "mouseMoved", "outside", 1),
+        (5, "mouseReleased", "outside", 0),
+    ] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent", json!({
+            "type": event_type, "x": geometry[point]["x"], "y": geometry[point]["y"],
+            "button": "left", "buttons": buttons,
+        }), &sid).await;
+    }
+    let state = evaluate(&mut ctx, 6, r#"JSON.stringify((() => {
+        const child = document.getElementById('pointer-frame').contentWindow;
+        return { events: child.pointerLog, capturedOnDown: child.capturedOnDown,
+            capturedAfterUp: child.document.querySelector('button').hasPointerCapture?.(1) ?? false };
+    })())"#, &sid).await;
+    let state: Value = serde_json::from_str(state["result"]["value"].as_str().unwrap()).unwrap();
+    let events = state["events"].as_array().unwrap();
+    assert_eq!(events.iter().map(|event| event["type"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["pointerdown", "mousedown", "gotpointercapture", "pointermove", "mousemove",
+            "pointerup", "lostpointercapture", "mouseup", "click"],
+        "the child must receive trusted pointer events before compatibility mouse events");
+    assert_eq!(state["capturedOnDown"], true);
+    assert_eq!(state["capturedAfterUp"], false);
+    for event in events {
+        assert_eq!(event["target"], "drag", "capture must retain the child target outside the frame");
+        assert_eq!(event["trusted"], true);
+        let down = event["type"] == "pointerdown" || event["type"] == "mousedown";
+        let expected_x = if down { 40.0 } else { geometry["expected"]["x"].as_f64().unwrap() };
+        let expected_y = if down { 50.0 } else { geometry["expected"]["y"].as_f64().unwrap() };
+        assert!((event["x"].as_f64().unwrap() - expected_x).abs() < 0.1, "wrong child x: {event}");
+        assert!((event["y"].as_f64().unwrap() - expected_y).abs() < 0.1, "wrong child y: {event}");
+    }
+    cdp(&mut ctx, 7, "Input.dispatchMouseEvent", json!({"type":"mouseMoved",
+        "x":geometry["outside"]["x"],"y":geometry["outside"]["y"],"buttons":0}), &sid).await;
+    let after = evaluate(&mut ctx, 8,
+        "document.getElementById('pointer-frame').contentWindow.pointerLog.length", &sid).await;
+    assert_eq!(after["result"]["value"].as_f64(), Some(events.len() as f64),
+        "released capture must not route subsequent top-document moves into the frame");
 }
