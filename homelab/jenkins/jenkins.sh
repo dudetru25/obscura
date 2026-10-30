@@ -75,6 +75,10 @@ export OBSCURA_BIN="$release_stage/extracted/obscura"
 "$OBSCURA_BIN" --version
 "$PYTHON_BIN" render-repros/capture-media-recording.py --obscura-bin "$OBSCURA_BIN" --out "$PWD/ci-output/media-obscura"
 cargo nextest run --locked --release --features render     -E 'test(media::tests::) | binary(media_capture) | test(resize_observer) | test(response_body_exposes_stream) | test(a_blob_url_is_chrome_shaped) | test(changing_iframe_src_releases_the_previous_realm) | test(cancelling_frame_script_fetch_keeps_all_siblings_resumable) | test(detaching_a_parent_discards_its_queued_descendant_work) | test(read_body_capped_) | test(textarea) | binary(textarea_semantics) | test(closed_dialogs_leave_normal_flow_until_opened) | test(parser_image_lifecycle_uses_shared_render_resource) | test(iframe_viewport_tracks_its_embedding_content_box) | test(retired_document_state_follows_javascript_context_lifetime) | test(retained_style_mirror_can_be_removed_after_its_frame_is_released) | binary(iframe_document_transfer) | test(input_key_event_escaping::) | test(js_fetch_emits_network_events::) | test(input_mouse_event_parity::)'     --no-fail-fast 2>&1 | tee ci-output/focused.log
+# Both scripted transports share request metadata and body reporting.
+cargo nextest run --locked --release -p obscura-cdp --features render,stealth \
+    -E 'test(js_fetch_emits_network_events::)' --no-fail-fast \
+    2>&1 | tee ci-output/fetch-stealth.log
 # Exercise the intermittent socket-close boundary repeatedly on the native worker.
 cargo nextest run --locked --release --features render -p obscura-js \
     -E 'test(read_body_capped_)' --stress-count 200 --no-fail-fast \
