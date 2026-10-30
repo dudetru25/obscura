@@ -10014,14 +10014,69 @@ mod tests {
             const malformed = [validity.patternMismatch, input.checkValidity()];
             input.setAttribute('pattern', '');
             const emptyPattern = [validity.patternMismatch, input.checkValidity()];
-            return { cases, disabled, readonly, optional, malformed, emptyPattern, invalid };
+            input.setAttribute('pattern', 'a)|(?:b');
+            const malformedStandalone = [validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '[[a-z]--[aeiou]]+');
+            const unicodeSets = ['b', 'bc', 'a'].map(value => {
+                input.value = value;
+                return [validity.patternMismatch, input.validationMessage !== ''];
+            });
+            input.setAttribute('pattern', '.+@b');
+            input.type = 'email';
+            input.setAttribute('multiple', '');
+            const multiple = ['a@b,c@b', 'a@b,c@d'].map(value => {
+                input.value = value;
+                return validity.patternMismatch;
+            });
+            input.value = '';
+            input.setAttribute('required', '');
+            const types = ['text', 'search', 'tel', 'url', 'email', 'password'].map(type => {
+                input.type = type;
+                return validity.valueMissing;
+            });
+            input.type = 'number';
+            input.value = '12';
+            const unsupported = validity.patternMismatch;
+            const invalidChecks = invalid;
+            const form = input.form;
+            let submits = 0;
+            form.addEventListener('submit', event => { event.preventDefault(); submits++; });
+            input.type = 'text';
+            input.setAttribute('pattern', '[0-9]{6}');
+            input.value = '';
+            form.requestSubmit();
+            input.value = '123';
+            form.requestSubmit();
+            const blocked = submits;
+            input.value = '123456';
+            form.requestSubmit();
+            input.value = '';
+            form.setAttribute('novalidate', '');
+            form.requestSubmit();
+            form.removeAttribute('novalidate');
+            const button = document.createElement('button');
+            button.setAttribute('formnovalidate', '');
+            form.append(button);
+            form.requestSubmit(button);
+            input.disabled = true;
+            form.requestSubmit();
+            input.disabled = false;
+            input.readOnly = true;
+            form.requestSubmit();
+            return { cases, disabled, readonly, optional, malformed, emptyPattern, invalid: invalidChecks,
+                malformedStandalone, unicodeSets, multiple, types, unsupported,
+                submission: [blocked, submits, invalid - invalidChecks] };
         "#).unwrap();
         assert_eq!(result, serde_json::json!({
             "cases": [[true, false, false], [false, true, false], [false, false, true],
                 [false, true, false], [false, true, false]],
             "disabled": [false, true], "readonly": [false, true],
             "optional": [false, false, true], "malformed": [false, true],
-            "emptyPattern": [true, false], "invalid": 5
+            "emptyPattern": [true, false], "invalid": 5,
+            "malformedStandalone": [false, true],
+            "unicodeSets": [[false, false], [false, false], [true, true]],
+            "multiple": [false, true], "types": [true, true, true, true, true, true],
+            "unsupported": false, "submission": [0, 5, 2]
         }));
     }
 

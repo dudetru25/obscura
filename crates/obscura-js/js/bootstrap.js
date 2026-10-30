@@ -5447,6 +5447,13 @@ class Element extends Node {
         );
       }
     }
+    if (!this.hasAttribute('novalidate') && !submitter?.hasAttribute('formnovalidate')) {
+      let valid = true;
+      for (const field of this.elements) {
+        if (field.willValidate && !field.checkValidity()) valid = false;
+      }
+      if (!valid) return;
+    }
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
     this._navigateSubmit(submitter);
@@ -18930,6 +18937,27 @@ function _isEmailInput(element) {
   return element.localName === 'input' && element._inputType() === 'email';
 }
 
+function _isTextConstraintInput(element) {
+  return element.localName === 'input'
+    && ['text', 'search', 'tel', 'url', 'email', 'password'].includes(element._inputType());
+}
+
+function _inputPatternMismatch(element) {
+  if (!_isTextConstraintInput(element) || element.value === '') return false;
+  const pattern = element.getAttribute('pattern');
+  if (pattern === null) return false;
+  // Validate the standalone pattern before anchoring, as HTML requires. The
+  // existing core evaluator returns malformed expressions as error data.
+  const [regexp, error] = __obscuraCore.evalContext(
+    `(function() { new RegExp(${JSON.stringify(pattern)}, 'v'); return new RegExp(${JSON.stringify('^(?:' + pattern + ')$')}, 'v'); })()`,
+    'ext:obscura/input-pattern'
+  );
+  if (error) return false;
+  const values = _isEmailInput(element) && element.hasAttribute('multiple')
+    ? element.value.split(',') : [element.value];
+  return values.some(value => !regexp.test(value));
+}
+
 function _sanitizeEmailValue(element, value) {
   if (!_isEmailInput(element)) return value;
   const trim = token => token.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
@@ -18956,11 +18984,12 @@ if (!Element.prototype.validity) {
             return values.some(value => !_emailAddressPattern.test(value));
           } },
           valueMissing: { enumerable: true, get() {
-            return _isEmailInput(element) && !element.readOnly && !_isActuallyDisabled(element)
+            return _isTextConstraintInput(element) && !element.readOnly && !_isActuallyDisabled(element)
               && element.hasAttribute('required') && element.value === '';
           } },
+          patternMismatch: { enumerable: true, get() { return _inputPatternMismatch(element); } },
           valid: { enumerable: true, get() {
-            return !this.customError && !this.typeMismatch && !this.valueMissing;
+            return !this.customError && !this.typeMismatch && !this.valueMissing && !this.patternMismatch;
           } },
         });
         _ns_validityCache.set(this, validity);
@@ -18999,6 +19028,7 @@ if (!Element.prototype.validationMessage) {
       if (_ns_customValidityMsg.has(this)) return _ns_customValidityMsg.get(this);
       if (this.validity.valueMissing) return 'Please fill out this field.';
       if (this.validity.typeMismatch) return 'Please enter an email address.';
+      if (this.validity.patternMismatch) return 'Please match the requested format.';
       return '';
     },
     enumerable: true,
