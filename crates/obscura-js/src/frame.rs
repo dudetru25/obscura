@@ -113,7 +113,7 @@ impl FrameRealm {
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
-        let owner = deno_core::v8::Weak::new(parent.runtime().v8_isolate(), &context);
+        let owner = parent.weak_realm_context(&context);
         realms.borrow_mut().register_document(
             context.clone(),
             frame_id,

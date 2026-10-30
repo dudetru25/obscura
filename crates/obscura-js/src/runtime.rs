@@ -587,6 +587,13 @@ impl ObscuraJsRuntime {
         EnteredRuntime(&mut self.js_runtime)
     }
 
+    /// Create a weak document-owner handle while its isolate is entered.
+    pub(crate) fn weak_realm_context(
+        &mut self, context: &v8::Global<v8::Context>,
+    ) -> v8::Weak<v8::Context> {
+        v8::Weak::new(self.runtime().v8_isolate(), context)
+    }
+
     /// Read native isolate statistics without evaluating scripts or forcing GC.
     pub fn heap_statistics(&mut self) -> v8::HeapStatistics {
         self.runtime().v8_isolate().get_heap_statistics()
