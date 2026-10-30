@@ -68,6 +68,8 @@ pub struct InterceptedRequest {
     pub page_id: String,
     pub url: String,
     pub method: String,
+    /// Non-empty UTF-8 request body; binary request bodies are omitted.
+    pub post_data: Option<String>,
     pub headers: HashMap<String, String>,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
@@ -94,6 +96,8 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    /// Non-empty UTF-8 request body; binary request bodies are omitted.
+    pub post_data: Option<String>,
     pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
@@ -3571,6 +3575,10 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+fn request_post_data(body: &[u8]) -> Option<String> {
+    std::str::from_utf8(body).ok().filter(|text| !text.is_empty()).map(str::to_owned)
+}
+
 // Fetch Metadata retains the least-trusted site reached by the URL list.
 // Returning to the initiator after a redirect must not restore same-origin.
 fn scripted_fetch_site(page_origin: &str, current_url: &str, redirects: &[url::Url]) -> &'static str {
@@ -4005,6 +4013,7 @@ async fn fetch_url_inner(
     let internal_load = matches!(resource_type,
         ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
     let body = body.to_vec();
+    let post_data = request_post_data(&body);
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -4097,7 +4106,7 @@ async fn fetch_url_inner(
         state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
         event: Some(JsNetworkEvent {
             request_id: request_id.clone(), intercepted: false,
-            url: url.clone(), method: method.clone(), status: 0,
+            url: url.clone(), method: method.clone(), post_data: post_data.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
@@ -4122,6 +4131,7 @@ async fn fetch_url_inner(
             page_id,
             url: url.clone(),
             method: method.clone(),
+            post_data: post_data.clone(),
             headers: custom_headers.clone(),
             resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
@@ -4144,7 +4154,7 @@ async fn fetch_url_inner(
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
                         error_text: None,
-                        url: url.clone(), method: method.clone(), status,
+                        url: url.clone(), method: method.clone(), post_data, status,
                         resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4238,6 +4248,7 @@ async fn fetch_url_inner(
     };
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
+    network_guard.event.as_mut().unwrap().post_data = request_post_data(&body);
 
     let client = match &http_client {
         Some(client) => client.request_client().await,
@@ -4660,7 +4671,8 @@ async fn fetch_url_inner(
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
                 error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
+                url: current_url, method: current_method.as_str().to_string(),
+                post_data: request_post_data(&current_body), status,
                 resource_type: resource_type_name.to_string(),
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4916,6 +4928,7 @@ async fn stealth_fetch_all(
             let mut event = network_guard.event.take().unwrap();
             event.url = current_url;
             event.method = current_method;
+            event.post_data = request_post_data(&current_body);
             event.status = status;
             event.response_headers = resp_headers;
             event.body_size = resp_bytes.len();
