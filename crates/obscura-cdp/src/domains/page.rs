@@ -944,7 +944,7 @@ pub fn emit_navigation_events(
         let rid = &nav_request_ids[idx];
         ctx.pending_events.push(CdpEvent {
             method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": network_request(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
         if fetch_pause_matches(ctx, &net_event.url) {
@@ -952,11 +952,7 @@ pub fn emit_navigation_events(
                 method: "Fetch.requestPaused".into(),
                 params: json!({
                     "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
+                    "request": network_request(net_event),
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
@@ -1009,11 +1005,7 @@ pub fn emit_navigation_events(
                 method: "Fetch.requestPaused".into(),
                 params: json!({
                     "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
+                    "request": network_request(net_event),
                     "frameId": frame_id,
                     "resourceType": net_event.resource_type,
                     "networkId": rid,
@@ -1028,7 +1020,7 @@ pub fn emit_navigation_events(
         if Some(i) != nav_idx && !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
-                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": network_request(net_event), "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
         }
@@ -1179,6 +1171,14 @@ pub(crate) fn emit_same_document_navigation(
     });
 }
 
+fn network_request(event: &obscura_browser::NetworkEvent) -> Value {
+    let mut request = json!({"url": event.url, "method": event.method, "headers": event.headers});
+    if let Some(post_data) = &event.post_data {
+        request["postData"] = json!(post_data);
+    }
+    request
+}
+
 /// Emit completed script-initiated requests after the document lifecycle has
 /// already finished. These requests belong to the current document loader and
 /// must not replay frame navigation or load lifecycle events.
@@ -1208,11 +1208,7 @@ pub(crate) fn emit_runtime_network_events(
                     "requestId": request_id,
                     "loaderId": loader_id,
                     "documentURL": page_url,
-                    "request": {
-                        "url": network_event.url,
-                        "method": network_event.method,
-                        "headers": network_event.headers,
-                    },
+                    "request": network_request(network_event),
                     "timestamp": network_event.timestamp,
                     "wallTime": network_event.timestamp,
                     "initiator": {"type": "script"},
@@ -2051,7 +2047,7 @@ mod tests {
         let events = [("document-internal", "Document", "https://example.test/", 200),
             ("script-1", "Script", "https://example.test/app.js", 404)]
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
-                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(), post_data: None,
                 resource_type: kind.into(), status, headers: Default::default(),
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
@@ -2396,6 +2392,7 @@ mod tests {
             intercepted: false,
             url: "https://example.test/data.json".into(),
             method: "GET".into(),
+            post_data: None,
             resource_type: "Fetch".into(),
             status: 200,
             headers: std::collections::HashMap::new(),
@@ -2493,6 +2490,7 @@ mod tests {
             intercepted: false,
             url: url.into(),
             method: "GET".into(),
+            post_data: None,
             resource_type: kind.into(),
             status: 200,
             headers: std::collections::HashMap::new(),
@@ -2554,6 +2552,7 @@ mod tests {
             intercepted: false,
             url: page_url.into(),
             method: "GET".into(),
+            post_data: None,
             resource_type: "Document".into(),
             status: 200,
             headers: std::collections::HashMap::new(),

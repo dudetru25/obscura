@@ -33,6 +33,7 @@ let _mediaInitializeDocument = null;
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscura_pointerState', '__obscura_pointerInput', '__obscura_endPointer', '__obscura_forgetPointerFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
@@ -4121,6 +4122,127 @@ function _elementStyle(element) {
   return style;
 }
 
+// Accessible child realms share the top Window's one mouse pointer owner.
+// Records retain exact document identity; a recycled frame/node id is never enough.
+const _pointerStates = new Map();
+function _pointerViews(view, x, y, includeDetached = false, points = [], seen = new Set()) {
+  if (seen.has(view.document)) return points;
+  seen.add(view.document);
+  points.push({ view, document: view.document, x, y });
+  for (const id of Object.keys(view.__obscura_frameElements)) {
+    const element = view.__obscura_frameElements[id];
+    const entry = view.__obscura_frameObjects[id];
+    if (!entry || element._frameId !== Number(id) || (!includeDetached && !element.isConnected)
+      || entry.window.document !== entry.document) continue;
+    if (includeDetached) {
+      _pointerViews(entry.window, 0, 0, true, points, seen);
+      continue;
+    }
+    const rect = element.getBoundingClientRect();
+    const width = element.offsetWidth, height = element.offsetHeight;
+    if (!(width > 0 && height > 0 && rect.width > 0 && rect.height > 0)) continue;
+    const style = view.getComputedStyle(element);
+    const left = element.clientLeft + (parseFloat(style.paddingLeft) || 0);
+    const top = element.clientTop + (parseFloat(style.paddingTop) || 0);
+    _pointerViews(entry.window, (x - rect.left) * width / rect.width - left,
+      (y - rect.top) * height / rect.height - top, includeDetached, points, seen);
+  }
+  return points;
+}
+function _samePointerTarget(left, right) {
+  return left === right || Boolean(left && right && left.target === right.target && left.document === right.document);
+}
+function _firePointerCapture(record, type, point, init, documentTarget = false) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new DOMException('Pointer capture coordinates are unavailable.', 'InvalidStateError');
+  const target = documentTarget || !record.target.isConnected ? record.document : record.target;
+  const options = Object.assign({}, init, { view: record.view, clientX: point.x, clientY: point.y,
+    bubbles: true, composed: true, pointerId: 1, pointerType: 'mouse', isPrimary: true });
+  target.dispatchEvent(record.view.__obscura_markTrusted(new record.view.PointerEvent(type, options)));
+}
+function _processPointerCapture(state, points) {
+  const livePoint = record => record && points.find(point => point.document === record.document);
+  let previous = state.current;
+  if (previous && !livePoint(previous)) state.current = previous = null;
+  if (state.pending && (!livePoint(state.pending) || !state.pending.target.isConnected)) state.pending = null;
+  if (previous && !_samePointerTarget(previous, state.pending)) {
+    _firePointerCapture(previous, 'lostpointercapture', livePoint(previous), state.init);
+  }
+  if (state.pending && (!_samePointerTarget(state.pending, previous))) {
+    const point = livePoint(state.pending);
+    if (point && state.pending.target.isConnected) {
+      _firePointerCapture(state.pending, 'gotpointercapture', point, state.init);
+    } else state.pending = null;
+  }
+  state.current = state.pending;
+}
+globalThis.__obscura_pointerState = function(pointerId) {
+  const root = globalThis.top;
+  return root === globalThis ? _pointerStates.get(pointerId) : root.__obscura_pointerState(pointerId);
+};
+globalThis.__obscura_pointerInput = function(x, y, init) {
+  const points = _pointerViews(globalThis, x, y);
+  let state = _pointerStates.get(1);
+  if (!state) {
+    state = { buttons: 0, activeDocument: null, current: null, pending: null };
+    _pointerStates.set(1, state);
+  }
+  state.x = x; state.y = y; state.init = init;
+  _processPointerCapture(state, points);
+  let point = state.current && points.find(point => point.document === state.current.document);
+  let target = point && state.current.target;
+  if (!point) {
+    point = points[0];
+    const visited = new Set();
+    while (!visited.has(point.document)) {
+      visited.add(point.document);
+      target = point.document.elementFromPoint(point.x, point.y) || point.document.body;
+      if (!target || target.localName !== 'iframe') break;
+      const entry = point.view.__obscura_frameObjects[target._frameId];
+      const child = entry && points.find(candidate => candidate.document === entry.document);
+      if (!child || child.x < 0 || child.y < 0 || child.x >= child.view.innerWidth || child.y >= child.view.innerHeight) break;
+      point.view.__obscura_setHovered(target);
+      point = child;
+    }
+  }
+  if (!point || !target) return null;
+  if (!state.buttons || !state.activeDocument) state.activeDocument = point.document;
+  state.buttons = init.buttons;
+  if (state.current) state.current.point = point;
+  return Object.assign({ target }, point);
+};
+globalThis.__obscura_endPointer = function() {
+  const state = _pointerStates.get(1);
+  if (!state) return;
+  const previous = state.current;
+  state.pending = null;
+  state.buttons = 0;
+  state.suppressMouse = false;
+  const points = _pointerViews(globalThis, state.x, state.y);
+  _processPointerCapture(state, points);
+  const point = globalThis.__obscura_pointerInput(state.x, state.y,
+    Object.assign({}, state.init, { buttons: 0, button: -1, pressure: 0 }));
+  if (point) {
+    if (previous && previous.document !== point.document && points.some(item => item.document === previous.document)) previous.view.__obscura_setHovered(null);
+    point.view.__obscura_setHovered(point.target);
+  }
+};
+globalThis.__obscura_forgetPointerFrame = function(view) {
+  const root = globalThis.top;
+  if (root !== globalThis) return root.__obscura_forgetPointerFrame(view);
+  // Collect before native retirement or registry deletion can invalidate access.
+  const documents = new Set(_pointerViews(view, 0, 0, true).map(point => point.document));
+  for (const state of _pointerStates.values()) {
+    if (documents.has(state.activeDocument)) state.activeDocument = null;
+    if (state.pending && documents.has(state.pending.document)) state.pending = null;
+    const current = state.current;
+    if (current && documents.has(current.document)) {
+      _firePointerCapture(current, 'lostpointercapture', current.point, state.init, true);
+      state.current = null;
+      if (state.pending && documents.has(state.pending.document)) state.pending = null;
+    }
+  }
+};
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -4720,6 +4842,26 @@ class Element extends Node {
         }
       }
     }
+  }
+  setPointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute setPointerCapture: 1 argument required.');
+    const state = globalThis.__obscura_pointerState(+pointerId | 0);
+    if (!state) throw new DOMException('The pointer is not active.', 'NotFoundError');
+    if (!this.isConnected) throw new DOMException('The element is not connected.', 'InvalidStateError');
+    const document = this.ownerDocument;
+    if (state.buttons && state.activeDocument === document) {
+      state.pending = { target: this, document, view: document.defaultView };
+    }
+  }
+  releasePointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute releasePointerCapture: 1 argument required.');
+    const state = globalThis.__obscura_pointerState(+pointerId | 0);
+    if (!state) throw new DOMException('The pointer is not active.', 'NotFoundError');
+    if (state.pending?.target === this) state.pending = null;
+  }
+  hasPointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute hasPointerCapture: 1 argument required.');
+    return globalThis.__obscura_pointerState(+pointerId | 0)?.pending?.target === this;
   }
   focus() {
     const previous = globalThis.__obscura_focused || null;
@@ -7325,6 +7467,8 @@ class HTMLImageElement extends Element {
     catch (_error) { return raw; }
   }
   set src(value) { this.setAttribute("src", value); }
+  get alt() { return this.getAttribute("alt") || ""; }
+  set alt(value) { this.setAttribute("alt", String(value)); }
 
   get currentSrc() {
     this._refreshImageFromCache();
@@ -11719,7 +11863,7 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
 };
 globalThis.__obscura_setHovered = function(el) {
   if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
-    __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
+    __obscuraCore.ops.op_set_hovered(el?._nid | 0, _realmFrameId);
   }
 };
 
@@ -15467,6 +15611,8 @@ globalThis.__obscura_liveFrameIds = function () {
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId, reason = 'navigation') {
+  const entry = globalThis.__obscura_frameObjects[frameId];
+  if (entry) globalThis.__obscura_forgetPointerFrame(entry.window);
   _dom('retire_frame', frameId, reason);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
