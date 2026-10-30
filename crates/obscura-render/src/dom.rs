@@ -17199,7 +17199,7 @@ mod tests {
             "display:flex",
             "display:grid;grid-template-rows:minmax(0,1fr)",
         ] {
-            let tree = parse_html(&format!(r#"<style>
+            let tree = parse_html(&format!(r#"<!doctype html><style>
                 html,body{{margin:0}}
                 #host{{{host};height:300px;width:400px}}
                 #item{{display:flex;min-height:0;min-width:0}}
@@ -17229,7 +17229,7 @@ mod tests {
             ("display:flex", ""),
             ("display:grid", ""),
         ] {
-            let tree = parse_html(&format!(r#"<style>
+            let tree = parse_html(&format!(r#"<!doctype html><style>
                 html,body{{margin:0}}
                 #host{{{host};width:400px}}
                 #item{{{item}}}
