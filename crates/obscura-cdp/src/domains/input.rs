@@ -106,6 +106,43 @@ const DELETE_JS: &str = "(function() {\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
+// CDP has no browser chrome to receive focus after the final document stop.
+// Blur at that boundary; the next Tab starts from the document edge.
+const TAB_FOCUS_JS: &str = r#"(function() {
+    var direction = $DIRECTION;
+    var elements = Array.from(document.querySelectorAll('*'));
+    var stops = elements.filter(function(element) {
+        if (!Number.isInteger(element.tabIndex) || element.tabIndex < 0 || globalThis.__obscura_isDisabled(element)) return false;
+        if (element.localName === 'input' && (element.getAttribute('type') || '').toLowerCase() === 'hidden') return false;
+        for (var ancestor = element; ancestor; ancestor = ancestor.parentElement) {
+            if (ancestor.hasAttribute('inert') || ancestor.hasAttribute('hidden')) return false;
+            if (ancestor.localName === 'dialog' && !ancestor.hasAttribute('open')) return false;
+        }
+        return element.checkVisibility({visibilityProperty:true}) && element.getClientRects().length > 0;
+    });
+    stops.sort(function(left, right) {
+        if (left.tabIndex === right.tabIndex) return 0;
+        if (left.tabIndex === 0) return 1;
+        if (right.tabIndex === 0) return -1;
+        return left.tabIndex - right.tabIndex;
+    });
+    var active = document.activeElement;
+    var index = stops.indexOf(active);
+    if (index < 0 && active && active !== document.body) {
+        // A programmatically focused negative-tabindex node starts from its
+        // tree position even though it is excluded from the sequential stops.
+        var position = elements.indexOf(active);
+        for (var i = position + direction; position >= 0 && i >= 0 && i < elements.length; i += direction) {
+            if (stops.indexOf(elements[i]) >= 0) { elements[i].focus(); return; }
+        }
+        active.blur();
+        return;
+    }
+    var next = index < 0 ? (direction > 0 ? 0 : stops.length - 1) : index + direction;
+    if (next >= 0 && next < stops.length) stops[next].focus();
+    else if (active && active !== document.body) active.blur();
+})()"#;
+
 fn mouse_button_code(button: &str) -> u8 {
     match button {
         "middle" => 1,
@@ -449,6 +486,13 @@ pub async fn handle(
                             virtual_key_code = virtual_key_code,
                         );
                         if page.evaluate(&js).as_bool() == Some(false) {
+                            return Ok(json!({}));
+                        }
+
+                        if key == "Tab" {
+                            if !alt_key && !ctrl_key && !meta_key {
+                                page.evaluate(&TAB_FOCUS_JS.replace("$DIRECTION", if shift_key { "-1" } else { "1" }));
+                            }
                             return Ok(json!({}));
                         }
 
