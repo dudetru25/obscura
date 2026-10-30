@@ -7874,6 +7874,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn retained_style_mirror_can_be_removed_after_its_frame_is_released() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("retained-frame-style");
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        assert_eq!(page.frames.len(), 1);
+        assert_eq!(page.evaluate_in_frame(0, "globalThis.__ran").unwrap(), serde_json::json!("YES"));
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const style = document.createElement('style'); style.id = 'host-style';
+            style.textContent = 'body { color: rgb(1, 2, 3); }'; document.head.appendChild(style);
+            const sentinel = document.createElement('div'); sentinel.id = 'parent-sentinel';
+            sentinel.textContent = 'Parent unchanged'; document.body.appendChild(sentinel);
+            globalThis.retainedDocument = document.querySelector('iframe').contentDocument;
+            globalThis.retainedMirror = style.cloneNode(true); retainedMirror.id = 'mirror';
+            retainedDocument.head.appendChild(retainedMirror);
+            return [retainedMirror.parentNode === retainedDocument.head,
+                retainedMirror.ownerDocument === retainedDocument];
+        })()"#).unwrap(), serde_json::json!([true, true]));
+        page.evaluate_script("document.querySelector('iframe').remove(); 1").unwrap();
+        page.release_detached_frames();
+        assert!(page.frames.is_empty());
+        assert!(page.pending_frame_work.is_empty());
+        assert_eq!(page.evaluate_script(r#"(() => {
+            retainedMirror.remove();
+            retainedMirror.remove();
+            return [retainedMirror.parentNode === null,
+                retainedMirror.ownerDocument === retainedDocument,
+                !retainedDocument.head.contains(retainedMirror),
+                document.getElementById('parent-sentinel').textContent,
+                document.getElementById('host-style').textContent];
+        })()"#).unwrap(), serde_json::json!([true, true, true,
+            "Parent unchanged", "body { color: rgb(1, 2, 3); }"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn suspend_resume_preserves_document_script_start_state() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             "script-state-suspend".to_string(),

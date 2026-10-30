@@ -595,6 +595,7 @@ impl ObscuraJsRuntime {
     /// Run a full collection only when an automation client explicitly asks.
     pub fn collect_garbage(&mut self) {
         self.runtime().v8_isolate().low_memory_notification();
+        self.realm_states().borrow_mut().sweep_document_owners();
     }
 
     /// Freeze the document timeline for one JavaScript task. Browser timelines
@@ -5411,6 +5412,38 @@ mod tests {
             })()"#).unwrap(), serde_json::json!(["retained", "retained", "retained", "retained"]));
             drop(rt);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_document_state_follows_javascript_context_lifetime() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame_id = rt.evaluate(r#"(() => {
+            globalThis.retainedFrame = document.createElement('iframe');
+            document.body.append(retainedFrame);
+            globalThis.retainedDocument = retainedFrame.contentDocument;
+            return retainedFrame.contentWindow.__obscura_frameId;
+        })()"#).unwrap().as_u64().unwrap() as u32;
+        let owner = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
+        let weak = Rc::downgrade(&owner);
+        drop(owner);
+        rt.evaluate("retainedFrame.remove(); retainedFrame = null").unwrap();
+        rt.forget_frame_state(frame_id);
+        rt.forget_frame_state(frame_id);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.collect_garbage();
+        assert!(weak.upgrade().is_some(), "a retained document must keep its native DOM alive");
+        {
+            let registry = rt.realm_states();
+            let registry = registry.borrow();
+            assert!(registry.by_frame_id(frame_id).is_none());
+            assert!(registry.context(frame_id).is_none());
+            assert_eq!(registry.live_count(), 0, "document ownership must not reactivate a frame");
+            assert_eq!(registry.frame_timers_active(frame_id), Some(false));
+        }
+        rt.evaluate("retainedDocument = null").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.collect_garbage();
+        assert!(weak.upgrade().is_none(), "collected JS documents must release their native DOM");
     }
 
     #[test]

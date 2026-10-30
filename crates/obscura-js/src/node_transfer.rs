@@ -46,10 +46,10 @@ pub(crate) fn owner_context<'s, 'i>(
     let owner = context.get_embedder_data(scope, ops::DOCUMENT_OWNER_SLOT)?;
     if !owner.is_uint32() { return None; }
     let owner = owner.uint32_value(scope)?;
-    let shared = ops::live_import_state(state, owner)?;
+    let shared = ops::document_state(state, owner)?;
     if generation.is_some_and(|generation| shared.borrow().document_generation != generation) { return None; }
     if owner != 0 {
-        let known = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().context(owner)?;
+        let known = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().document_context(scope, owner)?;
         if known != context { return None; }
     }
     Some(context)

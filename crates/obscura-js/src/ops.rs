@@ -1112,6 +1112,8 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+    // Retained JS nodes own their document without keeping its frame active.
+    document_owners: Vec<(v8::Weak<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
 }
 
@@ -1134,11 +1136,40 @@ impl RealmStates {
             .map(|(context, _, _)| context.clone())
     }
 
+    pub(crate) fn sweep_document_owners(&mut self) {
+        self.document_owners.retain(|(context, _, _)| !context.is_empty());
+    }
+
+    fn document_state(&self, frame_id: u32) -> Option<SharedState> {
+        self.by_frame_id(frame_id).or_else(|| self.document_owners.iter()
+            .find(|(context, id, _)| *id == frame_id && !context.is_empty())
+            .map(|(_, _, state)| state.clone()))
+    }
+
+    pub(crate) fn document_context<'s, 'i>(
+        &self, scope: &v8::PinScope<'s, 'i>, frame_id: u32,
+    ) -> Option<v8::Local<'s, v8::Context>> {
+        if let Some(context) = self.context(frame_id) {
+            return Some(v8::Local::new(scope, context));
+        }
+        self.document_owners.iter().find(|(context, id, _)| *id == frame_id && !context.is_empty())
+            .and_then(|(context, _, _)| context.to_local(scope))
+    }
+
+    pub(crate) fn register_document(
+        &mut self, context: v8::Global<v8::Context>, frame_id: u32,
+        state: SharedState, owner: v8::Weak<v8::Context>,
+    ) {
+        self.register(context, frame_id, state.clone());
+        self.document_owners.push((owner, frame_id, state));
+    }
+
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
         self.cancel_frame_timers(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);
         self.frame_timers.remove(&frame_id);
         self.cancel_inactive_frame_timers();
+        self.sweep_document_owners();
     }
     pub fn register(
         &mut self,
@@ -1146,6 +1177,7 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        self.sweep_document_owners();
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
             owner: None, cancel: CancelHandle::new_rc(),
         });
@@ -1257,14 +1289,12 @@ impl RealmStates {
 /// id and passes it, which is both correct here and cheaper than asking V8:
 /// a page with no frames resolves on `frame_id == 0` alone.
 pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
-    let page = || op_state.borrow::<SharedState>().clone();
-    if frame_id == 0 {
-        return page();
-    }
-    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
-        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
-        None => page(),
-    }
+    document_state(op_state, frame_id).unwrap_or_else(|| op_state.borrow::<SharedState>().clone())
+}
+
+pub(crate) fn document_state(op_state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(op_state.borrow::<SharedState>().clone()); }
+    op_state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().document_state(frame_id)
 }
 
 /// The state of the realm running right now, or the page's when the caller is
@@ -6861,7 +6891,8 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        let owner = v8::Weak::new(scope, &handle);
+        registry.borrow_mut().register_document(handle.clone(), frame_id, Rc::new(RefCell::new(child)), owner);
         registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
