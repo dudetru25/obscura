@@ -5237,10 +5237,12 @@ class Element extends Node {
         el._iframeLoadedUrl = loadedUrl;
         el._iframeOpaque = _sandboxOpaqueOrigin;
         // The host fires load after creating the realm and running its scripts.
-        const box = el.getBoundingClientRect();
+        const style = globalThis.getComputedStyle(el);
+        const width = style.display === 'none' ? 0 : Math.max(0, el.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0));
+        const height = style.display === 'none' ? 0 : Math.max(0, el.clientHeight - (parseFloat(style.paddingTop) || 0) - (parseFloat(style.paddingBottom) || 0));
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
+          loadedUrl, html, Math.round(width), Math.round(height), el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
