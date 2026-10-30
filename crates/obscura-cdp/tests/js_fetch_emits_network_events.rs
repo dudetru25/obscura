@@ -25,12 +25,29 @@ async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 2048];
-                    let length = socket.read(&mut buf).await.unwrap();
-                    let request = String::from_utf8_lossy(&buf[..length]);
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let header_end = loop {
+                        let length = socket.read(&mut chunk).await.unwrap();
+                        assert!(length > 0, "fixture request headers must complete");
+                        bytes.extend_from_slice(&chunk[..length]);
+                        assert!(bytes.len() <= 16_384, "fixture request headers are bounded");
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let request = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
                     let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
                     let headers = request.lines().skip(1).filter_map(|line| line.split_once(':'))
                         .map(|(name, value)| (name.to_ascii_lowercase(), value.trim())).collect::<std::collections::HashMap<_, _>>();
+                    let content_length = headers.get("content-length").map(|value| value.parse::<usize>().unwrap()).unwrap_or(0);
+                    assert!(content_length <= 8192, "fixture request body is bounded");
+                    while bytes.len() - header_end < content_length {
+                        let length = socket.read(&mut chunk).await.unwrap();
+                        assert!(length > 0, "fixture request body must complete");
+                        bytes.extend_from_slice(&chunk[..length]);
+                    }
+                    let request_body = String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).ok();
                     let site = headers.get("sec-fetch-site").copied().unwrap_or("");
                     let cookie = headers.get("cookie").is_some_and(|value|
                         value.split(';').any(|item| item.trim() == "metadata-session=fixture"));
@@ -47,6 +64,7 @@ async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
                     let (status, content_type, body) = match path {
                         "/api/start.json" if redirect.is_none() => (403, "application/json", r#"{"error":"cookie-auth metadata missing"}"#.to_string()),
                         "/api/data.json" => (200, "application/json", r#"{"value":42}"#.to_string()),
+                        "/api/body.json" => (200, "application/json", json!({"body":request_body}).to_string()),
                         "/api/missing.json" => (404, "application/json", r#"{"error":"missing"}"#.to_string()),
                         "/api/site-return.json" => (200, "application/json", json!({"site":site,"cookie":cookie}).to_string()),
                         _ => (200, "text/html", r#"<html><head></head><body>
@@ -195,6 +213,76 @@ async fn js_fetch_emits_network_request_and_response() {
             json!({"path":"/api/site-return.json","site":expected_site,"cookie":true}),
         ], "the redirect URL list must retain its least-trusted site");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_fetch_post_body_is_observable_without_interception() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let (base, _observed) = serve().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "body-session";
+    ctx.sessions.insert(session.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), session).await;
+    assert!(ctx.pending_events.iter().filter(|event| event.method == "Network.requestWillBeSent")
+        .all(|event| event.params["request"].get("postData").is_none()), "initial GET requests must omit postData");
+
+    let unicode_body = r#"{"message":"hello, café"}"#;
+    let cases = [
+        ("POST", serde_json::to_string(unicode_body).unwrap(), Some(unicode_body), Some(unicode_body)),
+        ("POST", "''".to_string(), Some(""), None),
+        ("POST", "new Uint8Array([255,0])".to_string(), None, None),
+        ("GET", "undefined".to_string(), Some(""), None),
+    ];
+    let mut id = 2;
+    for (method, body, expected_wire, expected_post_data) in cases {
+        ctx.pending_events.clear();
+        let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":format!("fetch('/api/body.json',{{method:'{method}',body:{body}}}).then(response=>response.json())"),
+            "awaitPromise":true,"returnByValue":true,
+        }), session).await;
+        id += 1;
+        assert_eq!(response["result"]["value"], json!({"body":expected_wire}), "the real server must receive the expected body");
+        let request = ctx.pending_events.iter().find(|event| event.method == "Network.requestWillBeSent"
+            && event.params["request"]["url"].as_str().is_some_and(|url| url.ends_with("/api/body.json")))
+            .expect("runtime request must emit its start event");
+        assert_eq!(request.params["request"]["method"], method);
+        if let Some(expected) = expected_post_data {
+            assert_eq!(request.params["request"]["postData"], expected, "CDP must preserve the exact UTF-8 request body");
+        } else {
+            assert!(request.params["request"].get("postData").is_none(), "absent, empty and binary request bodies must omit postData");
+        }
+        let request_id = &request.params["requestId"];
+        assert!(ctx.pending_events.iter().any(|event| event.method == "Network.responseReceived"
+            && &event.params["requestId"] == request_id && event.params["response"]["status"] == 200),
+            "response identity must match the body-bearing request");
+    }
+
+    let (intercept_tx, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    ctx.intercept_tx = Some(intercept_tx);
+    cdp(&mut ctx, id, "Fetch.enable", json!({"patterns":[{"urlPattern":format!("{base}api/body.json")}]}), session).await;
+    id += 1;
+    ctx.pending_events.clear();
+    let replacement_body = r#"{"message":"continued, café"}"#;
+    let continuation = async {
+        let request: obscura_js::ops::InterceptedRequest = intercepted.recv().await.expect("POST must reach the existing interception boundary");
+        assert_eq!(request.method, "POST");
+        let request_id = request.request_id;
+        assert!(request.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: Some(replacement_body.as_bytes().to_vec()),
+        }).is_ok(), "the intercepted body rewrite must be delivered");
+        request_id
+    };
+    let (response, request_id) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":format!("fetch('/api/body.json',{{method:'POST',body:{}}}).then(response=>response.json())", serde_json::to_string(unicode_body).unwrap()),
+            "awaitPromise":true,"returnByValue":true,
+        }), session), continuation)
+    }).await.expect("the intercepted POST and body rewrite must complete");
+    assert_eq!(response["result"]["value"], json!({"body":replacement_body}), "the server must receive the continued body rather than the original body");
+    assert!(ctx.pending_events.iter().any(|event| event.method == "Network.responseReceived"
+        && event.params["requestId"] == request_id && event.params["response"]["status"] == 200),
+        "continuation must preserve the request's response identity");
 }
 
 #[tokio::test(flavor = "current_thread")]
