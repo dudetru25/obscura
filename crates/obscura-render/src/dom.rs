@@ -309,6 +309,8 @@ pub struct DomLayout {
     /// Native grid track extents beyond the content box, including unoccupied
     /// tracks. Only element scroll containers expose these through CSSOM.
     grid_overflow: HashMap<NodeId, Rect>,
+    /// Used column and row track sizes for resolved grid CSSOM values.
+    grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     /// Per-line border-box fragments for ordinary non-replaced inline
     /// elements. `rects` retains their union for `getBoundingClientRect()`;
     /// this list is the source for background/border painting and
@@ -1005,6 +1007,10 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    pub(crate) fn grid_tracks(&self, id: NodeId) -> Option<&(Vec<f32>, Vec<f32>)> {
+        self.grid_tracks.get(&id)
+    }
+
     pub(crate) fn derived_layout_state(
         &self,
         tree: &DomTree,
@@ -5307,6 +5313,7 @@ fn layout_dom_once(
 
     let mut rects = HashMap::new();
     let mut grid_overflow = HashMap::new();
+    let mut grid_tracks = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
     // Final absolute rects of anonymous inline-run leaves, keyed by the
@@ -7734,6 +7741,7 @@ fn layout_dom_once(
                 &words,
                 &mut rects,
                 &mut grid_overflow,
+                &mut grid_tracks,
                 &mut text_runs,
                 &mut anon_rects,
                 &generated_nodes,
@@ -7936,6 +7944,7 @@ fn layout_dom_once(
         DomLayout {
             rects,
             grid_overflow,
+            grid_tracks,
             inline_fragments,
             styles,
             custom_properties,
@@ -8964,6 +8973,7 @@ fn compute_absolute_rects(
     words: &HashMap<taffy::NodeId, (NodeId, String)>,
     rects: &mut HashMap<NodeId, Rect>,
     grid_overflow: &mut HashMap<NodeId, Rect>,
+    grid_tracks: &mut HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     text_runs: &mut HashMap<NodeId, Vec<(Rect, String)>>,
     anon_rects: &mut HashMap<usize, Rect>,
     generated_nodes: &HashMap<taffy::NodeId, usize>,
@@ -8982,6 +8992,7 @@ fn compute_absolute_rects(
         if let Some(dom_id) = id_map.get(&taffy_id) {
             rects.insert(*dom_id, rect);
             if let taffy::tree::DetailedLayoutInfo::Grid(info) = taffy_tree.detailed_layout_info(taffy_id) {
+                grid_tracks.insert(*dom_id, (info.columns.sizes.clone(), info.rows.sizes.clone()));
                 let right = info.columns.end_offset;
                 let bottom = info.rows.end_offset;
                 if right + layout.padding.right > layout.size.width - layout.border.right
@@ -9019,6 +9030,7 @@ fn compute_absolute_rects(
                     words,
                     rects,
                     grid_overflow,
+                    grid_tracks,
                     text_runs,
                     anon_rects,
                     generated_nodes,

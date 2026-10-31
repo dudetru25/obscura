@@ -1782,6 +1782,17 @@ impl PreparedRender {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
+        if let Some((columns, rows)) = self.layout.grid_tracks(id) {
+            let resolved_tracks = |tracks: &[f32]| {
+                if tracks.is_empty() {
+                    "none".to_string()
+                } else {
+                    tracks.iter().map(|size| format!("{size}px")).collect::<Vec<_>>().join(" ")
+                }
+            };
+            out.insert("grid-template-columns", resolved_tracks(columns));
+            out.insert("grid-template-rows", resolved_tracks(rows));
+        }
         out.insert(
             "vertical-align",
             match style.vertical_align {
