@@ -4,15 +4,15 @@
 try {
     homelabPipeline(
         agentLabel: 'homelab-dev3-linux',
-        branch: 'feat/media-playback',
+        branch: 'fix/browser-api-compat',
         sourceRepository: 'https://github.com/dudetru25/obscura.git',
         scmCredentialId: scm.userRemoteConfigs[0].credentialsId,
         sourceRevisionParameter: 'SOURCE_SHA',
-        scriptPath: 'scripts/ci/Jenkinsfile.focused',
+        scriptPath: 'homelab/jenkins/Jenkinsfile.focused',
         pipelineRevision: params.SOURCE_SHA,
         timeoutMinutes: 30,
         queueProfile: 'small-web',
-        checkCommand: 'bash scripts/ci/jenkins-focused.sh'
+        checkCommand: 'bash homelab/jenkins/jenkins-focused.sh'
     )
 } finally {
     node('homelab-dev3-linux') {

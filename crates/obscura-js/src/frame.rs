@@ -113,10 +113,12 @@ impl FrameRealm {
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
-        realms.borrow_mut().register(
+        let owner = parent.weak_realm_context(&context);
+        realms.borrow_mut().register_document(
             context.clone(),
             frame_id,
             Rc::new(std::cell::RefCell::new(state)),
+            owner,
         );
 
         let realm = FrameRealm {
@@ -216,19 +218,19 @@ impl FrameRealm {
         self.frame_id
     }
 
-    /// Sets the frame document's viewport before any of its scripts run.
+    /// Sets the frame viewport at initialization and when its embedding box changes.
     pub fn set_viewport(
         &self,
         parent: &mut ObscuraJsRuntime,
         width: f64,
         height: f64,
     ) -> Result<(), String> {
-        let width = if width.is_finite() && width > 0.0 {
+        let width = if width.is_finite() && width >= 0.0 {
             width
         } else {
             300.0
         };
-        let height = if height.is_finite() && height > 0.0 {
+        let height = if height.is_finite() && height >= 0.0 {
             height
         } else {
             150.0
@@ -242,11 +244,20 @@ impl FrameRealm {
         self.execute_script(
             parent,
             &format!(
-                "globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                "(() => {{\
+                 const changed=globalThis.innerWidth!=={width}||globalThis.innerHeight!=={height};\
+                 globalThis.__obscura_viewport_w={width};globalThis.__obscura_viewport_h={height};\
+                 globalThis.innerWidth={width};globalThis.innerHeight={height};\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
-                 }}"
+                 }}\
+                 if(!changed)return;\
+                 globalThis.__obscura_recompute_media_queries();\
+                 globalThis.__obscura_recompute_intersections();\
+                 globalThis.__obscura_recompute_resizes();\
+                 globalThis.dispatchEvent(new Event('resize'));\
+                 }})()"
             ),
         )
     }

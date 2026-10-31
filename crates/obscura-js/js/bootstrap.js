@@ -33,6 +33,7 @@ let _mediaInitializeDocument = null;
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
+    '__obscura_pointerState', '__obscura_pointerInput', '__obscura_endPointer', '__obscura_forgetPointerFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
@@ -175,7 +176,7 @@ const _dom = (cmd, a1, a2) => {
     result = mutation.result;
     for (const [id, nid] of mutation.__obscuraFrameRetirements) {
       const element = _cache.get(nid);
-      if (element && element._frameId === id) _resetIframeElement(element);
+      if (element && element._frameId === id) _resetIframeElement(element, 'detach');
     }
   }
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
@@ -527,6 +528,9 @@ function _resolveResourceUrl(src) {
 }
 
 const _linkedStylesheetNodes = new WeakMap();
+// A detached clone has no fetch lifecycle to transfer. A link that has ever
+// started loading stays in its owning realm, including while its fetch is pending.
+const _startedLinkedStylesheets = new WeakSet();
 const _linkElementSheets = new WeakMap();
 
 function _linkedStylesheetHref(link, explicitHref) {
@@ -537,6 +541,7 @@ function _linkedStylesheetHref(link, explicitHref) {
 function _registerLinkedStylesheet(link, explicitHref) {
   if (!link) return null;
   const href = _linkedStylesheetHref(link, explicitHref);
+  _startedLinkedStylesheets.add(link);
   _linkedStylesheetNodes.set(link, true);
   let sheet = _linkElementSheets.get(link);
   if (!sheet) {
@@ -694,9 +699,9 @@ async function _loadLinkedStylesheet(c) {
     if (c.disabled) c.setAttribute('disabled', '');
     else c.removeAttribute('disabled');
   }
-  const fullUrl = _resolveResourceUrl(href);
-  let pageOrigin = "";
-  try { pageOrigin = new URL(_domParse("document_url") || "about:blank").origin; } catch(e) {}
+  _startedLinkedStylesheets.add(c);
+  const fullUrl = _urlResolveOp(href, _documentBase() || "about:blank") || href;
+  const pageOrigin = _realmOrigin();
   try {
     const loaded = await _fetchLinkedCss(fullUrl, pageOrigin);
     __obscuraCore.ops.op_external_stylesheet_set(
@@ -2329,7 +2334,7 @@ function _runPostConnectionSteps(nodes) {
       state.cursor = null;
       const n = nodes[i];
       __prepareInsertedSubtree(n);
-      if (n instanceof Element && n.tagName === 'LINK') _loadLinkedStylesheet(n);
+      if (n.nodeType === 1 && n.localName === 'link') _loadLinkedStylesheet(n);
       if (_mediaTreeChanged) _mediaTreeChanged(n);
     }
   } finally {
@@ -2448,6 +2453,23 @@ function _isDomNode(value) {
       && (typeof value._nid === "number" || value._documentShim === true));
 }
 
+// Common same-realm wrappers are identified by the private cache. Foreign
+// prototypes and numeric IDs are not ownership evidence: IDs belong to arenas.
+function _assertSameNativeTree(parent, node, method) {
+  if (_cache.get(parent._nid) === parent && _cache.get(node._nid) === node) return;
+  const parentFrame = __obscuraCore.ops.op_node_owner_frame(parent);
+  const nodeFrame = __obscuraCore.ops.op_node_owner_frame(node);
+  if (parentFrame < 0 || nodeFrame < 0 || parentFrame !== _realmFrameId || nodeFrame !== parentFrame) {
+    throw _mutationError(method, "Cross-document adoption is not supported.", "WrongDocumentError", parent);
+  }
+}
+function _assertInsertionNodes(context, nodes, method) {
+  _assertSameNativeTree(context, context, method);
+  for (const node of nodes) {
+    if (_isDomNode(node) && !_sameNativeTree(context, node)) _adoptionPlan(node);
+  }
+}
+
 function _requireNodeArgument(value, method, position, iface = "Node") {
   if (!_isDomNode(value)) {
     throw new TypeError(
@@ -2481,6 +2503,7 @@ function _mutationError(method, message, name, context) {
 
 function _isHostIncludingInclusiveAncestor(node, parent) {
   if (node === parent) return true;
+  if (!_sameNativeTree(node, parent)) return false;
   const type = node.nodeType;
   if (type !== 1 && type !== 9 && type !== 11) return false;
   // The native walk goes up from parent and through shadow hosts; leaves
@@ -2492,6 +2515,7 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 // (`replacing` true). Steps run in the spec's order because the order is
 // observable through which exception is thrown.
 function _ensureInsertionValidity(parent, node, child, method, replacing) {
+  _assertSameNativeTree(parent, parent, method);
   const parentType = parent.nodeType;
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
     throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
@@ -2575,6 +2599,7 @@ function _ensureDocumentChildValidity(parent, node, nodeType, child, method, rep
 // argument is collected into a DocumentFragment so the caller inserts once and
 // observers get a single record.
 function _convertNodesIntoNode(nodes, context) {
+  _assertInsertionNodes(context, nodes, "insert");
   if (nodes.length === 1 && _isDomNode(nodes[0])) return nodes[0];
   const owner = _nodeDocumentForInsertion(context);
   const converted = [];
@@ -2595,6 +2620,7 @@ function _convertNodesIntoNode(nodes, context) {
 // same, including the one childList record, without the fragment round trip.
 // Anything else takes the fragment path. `reference` is read after conversion.
 function _preInsertConverted(parent, args, context, reference, method) {
+  _assertInsertionNodes(parent, args, method);
   if (args.length === 1 && _isDomNode(args[0])) return _preInsertNode(parent, args[0], reference(), method);
   const parentType = parent.nodeType;
   if (args.length > 1 && (parentType === 1 || parentType === 11) && !(parent instanceof ShadowRoot)) {
@@ -2664,6 +2690,7 @@ function _hasMutationObservers() {
 
 // "Remove": `suppress` skips the record, as replace/replace-all queue their own.
 function _removeNode(parent, child, suppress, method = "removeChild") {
+  _assertSameNativeTree(parent, child, method);
   const observed = !suppress && _hasMutationObservers();
   const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
   const removedWindowNames = _windowNamedNamesInTree(child);
@@ -2686,6 +2713,8 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
 // that still has a parent is removed from it first, which old-parent
 // observers see as a removal (adopt runs "remove" before inserting).
 function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  _adoptForInsertion(parent, node);
+  _assertSameNativeTree(parent, node, method);
   if (node._shadowParent) {
     node._shadowParent.removeChild(node);
   } else {
@@ -2737,6 +2766,7 @@ function _insertNode(parent, node, child, suppress, method) {
 
 function _preInsertNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, false);
+  _adoptForInsertion(parent, node);
   let reference = child;
   if (reference === node) reference = node.nextSibling;
   _insertNode(parent, node, reference, false, method);
@@ -2745,6 +2775,7 @@ function _preInsertNode(parent, node, child, method) {
 
 function _replaceChildNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, true);
+  _adoptForInsertion(parent, node);
   let reference = child.nextSibling;
   if (reference === node) reference = node.nextSibling;
   let previousSibling = child.previousSibling;
@@ -2770,6 +2801,8 @@ function _replaceChildNode(parent, node, child, method) {
 
 // "Replace all" (replaceChildren, textContent). `node` may be null.
 function _replaceAllChildren(parent, node, method) {
+  if (node !== null) _adoptForInsertion(parent, node);
+  _assertSameNativeTree(parent, node === null ? parent : node, method);
   const removedNodes = Array.from(parent.childNodes);
   const observed = _hasMutationObservers();
   const addedNodes = node === null ? [] : (node.nodeType === 11 ? Array.from(node.childNodes) : [node]);
@@ -2930,7 +2963,7 @@ class Node {
   }
   contains(o) {
     if (o === this) return true;
-    return o ? _dom("contains", this._nid, o._nid) === "true" : false;
+    return o && _sameNativeTree(this, o) ? _dom("contains", this._nid, o._nid) === "true" : false;
   }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
@@ -3003,7 +3036,8 @@ class Node {
       const order = own.compareDocumentPosition(target);
       return order & ~(ownAttr ? 16 : 0) & ~(otherAttr ? 8 : 0);
     }
-    if (this._nid === other._nid) return 0;
+    if (this === other) return 0;
+    if (!_sameNativeTree(this, other)) return 1 | 32 | (_nodeNativeFrame(this) < _nodeNativeFrame(other) ? 4 : 2);
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
     if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
@@ -3060,7 +3094,7 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this._nid === other._nid) return true;
+    if (this === other) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -3080,7 +3114,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return !!other && this._nid === other._nid; }
+  isSameNode(other) { return this === other; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -4088,6 +4122,130 @@ function _elementStyle(element) {
   return style;
 }
 
+// Accessible child realms share the top Window's one mouse pointer owner.
+// Records retain exact document identity; a recycled frame/node id is never enough.
+const _pointerStates = new Map();
+function _pointerViews(view, x, y, includeDetached = false, points = [], seen = new Set()) {
+  if (seen.has(view.document)) return points;
+  seen.add(view.document);
+  points.push({ view, document: view.document, x, y });
+  for (const id of Object.keys(view.__obscura_frameElements)) {
+    const element = view.__obscura_frameElements[id];
+    const entry = view.__obscura_frameObjects[id];
+    if (!entry || element._frameId !== Number(id) || (!includeDetached && !element.isConnected)
+      || entry.window.document !== entry.document) continue;
+    if (includeDetached) {
+      _pointerViews(entry.window, 0, 0, true, points, seen);
+      continue;
+    }
+    const rect = element.getBoundingClientRect();
+    const width = element.offsetWidth, height = element.offsetHeight;
+    if (!(width > 0 && height > 0 && rect.width > 0 && rect.height > 0)) continue;
+    const style = view.getComputedStyle(element);
+    const left = element.clientLeft + (parseFloat(style.paddingLeft) || 0);
+    const top = element.clientTop + (parseFloat(style.paddingTop) || 0);
+    _pointerViews(entry.window, (x - rect.left) * width / rect.width - left,
+      (y - rect.top) * height / rect.height - top, includeDetached, points, seen);
+  }
+  return points;
+}
+function _samePointerTarget(left, right) {
+  return left === right || Boolean(left && right && left.target === right.target && left.document === right.document);
+}
+function _firePointerCapture(record, type, point, init, documentTarget = false) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new DOMException('Pointer capture coordinates are unavailable.', 'InvalidStateError');
+  const target = documentTarget || !record.target.isConnected ? record.document : record.target;
+  const options = Object.assign({}, init, { view: record.view, clientX: point.x, clientY: point.y,
+    bubbles: true, composed: true, pointerId: 1, pointerType: 'mouse', isPrimary: true });
+  target.dispatchEvent(record.view.__obscura_markTrusted(new record.view.PointerEvent(type, options)));
+}
+function _processPointerCapture(state, points) {
+  const livePoint = record => record && points.find(point => point.document === record.document);
+  let previous = state.current;
+  if (previous && !livePoint(previous)) state.current = previous = null;
+  if (state.pending && (!livePoint(state.pending) || !state.pending.target.isConnected)) state.pending = null;
+  if (previous && !_samePointerTarget(previous, state.pending)) {
+    _firePointerCapture(previous, 'lostpointercapture', livePoint(previous), state.init);
+  }
+  if (state.pending && (!_samePointerTarget(state.pending, previous))) {
+    const point = livePoint(state.pending);
+    if (point && state.pending.target.isConnected) {
+      _firePointerCapture(state.pending, 'gotpointercapture', point, state.init);
+    } else state.pending = null;
+  }
+  state.current = state.pending;
+}
+globalThis.__obscura_pointerState = function(pointerId) {
+  const root = globalThis.top;
+  return root === globalThis ? _pointerStates.get(pointerId) : root.__obscura_pointerState(pointerId);
+};
+globalThis.__obscura_pointerInput = function(x, y, init) {
+  const points = _pointerViews(globalThis, x, y);
+  let state = _pointerStates.get(1);
+  if (!state) {
+    state = { buttons: 0, activeDocument: null, current: null, pending: null };
+    _pointerStates.set(1, state);
+  }
+  state.x = x; state.y = y; state.init = init;
+  _processPointerCapture(state, points);
+  let point = state.current && points.find(point => point.document === state.current.document);
+  let target = point && state.current.target;
+  if (!point) {
+    point = points[0];
+    const visited = new Set();
+    while (!visited.has(point.document)) {
+      visited.add(point.document);
+      target = point.document.elementFromPoint(point.x, point.y) || point.document.body;
+      if (!target || target.localName !== 'iframe') break;
+      const entry = point.view.__obscura_frameObjects[target._frameId];
+      const child = entry && points.find(candidate => candidate.document === entry.document);
+      if (!child || child.x < 0 || child.y < 0 || child.x >= child.view.innerWidth || child.y >= child.view.innerHeight) break;
+      point.view.__obscura_setHovered(target);
+      point = child;
+    }
+  }
+  if (!point || !target) return null;
+  if (state.point && state.point.document !== point.document && points.some(item => item.document === state.point.document)) {
+    state.point.view.__obscura_setHovered(null);
+  }
+  state.point = point;
+  if (!state.buttons || !state.activeDocument) state.activeDocument = point.document;
+  state.buttons = init.buttons;
+  if (state.current) state.current.point = point;
+  return Object.assign({ target }, point);
+};
+globalThis.__obscura_endPointer = function() {
+  const state = _pointerStates.get(1);
+  if (!state) return;
+  state.pending = null;
+  state.buttons = 0;
+  state.suppressMouse = false;
+  const points = _pointerViews(globalThis, state.x, state.y);
+  _processPointerCapture(state, points);
+  const point = globalThis.__obscura_pointerInput(state.x, state.y,
+    Object.assign({}, state.init, { buttons: 0, button: -1, pressure: 0 }));
+  if (point) {
+    point.view.__obscura_setHovered(point.target);
+  }
+};
+globalThis.__obscura_forgetPointerFrame = function(view) {
+  const root = globalThis.top;
+  if (root !== globalThis) return root.__obscura_forgetPointerFrame(view);
+  // Collect before native retirement or registry deletion can invalidate access.
+  const documents = new Set(_pointerViews(view, 0, 0, true).map(point => point.document));
+  for (const state of _pointerStates.values()) {
+    if (state.point && documents.has(state.point.document)) state.point = null;
+    if (documents.has(state.activeDocument)) state.activeDocument = null;
+    if (state.pending && documents.has(state.pending.document)) state.pending = null;
+    const current = state.current;
+    if (current && documents.has(current.document)) {
+      _firePointerCapture(current, 'lostpointercapture', current.point, state.init, true);
+      state.current = null;
+      if (state.pending && documents.has(state.pending.document)) state.pending = null;
+    }
+  }
+};
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -4688,6 +4846,26 @@ class Element extends Node {
       }
     }
   }
+  setPointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute setPointerCapture: 1 argument required.');
+    const state = globalThis.__obscura_pointerState(+pointerId | 0);
+    if (!state) throw new DOMException('The pointer is not active.', 'NotFoundError');
+    if (!this.isConnected) throw new DOMException('The element is not connected.', 'InvalidStateError');
+    const document = this.ownerDocument;
+    if (state.buttons && state.activeDocument === document) {
+      state.pending = { target: this, document, view: document.defaultView };
+    }
+  }
+  releasePointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute releasePointerCapture: 1 argument required.');
+    const state = globalThis.__obscura_pointerState(+pointerId | 0);
+    if (!state) throw new DOMException('The pointer is not active.', 'NotFoundError');
+    if (state.pending?.target === this) state.pending = null;
+  }
+  hasPointerCapture(pointerId) {
+    if (!arguments.length) throw new TypeError('Failed to execute hasPointerCapture: 1 argument required.');
+    return globalThis.__obscura_pointerState(+pointerId | 0)?.pending?.target === this;
+  }
   focus() {
     const previous = globalThis.__obscura_focused || null;
     if (previous === this) return;
@@ -4870,7 +5048,7 @@ class Element extends Node {
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (_formValues[this._nid] !== undefined) return _sanitizeEmailValue(this, _formValues[this._nid]);
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4889,7 +5067,7 @@ class Element extends Node {
         return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
       }
     }
-    return this.getAttribute("value") || "";
+    return _sanitizeEmailValue(this, this.getAttribute("value") || "");
   }
   // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
   // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
@@ -4921,7 +5099,7 @@ class Element extends Node {
       }
       return;
     }
-    const value = String(v);
+    const value = _sanitizeEmailValue(this, String(v));
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
@@ -5204,10 +5382,12 @@ class Element extends Node {
         el._iframeLoadedUrl = loadedUrl;
         el._iframeOpaque = _sandboxOpaqueOrigin;
         // The host fires load after creating the realm and running its scripts.
-        const box = el.getBoundingClientRect();
+        const style = globalThis.getComputedStyle(el);
+        const width = style.display === 'none' ? 0 : Math.max(0, el.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0));
+        const height = style.display === 'none' ? 0 : Math.max(0, el.clientHeight - (parseFloat(style.paddingTop) || 0) - (parseFloat(style.paddingBottom) || 0));
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
+          loadedUrl, html, Math.round(width), Math.round(height), el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -5414,6 +5594,13 @@ class Element extends Node {
         );
       }
     }
+    if (!this.hasAttribute('novalidate') && !submitter?.hasAttribute('formnovalidate')) {
+      let valid = true;
+      for (const field of this.elements) {
+        if (field.willValidate && !field.checkValidity()) valid = false;
+      }
+      if (!valid) return;
+    }
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
     this._navigateSubmit(submitter);
@@ -5503,12 +5690,12 @@ class Element extends Node {
     return this._dataset;
   }
   get offsetWidth() {
-    if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
+    if (this._isViewportRoot()) return globalThis.innerWidth ?? 1280;
     const metrics = this._renderBoxMetrics();
     return metrics ? metrics.offsetWidth : this.getBoundingClientRect().width;
   }
   get offsetHeight() {
-    if (this._isViewportRoot()) return globalThis.innerHeight || 720;
+    if (this._isViewportRoot()) return globalThis.innerHeight ?? 720;
     const metrics = this._renderBoxMetrics();
     return metrics ? metrics.offsetHeight : this.getBoundingClientRect().height;
   }
@@ -5565,12 +5752,12 @@ class Element extends Node {
     // In standards mode only the root element exposes the viewport. Body is
     // an ordinary box; treating it as another viewport breaks libraries that
     // measure the page's body or a full-viewport sizing sentinel.
-    if (this.tagName === 'HTML') return globalThis.innerWidth || 1280;
+    if (this.tagName === 'HTML') return globalThis.innerWidth ?? 1280;
     const metrics = this._renderClientMetrics();
     return metrics ? metrics.width : 100;
   }
   get clientHeight() {
-    if (this.tagName === 'HTML') return globalThis.innerHeight || 720;
+    if (this.tagName === 'HTML') return globalThis.innerHeight ?? 720;
     const metrics = this._renderClientMetrics();
     return metrics ? metrics.height : 20;
   }
@@ -7283,6 +7470,8 @@ class HTMLImageElement extends Element {
     catch (_error) { return raw; }
   }
   set src(value) { this.setAttribute("src", value); }
+  get alt() { return this.getAttribute("alt") || ""; }
+  set alt(value) { this.setAttribute("alt", String(value)); }
 
   get currentSrc() {
     this._refreshImageFromCache();
@@ -7430,7 +7619,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_load_image_metadata;
       if (typeof op === "function") {
-        Promise.resolve(op(this._nid >>> 0)).then(
+        Promise.resolve(op(this._nid >>> 0, _realmFrameId)).then(
           raw => {
             let metadata = null;
             try { metadata = JSON.parse(raw); }
@@ -7454,7 +7643,7 @@ class HTMLImageElement extends Element {
     try {
       const op = __obscuraCore.ops.op_image_metadata;
       if (typeof op !== "function") return;
-      const metadata = JSON.parse(op(this._nid >>> 0, true));
+      const metadata = JSON.parse(op(this._nid >>> 0, true, _realmFrameId));
       if (!metadata) return;
       const selected = metadata.currentSrc ? String(metadata.currentSrc) : "";
       if (selected !== this._imageCurrentSrc) {
@@ -9279,14 +9468,17 @@ globalThis.__resizeObservers = [];
 let _resizeRenderCheckpointPending = false;
 let _resizeRenderCheckpointRunning = false;
 let _resizeRenderCheckpointRerun = false;
-function _registerResizeObserver(observer) {
-  if (!globalThis.__resizeObservers.includes(observer)) {
-    globalThis.__resizeObservers.push(observer);
+function _roTargetView(target) {
+  return target.ownerDocument?.defaultView || globalThis;
+}
+function _registerResizeObserver(observer, view = globalThis) {
+  if (!view.__resizeObservers.includes(observer)) {
+    view.__resizeObservers.push(observer);
   }
 }
-function _unregisterResizeObserver(observer) {
-  const index = globalThis.__resizeObservers.indexOf(observer);
-  if (index >= 0) globalThis.__resizeObservers.splice(index, 1);
+function _unregisterResizeObserver(observer, view = globalThis) {
+  const index = view.__resizeObservers.indexOf(observer);
+  if (index >= 0) view.__resizeObservers.splice(index, 1);
 }
 function _scheduleResizeRenderCheckpoint() {
   if (!globalThis.__resizeObservers.length) return;
@@ -9366,10 +9558,11 @@ function _roNodeDepth(target) {
 }
 function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   let geometry = suppliedGeometry ?? null;
+  const view = _roTargetView(target);
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), view.__obscura_frameId >>> 0);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -9409,7 +9602,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
         // inline value so batching does not silently swap inline/block axes.
         writingMode: geometry.writingMode || target?.style?.writingMode || "",
       }
-    : getComputedStyle(target);
+    : view.getComputedStyle(target);
   const paddingTop = _roNumber(style.paddingTop);
   const paddingRight = _roNumber(style.paddingRight);
   const paddingBottom = _roNumber(style.paddingBottom);
@@ -9441,7 +9634,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   // Device-pixel content sizes snap the content edges, rather than merely
   // rounding a CSS size multiplied by DPR. Preserve that distinction for
   // fractional positions and dimensions.
-  const dpr = Math.max(0, Number(globalThis.devicePixelRatio) || 1);
+  const dpr = Math.max(0, Number(view.devicePixelRatio) || 1);
   const contentLeft = (Number(geometry.x) + borderLeft + paddingLeft) * dpr;
   const contentTop = (Number(geometry.y) + borderTop + paddingTop) * dpr;
   const deviceWidth = emptyInline ? 0 : Math.max(0,
@@ -9466,26 +9659,33 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
 
 function _roMeasurements(targets) {
   const measurements = new Map();
-  if (!targets.length) return measurements;
-  const bulk = __obscuraCore.ops.op_resize_observer_measurements;
-  if (typeof bulk === "function"
-      && targets.every(target => target?._nid != null)) {
-    try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
-      const geometries = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(geometries) && geometries.length === targets.length) {
-        for (let index = 0; index < targets.length; index++) {
-          measurements.set(
-            targets[index],
-            _roMeasurement(targets[index], geometries[index], true),
-          );
-        }
-        return measurements;
-      }
-    } catch (_error) {}
-  }
+  const frames = new Map();
   for (const target of targets) {
-    measurements.set(target, _roMeasurement(target));
+    const frameId = _roTargetView(target).__obscura_frameId >>> 0;
+    if (!frames.has(frameId)) frames.set(frameId, []);
+    frames.get(frameId).push(target);
+  }
+  const bulk = __obscuraCore.ops.op_resize_observer_measurements;
+  for (const [frameId, frameTargets] of frames) {
+    if (typeof bulk === "function"
+        && frameTargets.every(target => target?._nid != null)) {
+      try {
+        const raw = bulk(JSON.stringify(frameTargets.map(target => target._nid | 0)), frameId);
+        const geometries = raw ? JSON.parse(raw) : null;
+        if (Array.isArray(geometries) && geometries.length === frameTargets.length) {
+          for (let index = 0; index < frameTargets.length; index++) {
+            measurements.set(
+              frameTargets[index],
+              _roMeasurement(frameTargets[index], geometries[index], true),
+            );
+          }
+          continue;
+        }
+      } catch (_error) {}
+    }
+    for (const target of frameTargets) {
+      measurements.set(target, _roMeasurement(target));
+    }
   }
   return measurements;
 }
@@ -9521,6 +9721,7 @@ globalThis.ResizeObserver = class ResizeObserver {
     }
     this._callback = callback;
     this._targets = new Map();
+    this._realms = new Set();
     this._active = [];
     this._skipped = false;
   }
@@ -9562,13 +9763,27 @@ globalThis.ResizeObserver = class ResizeObserver {
       // Update before invoking callbacks. Callback-driven mutations are
       // compared against this delivery in the same bounded delivery cycle.
       observation.last = size.slice();
+      // A target realm can run this checkpoint. Expose entry sizes from the
+      // observer's realm even when its measurements came from another realm.
+      if (!(measurement.contentBoxSize[0] instanceof ResizeObserverSize)) {
+        const copySizes = sizes => sizes.map(size => new ResizeObserverSize(
+          _roConstructionKey, size.inlineSize, size.blockSize));
+        measurement = {
+          ...measurement,
+          contentRect: _ioRect(measurement.contentRect.x, measurement.contentRect.y,
+            measurement.contentRect.width, measurement.contentRect.height),
+          contentBoxSize: copySizes(measurement.contentBoxSize),
+          borderBoxSize: copySizes(measurement.borderBoxSize),
+          devicePixelContentBoxSize: copySizes(measurement.devicePixelContentBoxSize),
+        };
+      }
       return new ResizeObserverEntry(_roConstructionKey, target, measurement);
     });
     this._active = [];
     try { this._callback.call(this, entries, this); } catch (_error) {}
   }
   observe(target, options = {}) {
-    if (!(target instanceof Element)) {
+    if (!_isDomNode(target) || target.nodeType !== 1) {
       throw new TypeError("ResizeObserver.observe requires an Element");
     }
     const box = options && options.box != null ? String(options.box) : "content-box";
@@ -9578,18 +9793,30 @@ globalThis.ResizeObserver = class ResizeObserver {
     }
     const current = this._targets.get(target);
     if (current && current.box === box) return;
-    this._targets.set(target, { box, last: null });
+    const view = _roTargetView(target);
+    this._targets.set(target, { box, last: null, view });
+    this._realms.add(view);
+    _registerResizeObserver(this, view);
     _registerResizeObserver(this);
     _scheduleResizeRenderCheckpoint();
   }
   unobserve(target) {
+    const observation = this._targets.get(target);
+    if (!observation) return;
     this._targets.delete(target);
+    const view = observation.view;
+    if (![...this._targets.values()].some(current => current.view === view)) {
+      this._realms.delete(view);
+      if (view !== globalThis) _unregisterResizeObserver(this, view);
+    }
     if (!this._targets.size) _unregisterResizeObserver(this);
   }
   disconnect() {
     this._targets.clear();
     this._active = [];
     this._skipped = false;
+    for (const view of this._realms) _unregisterResizeObserver(this, view);
+    this._realms.clear();
     _unregisterResizeObserver(this);
   }
 };
@@ -10755,6 +10982,7 @@ function _replaceAdoptedStyleSheets(root, sheets) {
 }
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
+  configurable: true,
   get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) {
     _replaceAdoptedStyleSheets(this, sheets);
@@ -10878,10 +11106,11 @@ globalThis.MutationObserver = class MutationObserver {
     const existing = this._targets.find(registration => registration.target === target);
     if (existing) existing.options = init;
     else this._targets.push({ target, options: init });
-    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    _observeNodeOwner(this, target);
     if (!_mutationObserverRegistry.includes(this)) _mutationObserverRegistry.push(this);
   }
   disconnect() {
+    _disconnectNodeObservers(this);
     this._targets = [];
     this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
@@ -10926,8 +11155,8 @@ function _queueMutationRecord(type, target, init) {
       } else if (!options.childList) {
         continue;
       }
-      if (root !== target && root._nid !== target._nid) {
-        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
+      if (root !== target) {
+        if (!_sameNativeTree(root, target) || !options.subtree || !_isObservedAncestor(root, target)) continue;
       }
       if (oldValue) wantsOldValue = true;
       matched = true;
@@ -11637,7 +11866,9 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
 };
 globalThis.__obscura_setHovered = function(el) {
   if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
-    __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
+    if (__obscuraCore.ops.op_set_hovered(el?._nid | 0, _realmFrameId)) {
+      _domMutationEpoch++;
+    }
   }
 };
 
@@ -15384,8 +15615,10 @@ globalThis.__obscura_liveFrameIds = function () {
 // Drop everything this realm holds for a frame the host has discarded. One
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
-globalThis.__obscura_forgetFrame = function (frameId) {
-  _dom('retire_frame', frameId);
+globalThis.__obscura_forgetFrame = function (frameId, reason = 'navigation') {
+  const entry = globalThis.__obscura_frameObjects[frameId];
+  if (entry) globalThis.__obscura_forgetPointerFrame(entry.window);
+  _dom('retire_frame', frameId, reason);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -15507,8 +15740,8 @@ function _ensureInitialFrameRealm(element, srcdoc) {
   return frameId !== 0;
 }
 
-function _resetIframeElement(element) {
-  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
+function _resetIframeElement(element, reason = 'navigation') {
+  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId, reason);
   element._frameId = 0;
   element._iframeOpaque = false;
   element._iframeLoadingUrl = null;
@@ -15797,6 +16030,30 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+const _taintedCanvasContexts = new WeakSet();
+function _assertCanvasOriginClean(context) {
+  if (_taintedCanvasContexts.has(context)) {
+    throw new DOMException('The canvas contains cross-origin image data.', 'SecurityError');
+  }
+}
+function _canvasImageSource(image) {
+  const decode = __obscuraCore.ops.op_canvas_image_pixels;
+  if (typeof decode !== 'function') return null;
+  const naturalWidth = image.naturalWidth, naturalHeight = image.naturalHeight;
+  if (!image.complete || !naturalWidth || !naturalHeight) {
+    if (image.complete && image.currentSrc) {
+      throw new DOMException('The image could not be decoded.', 'InvalidStateError');
+    }
+    return null;
+  }
+  const scale = Math.min(1, _MAX_CANVAS_DIMENSION / naturalWidth, _MAX_CANVAS_DIMENSION / naturalHeight,
+    Math.sqrt(_MAX_CANVAS_PIXELS / (naturalWidth * naturalHeight)));
+  const w = Math.max(1, Math.floor(naturalWidth * scale)), h = Math.max(1, Math.floor(naturalHeight * scale));
+  const buf = new Uint8Array(w * h * 4);
+  const status = decode(image, image._nid >>> 0, w, h, buf);
+  if (status === 0) throw new DOMException('The cached image could not be decoded.', 'InvalidStateError');
+  return { w, h, buf, clean: status === 1, naturalWidth, naturalHeight };
+}
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -15829,6 +16086,7 @@ class _Canvas2D {
     this._w = valid ? requestedWidth : 0;
     this._h = valid ? requestedHeight : 0;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    _taintedCanvasContexts.delete(this);
     this._resetDrawingState();
     const register = __obscuraCore.ops.op_canvas_register_surface;
     if (typeof register === 'function') {
@@ -15952,6 +16210,7 @@ class _Canvas2D {
     return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
+    _assertCanvasOriginClean(this);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     const data = new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
@@ -15988,19 +16247,41 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
-  drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
-      for (let py = 0; py < dh; py++) {
-        for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
-          }
-        }
+  drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    if (args.length !== 2 && args.length !== 4 && args.length < 8) {
+      throw new TypeError('drawImage requires 3, 5 or 9 arguments.');
+    }
+    let source;
+    if (image && image.nodeType === 1 && image.localName === 'img') {
+      source = _canvasImageSource(image);
+      if (!source) return;
+    } else if (image && image._ctx && image._ctx._buf) {
+      const context = image._ctx;
+      source = { w: context._w, h: context._h, buf: context._buf,
+        clean: !_taintedCanvasContexts.has(context), naturalWidth: context._w, naturalHeight: context._h };
+    } else {
+      return;
+    }
+    sx = 0; sy = 0; sw = source.naturalWidth; sh = source.naturalHeight;
+    if (args.length >= 8) [sx, sy, sw, sh, dx, dy, dw, dh] = args.slice(0,8).map(Number);
+    else if (args.length === 4) [dx, dy, dw, dh] = args.map(Number);
+    else { [dx, dy] = args.map(Number); dw = sw; dh = sh; }
+    if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite) || !sw || !sh || !dw || !dh) return;
+    if (sw < 0) { sx += sw; sw = -sw; } if (sh < 0) { sy += sh; sh = -sh; }
+    if (dw < 0) { dx += dw; dw = -dw; } if (dh < 0) { dy += dh; dh = -dh; }
+    if (!source.clean) { _taintedCanvasContexts.add(this); return; }
+    const scaleX = source.w / source.naturalWidth, scaleY = source.h / source.naturalHeight;
+    const left = Math.max(0, Math.floor(dx)), right = Math.min(this._w, Math.ceil(dx + dw));
+    const top = Math.max(0, Math.floor(dy)), bottom = Math.min(this._h, Math.ceil(dy + dh));
+    for (let y = top; y < bottom; y++) {
+      const sourceY = Math.floor((sy + (y + 0.5 - dy) * sh / dh) * scaleY);
+      if (sourceY < 0 || sourceY >= source.h) continue;
+      for (let x = left; x < right; x++) {
+        const sourceX = Math.floor((sx + (x + 0.5 - dx) * sw / dw) * scaleX);
+        if (sourceX < 0 || sourceX >= source.w) continue;
+        const index = (sourceY * source.w + sourceX) * 4;
+        this._setPixel(x, y, source.buf[index], source.buf[index+1], source.buf[index+2], source.buf[index+3]);
       }
     }
     this._markPaintDamage();
@@ -16229,6 +16510,7 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
 };
 HTMLCanvasElement.prototype.toDataURL = function(type) {
   const ctx = this._ctx || this.getContext('2d');
+  if (ctx) _assertCanvasOriginClean(ctx);
   if (ctx && ctx._buf) {
     if (ctx._w === 0 || ctx._h === 0) return 'data:,';
     return _encodePNG(ctx._w, ctx._h, ctx._buf);
@@ -16290,7 +16572,7 @@ function _shadowRootForHost(host, includeClosed) {
   if (!includeClosed && parts[1] !== 'open') return null;
   const rootNid = +parts[0];
   let root = _cache.get(rootNid);
-  if (!(root instanceof ShadowRoot)) {
+  if (!root || root._host !== host) {
     root = new ShadowRoot(rootNid, host, { mode: parts[1] });
     _cache.set(rootNid, root);
   }
@@ -18128,22 +18410,28 @@ if (typeof URLPattern === 'undefined') {
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node) {
     const deep = arguments[1];
+    const method = _documentRealmMember(this, 'importNode');
+    if (method) return Reflect.apply(method, this, [node, deep]);
     _requireNodeArgument(node, "importNode", 1, "Document");
     if (node.nodeType === 9 || node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
     }
-    const clone = node.cloneNode(!!deep);
+    const sourceFrame = __obscuraCore.ops.op_node_owner_frame(node);
+    if (sourceFrame === _realmFrameId) return _stampNodeDocument(node.cloneNode(!!deep), this);
+    const result = JSON.parse(__obscuraCore.ops.op_import_node(node, node._nid >>> 0, _realmFrameId, !!deep));
+    if (result.error) throw new DOMException("The node cannot be imported into this document.", result.error);
+    const clone = node.nodeType === 11 ? new DocumentFragment(result.nid) : _wrap(result.nid);
+    _cache.set(result.nid, clone);
+    _seedDetachedTreeState(clone);
     return _stampNodeDocument(clone, this);
   };
 }
 
-// Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
-// nodes between documents (portals, iframe hand-off) call it; the missing
-// method throws "adoptNode is not a function". With no second document to
-// transfer ownership from, the node is already ours, so return it as-is,
-// matching the observable effect of adoption into this document.
+// Native adoption changes the owner while preserving the wrapper and listeners.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
   Document.prototype.adoptNode = function(node) {
+    const method = _documentRealmMember(this, 'adoptNode');
+    if (method) return Reflect.apply(method, this, [node]);
     _requireNodeArgument(node, "adoptNode", 1, "Document");
     if (node.nodeType === 9) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", "NotSupportedError");
@@ -18151,6 +18439,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
     if (node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
     }
+    if (!_sameNativeTree(this, node)) return _adoptAcrossDocuments(this, node);
+    _assertSameNativeTree(this, node, "adoptNode");
     const parent = node.parentNode;
     if (parent) parent.removeChild(node);
     if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
@@ -18383,10 +18673,12 @@ const _installCaretGeometry = (function _installCaretGeometry() {
   };
 });
 
+/* NODE_TRANSFER */
+
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported', 'importNode', 'adoptNode'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
@@ -18395,6 +18687,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['nodeAdoptionSource', _nodeAdoptionSource],
+  ['registerNodeObserver', _registerNodeObserver],
 ]));
 
 globalThis.__obscura_init = (function() {
@@ -18841,12 +19135,66 @@ if (typeof ValidityState === 'undefined') {
 const _ns_validityCache = new WeakMap();
 const _ns_customValidityMsg = new WeakMap();
 
-// Element.prototype.validity - returns cached ValidityState for the element
+function _isEmailInput(element) {
+  return element.localName === 'input' && element._inputType() === 'email';
+}
+
+function _isTextConstraintInput(element) {
+  return element.localName === 'input'
+    && ['text', 'search', 'tel', 'url', 'email', 'password'].includes(element._inputType());
+}
+
+function _inputPatternMismatch(element) {
+  if (!_isTextConstraintInput(element) || element.value === '') return false;
+  const pattern = element.getAttribute('pattern');
+  if (pattern === null) return false;
+  // Validate the standalone pattern before anchoring, as HTML requires. The
+  // existing core evaluator returns malformed expressions as error data.
+  const [regexp, error] = __obscuraCore.evalContext(
+    `(function() { new RegExp(${JSON.stringify(pattern)}, 'v'); return new RegExp(${JSON.stringify('^(?:' + pattern + ')$')}, 'v'); })()`,
+    'ext:obscura/input-pattern'
+  );
+  if (error) return false;
+  const values = _isEmailInput(element) && element.hasAttribute('multiple')
+    ? element.value.split(',') : [element.value];
+  return values.some(value => !regexp.test(value));
+}
+
+function _sanitizeEmailValue(element, value) {
+  if (!_isEmailInput(element)) return value;
+  const trim = token => token.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  return element.hasAttribute('multiple')
+    ? value.split(',').map(trim).join(',')
+    : trim(value.replace(/[\r\n]/g, ''));
+}
+
+// HTML's email grammar permits single-label domains and limits each label to 63 characters.
+const _emailAddressPattern = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+// Keep the cached object live when a caller retains input.validity across edits.
 if (!Element.prototype.validity) {
   Object.defineProperty(Element.prototype, 'validity', {
     get: function() {
       if (!_ns_validityCache.has(this)) {
-        _ns_validityCache.set(this, new ValidityState());
+        const element = this;
+        const validity = new ValidityState();
+        Object.defineProperties(validity, {
+          customError: { enumerable: true, get() { return _ns_customValidityMsg.has(element); } },
+          typeMismatch: { enumerable: true, get() {
+            if (!_isEmailInput(element) || element.value === '') return false;
+            const values = element.hasAttribute('multiple') ? element.value.split(',') : [element.value];
+            return values.some(value => !_emailAddressPattern.test(value));
+          } },
+          valueMissing: { enumerable: true, get() {
+            return _isTextConstraintInput(element) && !element.readOnly && !_isActuallyDisabled(element)
+              && element.hasAttribute('required') && element.value === '';
+          } },
+          patternMismatch: { enumerable: true, get() { return _inputPatternMismatch(element); } },
+          valid: { enumerable: true, get() {
+            return !this.customError && !this.typeMismatch && !this.valueMissing && !this.patternMismatch;
+          } },
+        });
+        _ns_validityCache.set(this, validity);
       }
       return _ns_validityCache.get(this);
     },
@@ -18859,36 +19207,51 @@ if (!Element.prototype.validity) {
 if (!Element.prototype.willValidate) {
   Object.defineProperty(Element.prototype, 'willValidate', {
     get: function() {
-      return true;
+      if (_isActuallyDisabled(this) || this.closest('datalist')) return false;
+      if (this.localName === 'input') {
+        const type = this._inputType();
+        if (['hidden', 'reset', 'button'].includes(type)) return false;
+        if (this.readOnly && ['text', 'search', 'url', 'tel', 'email', 'password',
+          'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(type)) return false;
+      }
+      if (this.localName === 'textarea' && this.readOnly) return false;
+      return !['fieldset', 'output'].includes(this.localName);
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.validationMessage - custom validation message if set
+// Element.prototype.validationMessage - active constraint or custom validation message
 if (!Element.prototype.validationMessage) {
   Object.defineProperty(Element.prototype, 'validationMessage', {
     get: function() {
-      return _ns_customValidityMsg.get(this) || '';
+      if (!this.willValidate) return '';
+      if (_ns_customValidityMsg.has(this)) return _ns_customValidityMsg.get(this);
+      if (this.validity.valueMissing) return 'Please fill out this field.';
+      if (this.validity.typeMismatch) return 'Please enter an email address.';
+      if (this.validity.patternMismatch) return 'Please match the requested format.';
+      return '';
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.checkValidity - stub returns true
+// Check current constraints and dispatch the cancelable, non-bubbling invalid event.
 if (!Element.prototype.checkValidity) {
   Element.prototype.checkValidity = function checkValidity() {
-    return true;
+    if (!this.willValidate || this.validity.valid) return true;
+    this.dispatchEvent(new Event('invalid', { cancelable: true }));
+    return false;
   };
   _markNative(Element.prototype.checkValidity);
 }
 
-// Element.prototype.reportValidity - stub returns true
+// Headless validation reports the same result and event as checkValidity.
 if (!Element.prototype.reportValidity) {
   Element.prototype.reportValidity = function reportValidity() {
-    return true;
+    return this.checkValidity();
   };
   _markNative(Element.prototype.reportValidity);
 }
@@ -18896,16 +19259,9 @@ if (!Element.prototype.reportValidity) {
 // Element.prototype.setCustomValidity - set custom validation message
 if (!Element.prototype.setCustomValidity) {
   Element.prototype.setCustomValidity = function setCustomValidity(msg) {
-    const validity = this.validity;
-    if (msg && msg.length > 0) {
-      _ns_customValidityMsg.set(this, msg);
-      validity.customError = true;
-      validity.valid = false;
-    } else {
-      _ns_customValidityMsg.delete(this);
-      validity.customError = false;
-      validity.valid = true;
-    }
+    const message = String(msg);
+    if (message) _ns_customValidityMsg.set(this, message);
+    else _ns_customValidityMsg.delete(this);
   };
   _markNative(Element.prototype.setCustomValidity);
 }
@@ -19123,6 +19479,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
   }
 })();
+
+_installAdoptedNodeDispatch();
 
 (function _markBuiltinsNative() {
   var seen = new Set();

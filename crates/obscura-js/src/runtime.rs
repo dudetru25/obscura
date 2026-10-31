@@ -587,6 +587,13 @@ impl ObscuraJsRuntime {
         EnteredRuntime(&mut self.js_runtime)
     }
 
+    /// Create a weak document-owner handle while its isolate is entered.
+    pub(crate) fn weak_realm_context(
+        &mut self, context: &v8::Global<v8::Context>,
+    ) -> v8::Weak<v8::Context> {
+        v8::Weak::new(self.runtime().v8_isolate(), context)
+    }
+
     /// Read native isolate statistics without evaluating scripts or forcing GC.
     pub fn heap_statistics(&mut self) -> v8::HeapStatistics {
         self.runtime().v8_isolate().get_heap_statistics()
@@ -595,6 +602,7 @@ impl ObscuraJsRuntime {
     /// Run a full collection only when an automation client explicitly asks.
     pub fn collect_garbage(&mut self) {
         self.runtime().v8_isolate().low_memory_notification();
+        self.realm_states().borrow_mut().sweep_document_owners();
     }
 
     /// Freeze the document timeline for one JavaScript task. Browser timelines
@@ -2373,6 +2381,7 @@ impl ObscuraJsRuntime {
                                 url: raw,
                                 profile,
                                 is_font,
+                                canvas_origin: None,
                                 response: None,
                                 };
                         }
@@ -2431,6 +2440,9 @@ impl ObscuraJsRuntime {
                         url: raw,
                         profile,
                         is_font,
+                        canvas_origin: response.as_ref().and_then(|response| {
+                            crate::ops::canvas_response_origin(initiator.as_str(), profile, response)
+                        }),
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2450,6 +2462,7 @@ impl ObscuraJsRuntime {
                             url: fallback.0,
                             profile: fallback.1,
                             is_font: fallback.2,
+                            canvas_origin: None,
                             response: None,
                         })
                     })
@@ -2550,10 +2563,14 @@ impl ObscuraJsRuntime {
                 _ => None,
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            let resource_url = load.url.clone();
             match load.profile {
                 Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
+            self.state.borrow_mut().render_resources.set_image_canvas_origin(
+                &resource_url, load.profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), load.canvas_origin,
+            );
             if let Some(response) = load.response {
                 self.state
                     .borrow_mut()
@@ -4623,7 +4640,8 @@ mod tests {
     fn bootstrap_source_uses_ascii_snapshot_storage() {
         let source = include_str!("../js/bootstrap.js")
             .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
-            .replace("/* MEDIA */", include_str!("../js/media.js"));
+            .replace("/* MEDIA */", include_str!("../js/media.js"))
+            .replace("/* NODE_TRANSFER */", include_str!("../js/node_transfer.js"));
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {
             assert_eq!(super::SNAPSHOT.windows(source.len())
@@ -5008,6 +5026,7 @@ mod tests {
                 url: url.clone(),
                 profile: None,
                 is_font: false,
+                canvas_origin: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,
@@ -5410,6 +5429,38 @@ mod tests {
             })()"#).unwrap(), serde_json::json!(["retained", "retained", "retained", "retained"]));
             drop(rt);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_document_state_follows_javascript_context_lifetime() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let frame_id = rt.evaluate_script(r#"(() => {
+            globalThis.retainedFrame = document.createElement('iframe');
+            document.body.append(retainedFrame);
+            globalThis.retainedDocument = retainedFrame.contentDocument;
+            return [retainedFrame._frameId];
+        })()"#).unwrap()[0].as_u64().unwrap() as u32;
+        let owner = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
+        let weak = Rc::downgrade(&owner);
+        drop(owner);
+        rt.evaluate_script("retainedFrame.remove(); retainedFrame = null").unwrap();
+        rt.forget_frame_state(frame_id);
+        rt.forget_frame_state(frame_id);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.collect_garbage();
+        assert!(weak.upgrade().is_some(), "a retained document must keep its native DOM alive");
+        {
+            let registry = rt.realm_states();
+            let registry = registry.borrow();
+            assert!(registry.by_frame_id(frame_id).is_none());
+            assert!(registry.context(frame_id).is_none());
+            assert_eq!(registry.live_count(), 0, "document ownership must not reactivate a frame");
+            assert_eq!(registry.frame_timers_active(frame_id), Some(false));
+        }
+        rt.evaluate_script("retainedDocument = null").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.collect_garbage();
+        assert!(weak.upgrade().is_none(), "collected JS documents must release their native DOM");
     }
 
     #[test]
@@ -7299,7 +7350,7 @@ mod tests {
     #[test]
     fn first_element_style_access_ignores_replaced_page_intrinsics() {
         let mut rt = setup_runtime("<html><body>Style</body></html>");
-        assert_eq!(rt.evaluate(r#"(() => {
+        assert_eq!(rt.evaluate_script(r#"(() => {
             const element = document.body;
             const original = [globalThis.Proxy, Object.defineProperty,
                 WeakMap.prototype.get, WeakMap.prototype.set, Reflect.apply];
@@ -7592,12 +7643,26 @@ mod tests {
     #[test]
     fn parsed_xlink_attribute_is_available_through_both_apis() {
         let mut rt = setup_runtime(
-            r##"<html><body><svg><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
+            r##"<html><body><svg id="s" xmlns="http://www.w3.org/2000/svg"><use id="u" xlink:href="#icon"></use></svg></body></html>"##,
         );
-        let v = rt
-            .evaluate("(function(){var u=document.getElementById('u');return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',');})()")
-            .unwrap();
-        assert_eq!(v, serde_json::json!("#icon|#icon|id,xlink:href"));
+        let v = rt.evaluate(r#"(() => {
+            const u = document.getElementById('u'), s = document.getElementById('s');
+            const xmlns = 'http://www.w3.org/2000/xmlns/';
+            const attr = s.attributes.getNamedItem('xmlns');
+            const parsed = [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'),
+                s.getAttributeNames(), attr?.name, attr?.localName, attr?.prefix, attr?.namespaceURI];
+            s.setAttribute('xmlns', 'urn:updated');
+            const updated = [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'), s.getAttributeNames()];
+            s.removeAttributeNS(xmlns, 'xmlns');
+            return { xlink: [u.getAttribute('xlink:href'), u.getAttributeNS('http://www.w3.org/1999/xlink','href'), u.getAttributeNames()],
+                parsed, updated, removed: [s.getAttribute('xmlns'), s.getAttributeNS(xmlns, 'xmlns'), s.getAttributeNames()] };
+        })()"#).unwrap();
+        assert_eq!(v, serde_json::json!({
+            "xlink": ["#icon", "#icon", ["id", "xlink:href"]],
+            "parsed": ["http://www.w3.org/2000/svg", "http://www.w3.org/2000/svg", ["id", "xmlns"], "xmlns", "xmlns", null, "http://www.w3.org/2000/xmlns/"],
+            "updated": ["urn:updated", "urn:updated", ["id", "xmlns"]],
+            "removed": [null, null, ["id"]]
+        }));
     }
 
     #[test]
@@ -9908,6 +9973,178 @@ mod tests {
     }
 
     #[test]
+    fn email_constraint_validation_tracks_edits_and_dispatches_invalid() {
+        let mut rt = setup_runtime(r#"<html><body><form><input id="email" type="email"></form>
+            <fieldset disabled><legend><input id="legend" type="email" value="bad"></legend>
+                <input id="disabled" type="email" value="bad"></fieldset>
+            <datalist><input id="listed" type="email" value="bad"></datalist></body></html>"#);
+        let result = rt.evaluate(r#"
+            const input = document.getElementById('email');
+            const validity = input.validity;
+            const invalid = [];
+            let bubbled = 0;
+            input.parentElement.addEventListener('invalid', () => bubbled++);
+            input.addEventListener('invalid', event => {
+                invalid.push([event.target === input, event.bubbles, event.cancelable]);
+                event.preventDefault();
+            });
+            const cases = ['', 'bad', 'a@b', ' a@b\r\n ', 'a@-b', 'a@b-', 'a@b..c',
+                'a b@c', 'a@@b', 'a@' + 'b'.repeat(64), 'a@b,c@d', '\u00a0a@b',
+                'a@' + 'b'.repeat(63), 'a@\nb'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.setAttribute('multiple', '');
+            const multiple = ['', ' a@b, c@d ', 'a@b,', ',a@b', 'a@b,bad'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.removeAttribute('multiple');
+            input.setAttribute('required', '');
+            input.value = '';
+            const required = [validity.valueMissing, input.checkValidity(), input.validationMessage !== ''];
+            input.value = 'a@b';
+            input.setCustomValidity('blocked');
+            const custom = [validity.customError, validity.valid, input.reportValidity(), input.validationMessage];
+            input.value = 'bad';
+            input.setCustomValidity('');
+            const cleared = [validity.customError, validity.typeMismatch, validity.valid, input.checkValidity()];
+            input.setAttribute('disabled', '');
+            const disabled = [input.willValidate, input.checkValidity(), input.validationMessage];
+            input.removeAttribute('disabled');
+            input.readOnly = true;
+            const readonly = [input.willValidate, input.reportValidity(), input.validationMessage];
+            input.readOnly = false;
+            input.value = 'a@b';
+            const corrected = [validity === input.validity, validity.valid, input.checkValidity(), input.validationMessage];
+            const barred = ['legend', 'disabled', 'listed'].map(id => {
+                const field = document.getElementById(id);
+                return [field.willValidate, field.checkValidity()];
+            });
+            const barredCustom = ['disabled', 'readonly', 'hidden'].map(state => {
+                const field = document.createElement('input');
+                field.type = state === 'hidden' ? 'hidden' : 'text';
+                if (state !== 'hidden') field.setAttribute(state, '');
+                field.setCustomValidity('blocked');
+                let events = 0;
+                field.addEventListener('invalid', () => events++);
+                return [field.willValidate, field.checkValidity(), field.reportValidity(), events];
+            });
+            return { cases, multiple, required, custom, cleared, disabled, readonly, corrected, barred, barredCustom,
+                events: [invalid.length, invalid.every(event => JSON.stringify(event) === '[true,false,true]'), bubbled] };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "cases": [["", false, true], ["bad", true, false], ["a@b", false, true], ["a@b", false, true],
+                ["a@-b", true, false], ["a@b-", true, false], ["a@b..c", true, false], ["a b@c", true, false],
+                ["a@@b", true, false], [format!("a@{}", "b".repeat(64)), true, false],
+                ["a@b,c@d", true, false], ["\u{a0}a@b", true, false],
+                [format!("a@{}", "b".repeat(63)), false, true], ["a@b", false, true]],
+            "multiple": [["", false, true], ["a@b,c@d", false, true], ["a@b,", true, false],
+                [",a@b", true, false], ["a@b,bad", true, false]],
+            "required": [true, false, true], "custom": [true, false, false, "blocked"],
+            "cleared": [false, true, false, false], "disabled": [false, true, ""],
+            "readonly": [false, true, ""], "corrected": [true, true, true, ""],
+            "barred": [[true, false], [false, true], [false, true]],
+            "barredCustom": [[false, true, true, 0], [false, true, true, 0], [false, true, true, 0]],
+            "events": [15, true, 0]
+        }));
+    }
+
+    #[test]
+    fn text_constraint_validation_rejects_missing_and_incomplete_codes() {
+        let mut rt = setup_runtime(r#"<html><body><form>
+            <input id="code" required pattern="[0-9]{6}">
+            </form></body></html>"#);
+        let result = rt.evaluate(r#"
+            const input = document.getElementById('code');
+            const validity = input.validity;
+            let invalid = 0;
+            input.addEventListener('invalid', () => invalid++);
+            const cases = ['', '123', '123456', 'a123456b', '12345x'].map(value => {
+                input.value = value;
+                return [validity.valueMissing, validity.patternMismatch, input.checkValidity()];
+            });
+            input.value = '';
+            input.setAttribute('disabled', '');
+            const disabled = [input.willValidate, input.checkValidity()];
+            input.removeAttribute('disabled');
+            input.readOnly = true;
+            const readonly = [input.willValidate, input.checkValidity()];
+            input.readOnly = false;
+            input.removeAttribute('required');
+            const optional = [validity.valueMissing, validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '[');
+            input.value = 'anything';
+            const malformed = [validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '');
+            const emptyPattern = [validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', 'a)|(?:b');
+            const malformedStandalone = [validity.patternMismatch, input.checkValidity()];
+            input.setAttribute('pattern', '[[a-z]--[aeiou]]+');
+            const unicodeSets = ['b', 'bc', 'a'].map(value => {
+                input.value = value;
+                return [validity.patternMismatch, input.validationMessage !== ''];
+            });
+            input.setAttribute('pattern', '.+@b');
+            input.type = 'email';
+            input.setAttribute('multiple', '');
+            const multiple = ['a@b,c@b', 'a@b,c@d'].map(value => {
+                input.value = value;
+                return validity.patternMismatch;
+            });
+            input.value = '';
+            input.setAttribute('required', '');
+            const types = ['text', 'search', 'tel', 'url', 'email', 'password'].map(type => {
+                input.type = type;
+                return validity.valueMissing;
+            });
+            input.type = 'number';
+            input.value = '12';
+            const unsupported = validity.patternMismatch;
+            const invalidChecks = invalid;
+            const form = input.form;
+            let submits = 0;
+            form.addEventListener('submit', event => { event.preventDefault(); submits++; });
+            input.type = 'text';
+            input.setAttribute('pattern', '[0-9]{6}');
+            input.value = '';
+            form.requestSubmit();
+            input.value = '123';
+            form.requestSubmit();
+            const blocked = submits;
+            input.value = '123456';
+            form.requestSubmit();
+            input.value = '';
+            form.setAttribute('novalidate', '');
+            form.requestSubmit();
+            form.removeAttribute('novalidate');
+            const button = document.createElement('button');
+            button.setAttribute('formnovalidate', '');
+            form.append(button);
+            form.requestSubmit(button);
+            input.disabled = true;
+            form.requestSubmit();
+            input.disabled = false;
+            input.readOnly = true;
+            form.requestSubmit();
+            return { cases, disabled, readonly, optional, malformed, emptyPattern, invalid: invalidChecks,
+                malformedStandalone, unicodeSets, multiple, types, unsupported,
+                submission: [blocked, submits, invalid - invalidChecks] };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "cases": [[true, false, false], [false, true, false], [false, false, true],
+                [false, true, false], [false, true, false]],
+            "disabled": [false, true], "readonly": [false, true],
+            "optional": [false, false, true], "malformed": [false, true],
+            "emptyPattern": [true, false], "invalid": 5,
+            "malformedStandalone": [false, true],
+            "unicodeSets": [[false, false], [false, false], [true, true]],
+            "multiple": [false, true], "types": [true, true, true, true, true, true],
+            "unsupported": false, "submission": [0, 5, 2]
+        }));
+    }
+
+    #[test]
     fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"
@@ -10239,6 +10476,37 @@ mod tests {
             document.body.removeAttribute('data-active');
             return [savedStyle.color, savedStyle.width, savedStyle.length > 20];
         })()"#).unwrap(), serde_json::json!(["rgb(0, 0, 255)", "80px", true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_exposes_used_grid_tracks_and_invalidates() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(r#"<!doctype html><style>
+            #grid { display:grid; width:320px; grid-template-columns:repeat(3,minmax(0,1fr));
+                    grid-template-rows:repeat(2,40px); gap:5px 10px }
+            #empty { display:grid }
+        </style><body><div id=grid><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <div id=plain></div><div id=empty></div></body>"#));
+        rt.set_viewport(700.0, 200.0);
+        rt.run_page_init();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const grid = document.getElementById('grid');
+            const style = getComputedStyle(grid);
+            const display = style.display;
+            const columns = style.gridTemplateColumns;
+            const rows = style.getPropertyValue('grid-template-rows');
+            grid.style.width = '620px';
+            const updated = style.getPropertyValue('grid-template-columns');
+            const plain = getComputedStyle(document.getElementById('plain'));
+            const empty = getComputedStyle(document.getElementById('empty'));
+            return [display, columns, rows, updated,
+                plain.gridTemplateColumns, plain.gridTemplateRows,
+                empty.gridTemplateColumns, empty.gridTemplateRows];
+        })()"#).unwrap(), serde_json::json!([
+            "grid", "100px 100px 100px", "40px 40px", "200px 200px 200px",
+            "none", "none", "none", "none"
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -10914,15 +11182,10 @@ mod tests {
         )
         .unwrap();
 
-        let started = std::time::Instant::now();
         rt.run_event_loop_until_quiescent(20, 10).await.unwrap();
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= std::time::Duration::from_millis(500)
-                && elapsed < std::time::Duration::from_millis(1_500),
-            "adaptive settle must wait for the active task boundary: {elapsed:?}",
-        );
+        // Assert task completion rather than comparing the page's Date-based
+        // performance clock with Rust's monotonic clock. The unyielding-drain
+        // regression below separately protects the watchdog's upper bound.
         assert_eq!(
             rt.evaluate("globalThis.__adaptiveLongTaskCompleted")
                 .unwrap(),
@@ -15248,6 +15511,113 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn resize_observer_tracks_same_origin_iframe_targets_in_their_own_realm() {
+        let mut rt = setup_runtime(
+            r#"<html style="margin:0"><body style="margin:0">
+                <div id="local" style="width:75px;height:25px"></div>
+            </body></html>"#,
+        );
+        rt.set_viewport(300.0, 200.0);
+        rt.execute_script(
+            "create-observed-iframe",
+            r#"
+                const frame = document.createElement("iframe");
+                frame.srcdoc = '<html><body><div id="foreign" style="width:120px;height:40px"></div></body></html>';
+                document.body.appendChild(frame);
+            "#,
+        ).unwrap();
+        // srcdoc navigation is queued. Wait for the target in the loaded realm.
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("Boolean(frame.contentDocument.getElementById('foreign'))")
+                .unwrap() == serde_json::json!(true)
+        }, 2_000).await, "the iframe target must load before observation");
+        assert_eq!(
+            rt.evaluate("[frame.contentDocument.getElementById('foreign') instanceof frame.contentWindow.Element, \
+                frame.contentDocument.getElementById('foreign') instanceof Element]").unwrap(),
+            serde_json::json!([true, false])
+        );
+        rt.execute_script(
+            "observe-iframe-and-parent",
+            r#"
+                globalThis.__localTarget = document.getElementById("local");
+                globalThis.__foreignTarget = frame.contentDocument.getElementById("foreign");
+                globalThis.__crossRealmRecords = [];
+                globalThis.__crossRealmIdentities = [];
+                globalThis.__crossRealmObserver = new ResizeObserver(function(entries, observer) {
+                    __crossRealmRecords.push(entries.map(entry => [
+                        entry.target.id, entry.contentRect.width, entry.contentRect.height,
+                    ]));
+                    __crossRealmIdentities.push(
+                        this === __crossRealmObserver && observer === __crossRealmObserver
+                        && entries.every(entry =>
+                            (entry.target === __localTarget || entry.target === __foreignTarget)
+                            && entry instanceof ResizeObserverEntry
+                            && entry.contentBoxSize[0] instanceof ResizeObserverSize
+                            && entry.borderBoxSize[0] instanceof ResizeObserverSize
+                            && entry.devicePixelContentBoxSize[0] instanceof ResizeObserverSize)
+                    );
+                });
+                __crossRealmObserver.observe(__localTarget);
+                __crossRealmObserver.observe(__foreignTarget);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords").unwrap(),
+            serde_json::json!([[["local", 75, 25], ["foreign", 120, 40]]])
+        );
+
+        for invalid in ["null", "{}", "document", "frame.contentDocument", "document.createTextNode('text')"] {
+            assert!(rt
+                .evaluate_script(&format!("__crossRealmObserver.observe({invalid})"))
+                .is_err());
+        }
+        assert!(rt
+            .evaluate_script("__crossRealmObserver.observe(__foreignTarget, {box:'invalid'})")
+            .is_err());
+        rt.evaluate("__foreignTarget.style.width = '200px'").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords").unwrap(),
+            serde_json::json!([
+                [["local", 75, 25], ["foreign", 120, 40]],
+                [["foreign", 200, 40]],
+            ])
+        );
+
+        rt.execute_script(
+            "unobserve-iframe-target",
+            "__crossRealmObserver.unobserve(__foreignTarget); \
+             __foreignTarget.style.width = '230px'; __localTarget.style.width = '90px';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords[2]").unwrap(),
+            serde_json::json!([["local", 90, 25]])
+        );
+        rt.evaluate("__crossRealmObserver.observe(__foreignTarget)").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__crossRealmRecords[3]").unwrap(),
+            serde_json::json!([["foreign", 230, 40]])
+        );
+        rt.execute_script(
+            "disconnect-cross-realm-observer",
+            "__crossRealmObserver.disconnect(); \
+             __foreignTarget.style.width = '250px'; __localTarget.style.width = '100px';",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__crossRealmRecords.length, __crossRealmIdentities]").unwrap(),
+            serde_json::json!([4, [true, true, true, true]])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn resize_observer_batches_unique_targets_into_one_native_layout_read() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -17914,6 +18284,49 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_draw_image_uses_cached_svg_pixels_and_overloads() {
+        use base64::Engine as _;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4" viewBox="0 0 100 100"><defs><style>.mark{fill:#00468b}</style></defs><rect class="mark" width="100" height="100"/></svg>"##;
+        let source = base64::engine::general_purpose::STANDARD.encode(svg);
+        let mut rt = parser_image_runtime(
+            &format!(r#"<img id="image" src="data:image/svg+xml;base64,{source}">"#),
+            |_url: &str| panic!("canvas must not fetch an uncached image"),
+        );
+        rt.evaluate("void document.getElementById('image').complete").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("(() => { const image=document.getElementById('image'); return [image.complete,image.naturalWidth,image.naturalHeight]; })()").unwrap(),
+            serde_json::json!([true, 4, 4]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(new Image(),0,0); return context.getImageData(0,0,1,1).data[3];
+        })()"#).unwrap(), serde_json::json!(0.0));
+        for kind in ["image", "canvas"] {
+            for arguments in ["1,1", "1,1,2,2", "0,0,size,size,1,1,2,2"] {
+                let script = format!(r#"(() => {{
+                    let source = document.getElementById('image');
+                    if ('{kind}' === 'canvas') {{
+                        source = document.createElement('canvas'); source.width = source.height = 2;
+                        const paint = source.getContext('2d'); paint.fillStyle = '#00468b'; paint.fillRect(0,0,2,2);
+                    }}
+                    const size = source.naturalWidth || source.width;
+                    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 4;
+                    const context = canvas.getContext('2d'); context.drawImage(source,{arguments});
+                    return [Array.from(context.getImageData(2,2,1,1).data),
+                        Array.from(context.getImageData(0,0,1,1).data)];
+                }})()"#);
+                assert_eq!(rt.evaluate(&script).unwrap(),
+                    serde_json::json!([[0,70,139,255],[0,0,0,0]]), "{kind}: {arguments}");
+            }
+        }
+        rt.execute_script("broken-canvas-image", "globalThis.brokenImage = new Image(); brokenImage.src = 'data:image/png;base64,AAAA'; void brokenImage.complete").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[brokenImage.complete,brokenImage.naturalWidth]").unwrap(), serde_json::json!([true,0]));
+        assert!(rt.evaluate_script("document.createElement('canvas').getContext('2d').drawImage(brokenImage,0,0)")
+            .unwrap_err().contains("InvalidStateError"));
+    }
+
+    #[cfg(feature = "render")]
     fn two_by_three_png() -> Vec<u8> {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
@@ -18121,6 +18534,17 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load"]])
         );
+        rt.execute_script("draw-opaque-canvas-image", r#"globalThis.opaqueCanvas = document.createElement('canvas');
+            opaqueCanvas.getContext('2d').drawImage(image,0,0);"#).unwrap();
+        for readback in ["opaqueCanvas.getContext('2d').getImageData(0,0,1,1)", "opaqueCanvas.toDataURL()"] {
+            assert!(rt.evaluate_script(readback).unwrap_err().contains("SecurityError"));
+        }
+        assert!(rt.evaluate_script(r#"(() => {
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(opaqueCanvas,0,0); return context.getImageData(0,0,1,1);
+        })()"#).unwrap_err().contains("SecurityError"));
+        assert_eq!(rt.evaluate(r#"(() => { opaqueCanvas.width = 1;
+            return opaqueCanvas.getContext('2d').getImageData(0,0,1,1).data[3]; })()"#).unwrap(), serde_json::json!(0.0));
 
         rt.execute_script(
             "require-anonymous-cors",
@@ -18156,6 +18580,10 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load", "error", "load", "load"]])
         );
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(image,0,0); return context.getImageData(0,0,1,1).data[3];
+        })()"#).unwrap(), serde_json::json!(255.0));
 
         rt.execute_script(
             "require-credentialed-cors",
@@ -18320,7 +18748,7 @@ mod tests {
         let loader_calls = calls.clone();
         let png = two_by_three_png();
         let mut rt = parser_image_runtime(
-            r#"<img id="hero" src="../assets/hero.png">"#,
+            r#"<img id="hero" src="../assets/hero.png" alt="Hero image">"#,
             move |_url: &str| {
                 loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(png.clone())
@@ -18336,7 +18764,8 @@ mod tests {
                     image instanceof HTMLImageElement,
                     image.complete,
                     image.naturalWidth,
-                    image.naturalHeight
+                    image.naturalHeight,
+                    image.alt
                 ];
                 image.addEventListener("load", () => __imageEvents.push("load"));
                 image.addEventListener("error", () => __imageEvents.push("error"));
@@ -18349,7 +18778,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rt.evaluate("__imageInitial").unwrap(),
-            serde_json::json!([true, false, 0, 0])
+            serde_json::json!([true, false, 0, 0, "Hero image"])
         );
 
         rt.run_event_loop_bounded(100).await.unwrap();
@@ -18382,6 +18811,89 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        rt.execute_script("create-frame-image", r#"
+            const parentImageState = JSON.stringify([
+                image.complete, image.naturalWidth, image.naturalHeight, image.currentSrc, __imageEvents
+            ]);
+            const frame = document.createElement("iframe");
+            frame.srcdoc = '<html><body><img id="frame-hero" alt="Frame image"></body></html>';
+            document.body.appendChild(frame);
+        "#).unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("Boolean(frame.contentDocument.getElementById('frame-hero'))").unwrap()
+                == serde_json::json!(true)
+        }, 2_000).await, "the image's owning iframe must load");
+        let frame_id = rt.evaluate_script("[frame._frameId]").unwrap()[0].as_u64().unwrap() as u32;
+        let frame_state = rt.realm_states().borrow().by_frame_id(frame_id).unwrap();
+        let frame_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = frame_calls.clone();
+        let png = two_by_three_png();
+        frame_state.borrow_mut().render_resources = obscura_render::RenderResourceCache::with_loader(
+            move |url: &str| {
+                assert_eq!(url, "http://example.com/assets/frame-hero.png");
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+        rt.execute_script("observe-frame-image", r#"
+            const frameImage = frame.contentDocument.getElementById("frame-hero");
+            globalThis.__frameImageEvents = [];
+            globalThis.__frameDecodeState = "pending";
+            frameImage.addEventListener("load", () => __frameImageEvents.push("load"));
+            frameImage.addEventListener("error", () => __frameImageEvents.push("error"));
+            frameImage.src = "../assets/frame-hero.png";
+            globalThis.__frameImageInitial = [frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight, frameImage.alt];
+            frameImage.decode().then(
+                () => { __frameDecodeState = "resolved"; },
+                error => { __frameDecodeState = error.name; }
+            );
+        "#).unwrap();
+        assert_eq!(rt.evaluate("__frameImageInitial").unwrap(), serde_json::json!([false, 0, 0, "Frame image"]));
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("__frameDecodeState === 'resolved'").unwrap() == serde_json::json!(true)
+        }, 2_000).await, "the frame-owned image must finish decoding");
+        assert_eq!(rt.evaluate(r#"[
+            frameImage.complete, frameImage.naturalWidth, frameImage.naturalHeight,
+            frameImage.currentSrc, __frameImageEvents, __frameDecodeState
+        ]"#).unwrap(), serde_json::json!([
+            true, 2, 3, "http://example.com/assets/frame-hero.png", ["load"], "resolved"
+        ]));
+        rt.execute_script("reread-frame-image", r#"
+            frameImage.decode();
+            frameImage.complete; frameImage.naturalWidth; frameImage.naturalHeight;
+        "#).unwrap();
+        assert_eq!(frame_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rt.evaluate("__frameImageEvents").unwrap(), serde_json::json!(["load"]));
+        rt.execute_script("reload-frame-image", r#"frameImage.src = "../assets/frame-hero.png";"#).unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("__frameImageEvents.length === 2").unwrap() == serde_json::json!(true)
+        }, 2_000).await, "a cached frame request must emit its own load event");
+        rt.execute_script("reflect-image-alt", r#"
+            globalThis.__imageAltReflection = [image, frameImage].map(target => {
+                const assigned = ["Gallery caption", 42, null, undefined].map(value => {
+                    target.alt = value;
+                    return [target.alt, target.getAttribute("alt")];
+                });
+                target.setAttribute("alt", "Updated image");
+                const fromAttribute = target.alt;
+                target.removeAttribute("alt");
+                return [assigned, fromAttribute, target.alt, target.hasAttribute("alt")];
+            });
+        "#).unwrap();
+        let expected_alt_reflection = serde_json::json!([
+            [["Gallery caption", "Gallery caption"], ["42", "42"],
+             ["null", "null"], ["undefined", "undefined"]],
+            "Updated image", "", false
+        ]);
+        assert_eq!(rt.evaluate("__imageAltReflection").unwrap(), serde_json::json!([
+            expected_alt_reflection.clone(), expected_alt_reflection
+        ]));
+        assert_eq!(frame_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rt.evaluate(r#"JSON.stringify([
+            image.complete, image.naturalWidth, image.naturalHeight, image.currentSrc, __imageEvents
+        ]) === parentImageState"#).unwrap(), serde_json::json!(true));
     }
 
     #[cfg(feature = "render")]

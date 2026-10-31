@@ -8,6 +8,16 @@ use html5ever::{Attribute as HtmlAttribute, LocalName, Namespace, QualName};
 
 use crate::tree::{Attribute, DomTree, NodeData, NodeId, ShadowRootMode};
 
+// html5ever represents an unprefixed SVG xmlns declaration with an empty
+// prefix. Store that as no prefix so every qualified-name API sees "xmlns".
+fn convert_attribute(mut attribute: HtmlAttribute) -> Attribute {
+    attribute.name.prefix = attribute.name.prefix.filter(|prefix| !prefix.is_empty());
+    Attribute {
+        name: attribute.name,
+        value: attribute.value.to_string(),
+    }
+}
+
 /// DOM's valid-shadow-host-name predicate. Gecko's
 /// `nsContentUtils::IsValidShadowHostName` uses this same HTML allowlist plus
 /// valid custom-element names; keeping the check at the parser boundary makes
@@ -137,10 +147,7 @@ impl TreeSink for DomTree {
     ) -> NodeId {
         let converted_attrs: Vec<Attribute> = attrs
             .into_iter()
-            .map(|a| Attribute {
-                name: a.name,
-                value: a.value.to_string(),
-            })
+            .map(convert_attribute)
             .collect();
 
         let id = self.new_node(NodeData::Element {
@@ -218,13 +225,10 @@ impl TreeSink for DomTree {
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<HtmlAttribute>) {
         self.with_node_mut(*target, |node| {
             if let NodeData::Element { attrs: existing, .. } = &mut node.data {
-                for attr in attrs {
+                for attr in attrs.into_iter().map(convert_attribute) {
                     let dominated = existing.iter().any(|a| a.name == attr.name);
                     if !dominated {
-                        existing.push(Attribute {
-                            name: attr.name,
-                            value: attr.value.to_string(),
-                        });
+                        existing.push(attr);
                     }
                 }
             }

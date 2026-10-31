@@ -68,6 +68,8 @@ pub struct InterceptedRequest {
     pub page_id: String,
     pub url: String,
     pub method: String,
+    /// Non-empty UTF-8 request body; binary request bodies are omitted.
+    pub post_data: Option<String>,
     pub headers: HashMap<String, String>,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
@@ -94,6 +96,8 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    /// Non-empty UTF-8 request body; binary request bodies are omitted.
+    pub post_data: Option<String>,
     pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
@@ -1112,6 +1116,8 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+    // Retained JS nodes own their document without keeping its frame active.
+    document_owners: Vec<(v8::Weak<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
 }
 
@@ -1134,11 +1140,40 @@ impl RealmStates {
             .map(|(context, _, _)| context.clone())
     }
 
+    pub(crate) fn sweep_document_owners(&mut self) {
+        self.document_owners.retain(|(context, _, _)| !context.is_empty());
+    }
+
+    fn document_state(&self, frame_id: u32) -> Option<SharedState> {
+        self.by_frame_id(frame_id).or_else(|| self.document_owners.iter()
+            .find(|(context, id, _)| *id == frame_id && !context.is_empty())
+            .map(|(_, _, state)| state.clone()))
+    }
+
+    pub(crate) fn document_context<'s, 'i>(
+        &self, scope: &v8::PinScope<'s, 'i>, frame_id: u32,
+    ) -> Option<v8::Local<'s, v8::Context>> {
+        if let Some(context) = self.context(frame_id) {
+            return Some(v8::Local::new(scope, context));
+        }
+        self.document_owners.iter().find(|(context, id, _)| *id == frame_id && !context.is_empty())
+            .and_then(|(context, _, _)| context.to_local(scope))
+    }
+
+    pub(crate) fn register_document(
+        &mut self, context: v8::Global<v8::Context>, frame_id: u32,
+        state: SharedState, owner: v8::Weak<v8::Context>,
+    ) {
+        self.register(context, frame_id, state.clone());
+        self.document_owners.push((owner, frame_id, state));
+    }
+
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
         self.cancel_frame_timers(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);
         self.frame_timers.remove(&frame_id);
         self.cancel_inactive_frame_timers();
+        self.sweep_document_owners();
     }
     pub fn register(
         &mut self,
@@ -1146,6 +1181,7 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        self.sweep_document_owners();
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
             owner: None, cancel: CancelHandle::new_rc(),
         });
@@ -1192,6 +1228,32 @@ impl RealmStates {
     pub(crate) fn cancel_inactive_frame_timers(&self) {
         for (id, timers) in &self.frame_timers {
             if self.frame_timers_active(*id) == Some(false) { timers.cancel.cancel(); }
+        }
+    }
+
+    // Navigation invalidates adopted wrappers in the replaced document tree.
+    // Detached documents keep their generation so retained nodes can clean up.
+    fn invalidate_frame_documents(&self, frame_id: u32) {
+        if frame_id == 0 { return; }
+        let active: std::collections::HashSet<u32> = self.frame_timers.keys().copied()
+            .filter(|id| self.frame_timers_active(*id) != Some(false)).collect();
+        let mut replaced = vec![frame_id];
+        for _ in 0..self.frame_timers.len() {
+            let before = replaced.len();
+            for (id, timers) in &self.frame_timers {
+                if !active.contains(id) || replaced.contains(id) { continue; }
+                let parent = timers.owner.as_ref().and_then(|(parent, _, _)| parent.upgrade());
+                let parent_id = parent.and_then(|parent| self.entries.iter()
+                    .find(|(_, _, state)| Rc::ptr_eq(state, &parent)).map(|(_, id, _)| *id));
+                if parent_id.is_some_and(|id| replaced.contains(&id)) { replaced.push(*id); }
+            }
+            if replaced.len() == before { break; }
+        }
+        for id in replaced {
+            if let Some(state) = self.by_frame_id(id) {
+                let mut state = state.borrow_mut();
+                state.document_generation = state.document_generation.wrapping_add(1);
+            }
         }
     }
 
@@ -1257,14 +1319,12 @@ impl RealmStates {
 /// id and passes it, which is both correct here and cheaper than asking V8:
 /// a page with no frames resolves on `frame_id == 0` alone.
 pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
-    let page = || op_state.borrow::<SharedState>().clone();
-    if frame_id == 0 {
-        return page();
-    }
-    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
-        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
-        None => page(),
-    }
+    document_state(op_state, frame_id).unwrap_or_else(|| op_state.borrow::<SharedState>().clone())
+}
+
+pub(crate) fn document_state(op_state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(op_state.borrow::<SharedState>().clone()); }
+    op_state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().document_state(frame_id)
 }
 
 /// The state of the realm running right now, or the page's when the caller is
@@ -1712,6 +1772,8 @@ pub struct RenderResourceLoad {
     pub url: String,
     pub profile: Option<ImageRequestProfile>,
     pub is_font: bool,
+    /// Document origin allowed to read these pixels after redirect/CORS checks.
+    pub canvas_origin: Option<String>,
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
     pub response: Option<RenderResourceResponse>,
@@ -1936,6 +1998,23 @@ fn stylesheet_origin_clean(document_url: &str, response_url: &str) -> bool {
     document.origin() == response.origin()
 }
 
+#[cfg(feature = "render")]
+pub(crate) fn canvas_response_origin(
+    document_url: &str,
+    profile: Option<ImageRequestProfile>,
+    response: &Response,
+) -> Option<String> {
+    let origin = url::Url::parse(document_url).ok()?.origin();
+    let serialized = origin.ascii_serialization();
+    if serialized == "null" { return None; }
+    let cors = matches!(profile, Some(ImageRequestProfile::CorsSameOrigin | ImageRequestProfile::CorsInclude));
+    if !cors && (response.url.origin() != origin
+        || response.redirected_from.iter().any(|url| url.origin() != origin)) {
+        return None;
+    }
+    Some(serialized)
+}
+
 /// Install host-fetched CSS without manufacturing a page-visible `<style>`.
 #[op2(fast)]
 fn op_external_stylesheet_set(
@@ -2108,7 +2187,12 @@ fn op_dom(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "retire_frame" {
-            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            if let Ok(id) = arg1.parse::<u32>() {
+                let registry = registry.borrow();
+                let detached = arg2 == "detach" && registry.frame_timers_active(id) == Some(false);
+                if !detached { registry.invalidate_frame_documents(id); }
+                registry.cancel_frame_timers(id);
+            }
             crate::media_ops::close_inactive(state);
             return "true".into();
         }
@@ -3510,6 +3594,29 @@ fn request_origin(request_url: &str) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+fn request_post_data(body: &[u8]) -> Option<String> {
+    std::str::from_utf8(body).ok().filter(|text| !text.is_empty()).map(str::to_owned)
+}
+
+// Fetch Metadata retains the least-trusted site reached by the URL list.
+// Returning to the initiator after a redirect must not restore same-origin.
+fn scripted_fetch_site(page_origin: &str, current_url: &str, redirects: &[url::Url]) -> &'static str {
+    let (Ok(source), Ok(target)) = (url::Url::parse(page_origin), url::Url::parse(current_url)) else {
+        return "cross-site";
+    };
+    let mut site = "same-origin";
+    for hop in redirects.iter().chain(std::iter::once(&target)) {
+        if source.origin() == hop.origin() {
+            continue;
+        }
+        if !same_site(&source, hop) {
+            return "cross-site";
+        }
+        site = "same-site";
+    }
+    site
+}
+
 /// Fetch "append a request `Origin` header": cross-origin requests and any
 /// request whose method is neither GET nor HEAD carry the requester's origin.
 fn sends_origin_header(method: &str, cross_origin: bool) -> bool {
@@ -3925,6 +4032,7 @@ async fn fetch_url_inner(
     let internal_load = matches!(resource_type,
         ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
     let body = body.to_vec();
+    let post_data = request_post_data(&body);
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
         method,
@@ -4017,7 +4125,7 @@ async fn fetch_url_inner(
         state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
         event: Some(JsNetworkEvent {
             request_id: request_id.clone(), intercepted: false,
-            url: url.clone(), method: method.clone(), status: 0,
+            url: url.clone(), method: method.clone(), post_data: post_data.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
         }),
@@ -4042,6 +4150,7 @@ async fn fetch_url_inner(
             page_id,
             url: url.clone(),
             method: method.clone(),
+            post_data: post_data.clone(),
             headers: custom_headers.clone(),
             resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
@@ -4064,7 +4173,7 @@ async fn fetch_url_inner(
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
                         error_text: None,
-                        url: url.clone(), method: method.clone(), status,
+                        url: url.clone(), method: method.clone(), post_data, status,
                         resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4158,6 +4267,7 @@ async fn fetch_url_inner(
     };
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
+    network_guard.event.as_mut().unwrap().post_data = request_post_data(&body);
 
     let client = match &http_client {
         Some(client) => client.request_client().await,
@@ -4338,6 +4448,9 @@ async fn fetch_url_inner(
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
+        if !current_headers.keys().any(|name| name.eq_ignore_ascii_case("sec-fetch-site")) {
+            req = req.header("Sec-Fetch-Site", scripted_fetch_site(&page_origin, &current_url, &redirected_from));
+        }
         if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
             req = req.header("Origin", &page_origin);
         }
@@ -4577,7 +4690,8 @@ async fn fetch_url_inner(
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
                 error_text: None,
-                url: current_url, method: current_method.as_str().to_string(), status,
+                url: current_url, method: current_method.as_str().to_string(),
+                post_data: request_post_data(&current_body), status,
                 resource_type: resource_type_name.to_string(),
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -4667,6 +4781,8 @@ async fn stealth_fetch_all(
         for (k, v) in &current_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
+        req_headers.entry("sec-fetch-site".to_string()).or_insert_with(||
+            scripted_fetch_site(&page_origin, &current_url, &redirected_from).to_string());
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let cookie_context = credentials_allowed.then(|| {
@@ -4831,6 +4947,7 @@ async fn stealth_fetch_all(
             let mut event = network_guard.event.take().unwrap();
             event.url = current_url;
             event.method = current_method;
+            event.post_data = request_post_data(&current_body);
             event.status = status;
             event.response_headers = resp_headers;
             event.body_size = resp_bytes.len();
@@ -5095,6 +5212,30 @@ mod tests {
         ] {
             assert_eq!(super::url_matches_cdp_pattern(pattern, url), expected,
                 "pattern {pattern:?}, URL {url:?}");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_readback_requires_clean_redirect_chain_or_validated_cors() {
+        use super::ImageRequestProfile::{CorsInclude, CorsSameOrigin, NoCorsInclude};
+        for (profile, final_url, redirected, expected) in [
+            (None, "https://app.test/image", false, true),
+            (Some(NoCorsInclude), "https://cdn.test/image", false, false),
+            (Some(NoCorsInclude), "https://app.test/image", true, false),
+            (Some(CorsSameOrigin), "https://cdn.test/image", true, true),
+            (Some(CorsInclude), "https://cdn.test/image", false, true),
+        ] {
+            let response = obscura_net::Response {
+                url: url::Url::parse(final_url).unwrap(), status: 200,
+                headers: Default::default(), body: Vec::new(),
+                redirected_from: if redirected { vec![url::Url::parse("https://cdn.test/redirect").unwrap()] } else { vec![] },
+            };
+            assert_eq!(super::canvas_response_origin("https://app.test/page", profile, &response),
+                expected.then(|| "https://app.test".to_string()), "{profile:?} {final_url} {redirected}");
+            for invalid_document in ["not a URL", "about:blank"] {
+                assert_eq!(super::canvas_response_origin(invalid_document, profile, &response), None);
+            }
         }
     }
 
@@ -6302,7 +6443,7 @@ fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Origin of the calling realm's document. A cross-origin frame must land in
 /// its own origin's bucket rather than the top document's, so this resolves the
 /// realm that made the call instead of reading page state directly.
-fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
+pub(crate) fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
     let cache = state.storage_origin_cache.borrow();
     // Document identity can change without rebuilding the realm.
     if cache.url == state.url && cache.inherited_origin == state.inherited_origin {
@@ -6652,8 +6793,8 @@ fn op_frame_document_ready(
 
 // deno_core owns the context-state and module-map slots. Store traced V8 values
 // after them, not Global handles that would keep the context alive after detach.
-const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
-const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
+pub(crate) const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
+pub(crate) const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
 
 #[op2(nofast)]
 fn op_register_document_realm(
@@ -6676,17 +6817,18 @@ fn op_register_document_realm(
     }
 }
 
-/// Resolve a borrowed document member from the receiver's creation realm, not
-/// its public prototype, which a membrane is allowed to replace.
+/// Resolve borrowed members from the native owner, including adopted nodes.
+/// Public prototypes may be replaced by a membrane.
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
+    state: &OpState,
     receiver: v8::Local<'s, v8::Object>,
     #[string] name: &str,
     caller_frame_id: u32,
 ) -> v8::Local<'s, v8::Value> {
     let member = (|| {
-        let context = receiver.get_creation_context(scope)?;
+        let context = crate::node_transfer::owner_context(scope, state, receiver)?;
         let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
         if owner == caller_frame_id { return None; }
         let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
@@ -6695,6 +6837,89 @@ fn op_document_realm_member<'s, 'i>(
         value.is_function().then_some(value)
     })();
     member.unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+#[op2(fast)]
+fn op_node_owner_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::node_transfer::owner_frame(scope, state, receiver).map_or(-1, |frame| frame as i32)
+    })).unwrap_or(-1)
+}
+
+#[derive(Clone, Copy)]
+enum ImportNodeError { InvalidState, Security, Unsupported }
+
+impl ImportNodeError {
+    fn name(self) -> &'static str {
+        match self {
+            Self::InvalidState => "InvalidStateError",
+            Self::Security => "SecurityError",
+            Self::Unsupported => "NotSupportedError",
+        }
+    }
+}
+
+pub(crate) fn live_import_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow();
+    if registry.frame_timers_active(frame_id) != Some(true) { return None; }
+    registry.by_frame_id(frame_id)
+}
+
+/// Import allocates only in the destination arena. Original wrappers and
+/// listeners stay with the source; adoption needs a separate ownership route.
+#[op2]
+#[string]
+fn op_import_node(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    source_nid: u32,
+    target_frame: u32,
+    deep: bool,
+) -> String {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source_frame = crate::node_transfer::owner_frame(scope, state, receiver)
+            .ok_or(ImportNodeError::InvalidState)?;
+        let source = live_import_state(state, source_frame).ok_or(ImportNodeError::InvalidState)?;
+        let target = live_import_state(state, target_frame).ok_or(ImportNodeError::InvalidState)?;
+        let source_nid = NodeId::new(source_nid);
+        if Rc::ptr_eq(&source, &target) {
+            let state = source.borrow();
+            let dom = state.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+            if source_nid == dom.document() || dom.is_shadow_root(source_nid) {
+                return Err(ImportNodeError::Unsupported);
+            }
+            let cloned = dom.clone_node(source_nid, deep).ok_or(ImportNodeError::InvalidState)?;
+            propagate_script_start_state(dom, source_nid, cloned, &state.already_started_scripts);
+            return Ok(cloned.raw());
+        }
+        let source = source.borrow();
+        let target = target.borrow();
+        let origin = storage_origin(&source);
+        if &*origin == "null" || &*origin != &*storage_origin(&target) {
+            return Err(ImportNodeError::Security);
+        }
+        let source_dom = source.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+        let target_dom = target.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+        if source_nid == source_dom.document() || source_dom.is_shadow_root(source_nid) {
+            return Err(ImportNodeError::Unsupported);
+        }
+        let (root, mapping) = target_dom.import_detached_node_from(source_dom, source_nid, deep)
+            .ok_or(ImportNodeError::InvalidState)?;
+        let started = source.already_started_scripts.borrow();
+        target.already_started_scripts.borrow_mut().extend(mapping.into_iter()
+            .filter_map(|(old, new)| started.contains(&old).then_some(new)));
+        Ok(root.raw())
+    })).unwrap_or(Err(ImportNodeError::InvalidState));
+    match result {
+        Ok(nid) => serde_json::json!({"nid": nid}).to_string(),
+        Err(error) => serde_json::json!({"error": error.name()}).to_string(),
+    }
 }
 
 /// Limit live contexts and DOM trees, including initial realms awaiting Page
@@ -6777,7 +7002,8 @@ fn op_initial_frame(
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
-        registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        let owner = v8::Weak::new(scope, &handle);
+        registry.borrow_mut().register_document(handle.clone(), frame_id, Rc::new(RefCell::new(child)), owner);
         registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
@@ -7896,6 +8122,11 @@ pub fn build_extension() -> Extension {
         op_frame_document_ready(),
         op_initial_frame(),
         op_document_realm_member(),
+        op_node_owner_frame(),
+        op_import_node(),
+        crate::node_transfer::op_node_owner_member(),
+        crate::node_transfer::op_adoption_nodes(),
+        crate::node_transfer::op_adopt_node(),
         op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),
@@ -7937,6 +8168,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
+        ops.push(op_canvas_image_pixels());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
@@ -8573,8 +8805,10 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u32) -> String {
+    let Some(shared) = live_import_state(state, frame_id) else {
+        return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" }).to_string();
+    };
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -8587,6 +8821,33 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
         return serde_json::json!({ "ok": false, "currentSrc": "" }).to_string();
     }
     cached_image_metadata_for_node(&gs, node_id)
+}
+
+/// Cache-only image pixels: 0 unavailable, 1 clean, 2 opaque (no bytes copied).
+/// The wrapper's native owner selects the live frame; page fields cannot name it.
+#[cfg(feature = "render")]
+#[op2(nofast)]
+fn op_canvas_image_pixels(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    nid: u32,
+    width: u32,
+    height: u32,
+    #[buffer] out: &mut [u8],
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frame = crate::node_transfer::owner_frame(scope, state, receiver)?;
+        let shared = live_import_state(state, frame)?;
+        let gs = shared.try_borrow().ok()?;
+        let dom = gs.dom.as_ref()?;
+        let node = NodeId::new(nid);
+        if dom.get_node(node)?.as_element()?.local.as_ref() != "img" { return None; }
+        let base_url = document_base_url(&gs);
+        gs.render_resources.cached_image_element_rgba(
+            dom, node, gs.viewport, base_url.as_deref(), &gs.url, width, height, out,
+        ).map(|clean| if clean { 1 } else { 2 })
+    })).ok().flatten().unwrap_or(0)
 }
 
 /// Compatibility path for standalone render runtimes which deliberately
@@ -8659,10 +8920,13 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id: u32) -> String {
     let shared = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        live_import_state(&state, frame_id)
+    };
+    let Some(shared) = shared else {
+        return serde_json::json!({ "state": "error", "ok": false, "currentSrc": "" }).to_string();
     };
     let node_id = NodeId::new(nid);
     let (
@@ -8813,6 +9077,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         response = fetch => response,
         _ = cancel_rx => None,
     };
+    let canvas_origin = response.as_ref().and_then(|response| {
+        canvas_response_origin(&shared.borrow().url, Some(request_profile), response)
+    });
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -8829,6 +9096,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                             request_profile,
                             bytes,
                         );
+                        gs.render_resources.set_image_canvas_origin(&selected_url, request_profile, canvas_origin);
                         // The leader owns the unknown-to-known cache
                         // transition. Followers only observe this result and
                         // must not invalidate the retained render again.
@@ -9272,7 +9540,7 @@ fn op_computed_style(
 
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
+fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) -> bool {
     let shared = frame_state(state, frame_id);
     let mut state = shared.borrow_mut();
     let changed = state.dom.as_ref().is_some_and(|dom| {
@@ -9284,6 +9552,7 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
+    changed
 }
 
 /// `Element.checkVisibility()` in one native call. Walking ancestors through

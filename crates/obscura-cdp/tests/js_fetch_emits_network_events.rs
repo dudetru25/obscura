@@ -11,35 +11,63 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-// Serves an HTML page that fetches /api/start.json, which redirects to the
-// JSON response at /api/data.json.
-async fn serve() -> String {
+// Initial inline fetches must carry native metadata before navigation commits.
+async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        for _ in 0..12 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf).await.unwrap();
-                let req = String::from_utf8_lossy(&buf[..]);
-                if req.starts_with("GET /api/start.json") {
-                    let resp = "HTTP/1.1 302 Found\r\nLocation: /api/data.json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                    return;
-                }
-                if req.starts_with("GET /api/missing.json") {
-                    let body = r#"{"error":"missing"}"#;
-                    let response = format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    return;
-                }
-                let (ct, body) = if req.starts_with("GET /api/data.json") {
-                    ("application/json", "{\"value\":42}")
-                } else {
-                    (
-                        "text/html",
-                        r#"<html><head></head><body>
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for listener in [listener, peer] {
+        let observed = observed.clone();
+        tokio::spawn(async move {
+            for _ in 0..24 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    let header_end = loop {
+                        let length = socket.read(&mut chunk).await.unwrap();
+                        assert!(length > 0, "fixture request headers must complete");
+                        bytes.extend_from_slice(&chunk[..length]);
+                        assert!(bytes.len() <= 16_384, "fixture request headers are bounded");
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let request = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                    let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let headers = request.lines().skip(1).filter_map(|line| line.split_once(':'))
+                        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim())).collect::<std::collections::HashMap<_, _>>();
+                    let content_length = headers.get("content-length").map(|value| value.parse::<usize>().unwrap()).unwrap_or(0);
+                    assert!(content_length <= 8192, "fixture request body is bounded");
+                    while bytes.len() - header_end < content_length {
+                        let length = socket.read(&mut chunk).await.unwrap();
+                        assert!(length > 0, "fixture request body must complete");
+                        bytes.extend_from_slice(&chunk[..length]);
+                    }
+                    let request_body = String::from_utf8(bytes[header_end..header_end + content_length].to_vec()).ok();
+                    let site = headers.get("sec-fetch-site").copied().unwrap_or("");
+                    let cookie = headers.get("cookie").is_some_and(|value|
+                        value.split(';').any(|item| item.trim() == "metadata-session=fixture"));
+                    if path.starts_with("/api/") {
+                        observed.lock().unwrap().push(json!({"path":path,"site":site,"cookie":cookie}));
+                    }
+                    let redirect = match path {
+                        "/api/start.json" if site == "same-origin" && cookie => Some("/api/data.json".to_string()),
+                        "/api/same-site-start" => Some(format!("http://{peer_addr}/api/same-site-hop")),
+                        "/api/cross-site-start" => Some(format!("http://localhost:{}/api/cross-site-hop", peer_addr.port())),
+                        "/api/same-site-hop" | "/api/cross-site-hop" => Some(format!("http://{addr}/api/site-return.json")),
+                        _ => None,
+                    };
+                    let (status, content_type, body) = match path {
+                        "/api/start.json" if redirect.is_none() => (403, "application/json", r#"{"error":"cookie-auth metadata missing"}"#.to_string()),
+                        "/api/data.json" => (200, "application/json", r#"{"value":42}"#.to_string()),
+                        "/api/body.json" => (200, "application/json", json!({"body":request_body}).to_string()),
+                        "/api/missing.json" => (404, "application/json", r#"{"error":"missing"}"#.to_string()),
+                        "/api/site-return.json" => (200, "application/json", json!({"site":site,"cookie":cookie}).to_string()),
+                        _ => (200, "text/html", r#"<html><head></head><body>
 <div id="r">stage1</div>
 <script>
 window.__done = new Promise(function (resolve) {
@@ -49,18 +77,24 @@ window.__done = new Promise(function (resolve) {
     .catch(function (e) { resolve("err:" + e); });
 });
 </script>
-</body></html>"#,
-                    )
-                };
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(resp.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{addr}/")
+</body></html>"#.to_string()),
+                    };
+                    let response = if let Some(location) = redirect {
+                        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nAccess-Control-Allow-Origin: http://{addr}\r\nAccess-Control-Allow-Credentials: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        let cookie_header = if content_type == "text/html" {
+                            "Set-Cookie: metadata-session=fixture; HttpOnly; SameSite=Lax; Path=/\r\n"
+                        } else {
+                            ""
+                        };
+                        format!("HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\n{cookie_header}Access-Control-Allow-Origin: http://{addr}\r\nAccess-Control-Allow-Credentials: true\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+    }
+    (format!("http://{addr}/"), observed)
 }
 
 async fn cdp(ctx: &mut CdpContext, id: u64, method: &str, params: Value, session_id: &str) -> Value {
@@ -110,7 +144,7 @@ fn response_request_id(ctx: &CdpContext, url_needle: &str) -> Option<String> {
 #[tokio::test(flavor = "current_thread")]
 async fn js_fetch_emits_network_request_and_response() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    let base = serve().await;
+    let (base, observed) = serve().await;
     let mut ctx = CdpContext::new();
     let page_id = ctx.create_page();
     let session_id = "session-1";
@@ -128,6 +162,11 @@ async fn js_fetch_emits_network_request_and_response() {
         session_id,
     )
     .await;
+
+    assert_eq!(*observed.lock().unwrap(), vec![
+        json!({"path":"/api/start.json","site":"same-origin","cookie":true}),
+        json!({"path":"/api/data.json","site":"same-origin","cookie":true}),
+    ], "inline fetch must send cookie-auth metadata without an interception repair");
 
     // The final fetched JSON URL must appear as a requestWillBeSent event.
     let request_urls = ctx
@@ -157,6 +196,104 @@ async fn js_fetch_emits_network_request_and_response() {
         Some("{\"value\":42}"),
         "Network.getResponseBody must return the script-fetched JSON"
     );
+
+    for (id, kind, expected_site, peer_cookie) in [
+        (3, "same-site", "same-site", true),
+        (4, "cross-site", "cross-site", false),
+    ] {
+        observed.lock().unwrap().clear();
+        let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":format!("fetch('/api/{kind}-start',{{credentials:'include'}}).then(response=>response.json())"),
+            "awaitPromise":true,"returnByValue":true,
+        }), session_id).await;
+        assert_eq!(response["result"]["value"], json!({"site":expected_site,"cookie":true}));
+        assert_eq!(*observed.lock().unwrap(), vec![
+            json!({"path":format!("/api/{kind}-start"),"site":"same-origin","cookie":true}),
+            json!({"path":format!("/api/{kind}-hop"),"site":expected_site,"cookie":peer_cookie}),
+            json!({"path":"/api/site-return.json","site":expected_site,"cookie":true}),
+        ], "the redirect URL list must retain its least-trusted site");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_fetch_post_body_is_observable_without_interception() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let (base, _observed) = serve().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session = "body-session";
+    ctx.sessions.insert(session.to_string(), page_id);
+    let unicode_body = r#"{"message":"hello, café"}"#;
+    let cases = [
+        ("POST", serde_json::to_string(unicode_body).unwrap(), Some(unicode_body), Some(unicode_body)),
+        ("POST", "''".to_string(), Some(""), None),
+        ("POST", "new Uint8Array([255,0])".to_string(), None, None),
+        ("GET", "undefined".to_string(), Some(""), None),
+    ];
+    let mut id = 2;
+    for (method, body, expected_wire, expected_post_data) in cases {
+        let injection = cdp(&mut ctx, id, "Page.addScriptToEvaluateOnNewDocument", json!({
+            "source":format!("globalThis.__bodyResponse=fetch('/api/body.json',{{method:'{method}',body:{body}}}).then(response=>response.json());"),
+        }), session).await;
+        id += 1;
+        ctx.pending_events.clear();
+        // Navigation runs the existing network-event serializer. Direct
+        // dispatch does not run the WebSocket server's post-command drain.
+        cdp(&mut ctx, id, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), session).await;
+        id += 1;
+        let response = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":"globalThis.__bodyResponse",
+            "awaitPromise":true,"returnByValue":true,
+        }), session).await;
+        id += 1;
+        cdp(&mut ctx, id, "Page.removeScriptToEvaluateOnNewDocument", json!({"identifier":injection["identifier"]}), session).await;
+        id += 1;
+        assert!(ctx.pending_events.iter().filter(|event| event.method == "Network.requestWillBeSent"
+            && event.params["request"]["method"] == "GET")
+            .all(|event| event.params["request"].get("postData").is_none()), "GET requests must omit postData");
+        assert_eq!(response["result"]["value"], json!({"body":expected_wire}), "the real server must receive the expected body");
+        let request = ctx.pending_events.iter().find(|event| event.method == "Network.requestWillBeSent"
+            && event.params["request"]["url"].as_str().is_some_and(|url| url.ends_with("/api/body.json")))
+            .expect("runtime request must emit its start event");
+        assert_eq!(request.params["request"]["method"], method);
+        if let Some(expected) = expected_post_data {
+            assert_eq!(request.params["request"]["postData"], expected, "CDP must preserve the exact UTF-8 request body");
+        } else {
+            assert!(request.params["request"].get("postData").is_none(), "absent, empty and binary request bodies must omit postData");
+        }
+        let request_id = &request.params["requestId"];
+        assert!(ctx.pending_events.iter().any(|event| event.method == "Network.responseReceived"
+            && &event.params["requestId"] == request_id && event.params["response"]["status"] == 200),
+            "response identity must match the body-bearing request");
+    }
+
+    let (intercept_tx, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    ctx.intercept_tx = Some(intercept_tx);
+    cdp(&mut ctx, id, "Fetch.enable", json!({"patterns":[{"urlPattern":format!("{base}api/body.json")}]}), session).await;
+    id += 1;
+    ctx.pending_events.clear();
+    let replacement_body = r#"{"message":"continued, café"}"#;
+    let continuation = async {
+        let request: obscura_js::ops::InterceptedRequest = intercepted.recv().await.expect("POST must reach the existing interception boundary");
+        assert_eq!(request.method, "POST");
+        let request_id = request.request_id;
+        assert!(request.resolver.send(obscura_js::ops::InterceptResolution::Continue {
+            url: None, method: None, headers: None, body: Some(replacement_body.as_bytes().to_vec()),
+        }).is_ok(), "the intercepted body rewrite must be delivered");
+        request_id
+    };
+    let (response, request_id) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression":format!("fetch('/api/body.json',{{method:'POST',body:{}}}).then(response=>response.json())", serde_json::to_string(unicode_body).unwrap()),
+            "awaitPromise":true,"returnByValue":true,
+        }), session), continuation)
+    }).await.expect("the intercepted POST and body rewrite must complete");
+    assert_eq!(response["result"]["value"], json!({"body":replacement_body}), "the server must receive the continued body rather than the original body");
+    let page = ctx.get_session_page_mut(&Some(session.to_string())).unwrap();
+    page.sync_js_network_events();
+    assert!(page.network_events.iter().any(|event|
+        event.request_id == request_id && event.status == 200 && event.intercepted),
+        "continuation must preserve the transport request's response identity");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -206,7 +343,7 @@ async fn stealth_context() -> (CdpContext, String, String) {
     let page = ctx.create_page();
     let session = "stealth-session".to_string();
     ctx.sessions.insert(session.clone(), page);
-    let base = serve().await;
+    let (base, _observed) = serve().await;
     cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), &session).await;
     (ctx, session, base)
 }

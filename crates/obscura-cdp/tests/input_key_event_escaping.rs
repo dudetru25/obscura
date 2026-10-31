@@ -215,6 +215,107 @@ async fn delete_key_removes_the_selected_range() {
     assert_eq!(value["result"]["value"], r#"{"value":"ad","start":1,"inputs":1}"#);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn tab_key_moves_focus_through_enabled_visible_stops() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    let setup = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": r#"document.body.innerHTML = `
+            <input id="search" value="query">
+            <input id="negative" tabindex="-1"><input disabled><input type="hidden">
+            <div inert><button>Inert</button></div>
+            <div hidden><button>Hidden</button></div>
+            <dialog><button>Closed dialog</button></dialog>
+            <div style="display:none"><button>No box</button></div>
+            <div style="visibility:hidden"><button>Invisible</button></div>
+            <fieldset disabled><input></fieldset>
+            <button id="new-page">New page</button>
+            <input id="transparent" style="opacity:0">
+            <fieldset disabled><legend><button id="legend">Legend</button></legend><button>Disabled fieldset</button></fieldset>
+            <input id="positive-later" tabindex="3">
+            <button id="positive-first" tabindex="1">First</button>
+            <button id="positive-tie" tabindex="1">Tie</button>`;
+            window.__tabTransitions = [];
+            window.__tabKeyTargets = [];
+            document.addEventListener('focusout', event => __tabTransitions.push([event.type, event.target.id, event.relatedTarget?.id ?? '']));
+            document.addEventListener('focusin', event => __tabTransitions.push([event.type, event.target.id, event.relatedTarget?.id ?? '']));
+            document.addEventListener('keydown', event => {
+                if (event.key !== 'Tab') return;
+                __tabKeyTargets.push([event.type, event.target.id]);
+                if (window.__cancelTab) event.preventDefault();
+            });
+            document.addEventListener('keyup', event => {
+                if (event.key === 'Tab') __tabKeyTargets.push([event.type, event.target.id]);
+            });
+            'ready'"#,
+        "returnByValue": true
+    }), session_id).await;
+    assert_eq!(setup["result"]["value"], "ready");
+
+    let cases = [
+        ("search", 0, false, "new-page"),
+        ("new-page", 8, false, "search"),
+        ("negative", 0, false, "new-page"),
+        ("negative", 8, false, "search"),
+        ("positive-first", 0, false, "positive-tie"),
+        ("positive-tie", 0, false, "positive-later"),
+        ("positive-later", 0, false, "search"),
+        ("new-page", 0, false, "transparent"),
+        ("transparent", 0, false, "legend"),
+        ("legend", 0, false, ""),
+        ("", 0, false, "positive-first"),
+        ("positive-first", 8, false, ""),
+        ("", 8, false, "legend"),
+        ("search", 0, true, "search"),
+        ("search", 1, false, "search"),
+        ("search", 2, false, "search"),
+        ("search", 4, false, "search"),
+    ];
+    let mut id = 3;
+    for (case_index, (start, modifiers, cancelled, expected)) in cases.into_iter().enumerate() {
+        cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression": format!(
+                "(() => {{ const start = document.getElementById({}); if (start) start.focus(); else document.activeElement.blur(); window.__cancelTab = {cancelled}; __tabTransitions.length = 0; __tabKeyTargets.length = 0; }})()",
+                serde_json::to_string(start).unwrap()
+            )
+        }), session_id).await;
+        id += 1;
+        for event_type in [if case_index % 2 == 0 { "keyDown" } else { "rawKeyDown" }, "keyUp"] {
+            cdp(&mut ctx, id, "Input.dispatchKeyEvent", json!({
+                "type": event_type, "key": "Tab", "code": "Tab", "text": "\t",
+                "windowsVirtualKeyCode": 9, "modifiers": modifiers
+            }), session_id).await;
+            id += 1;
+        }
+        let value = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+            "expression": "JSON.stringify({active: document.activeElement.id, transitions: __tabTransitions, keys: __tabKeyTargets, value: document.getElementById('search').value})",
+            "returnByValue": true
+        }), session_id).await;
+        id += 1;
+        let actual: Value = serde_json::from_str(value["result"]["value"].as_str().unwrap()).unwrap();
+        let mut transitions = Vec::new();
+        if start != expected {
+            if !start.is_empty() {
+                transitions.push(json!(["focusout", start, expected]));
+            }
+            if !expected.is_empty() {
+                transitions.push(json!(["focusin", expected, start]));
+            }
+        }
+        assert_eq!(actual, json!({
+            "active": expected,
+            "transitions": transitions,
+            "keys": [["keydown", start], ["keyup", expected]],
+            "value": "query"
+        }), "Tab case {case_index}: {start:?}, modifiers={modifiers}, cancelled={cancelled}");
+    }
+}
+
 // The same hazard one layer over: on the inserted *text* rather than on the key
 // name. `insert_text_js` interpolates the text into the same kind of
 // single-quoted literal. #433 escaped the backslash and the quote and stopped

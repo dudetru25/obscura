@@ -81,6 +81,7 @@ enum CachedResource {
         bytes: Arc<[u8]>,
         intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
         static_raster: std::sync::OnceLock<bool>,
+        canvas_origin: Option<String>,
     },
     Missing(std::time::Instant),
 }
@@ -339,6 +340,14 @@ impl RenderResourceCache {
         self.seed_shared(image_resource_key(&url, profile), bytes);
     }
 
+    /// Bind readback permission to the bytes just seeded by the owning page.
+    /// Replacement and eviction discard this permission with the cache entry.
+    pub fn set_image_canvas_origin(&mut self, url: &str, profile: ImageRequestProfile, origin: Option<String>) {
+        if let Some(CachedResource::Bytes { canvas_origin, .. }) = self.entries.get_mut(&image_resource_key(url, profile)) {
+            *canvas_origin = origin.filter(|origin| origin != "null");
+        }
+    }
+
     pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
         self.seed_missing(image_resource_key(&url, profile));
     }
@@ -500,6 +509,55 @@ impl RenderResourceCache {
         }
     }
 
+    /// Copy one cached image to straight RGBA without loading resources.
+    /// `Some(false)` reports an opaque image without writing any output bytes.
+    pub fn cached_image_element_rgba(
+        &self,
+        tree: &DomTree,
+        id: obscura_dom::tree::NodeId,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        document_url: &str,
+        width: u32,
+        height: u32,
+        out: &mut [u8],
+    ) -> Option<bool> {
+        let pixels = (width as u64).checked_mul(height as u64)?;
+        if pixels == 0 || pixels > MAX_IMAGE_RASTER_PIXELS || out.len() as u64 != pixels * 4 {
+            return None;
+        }
+        let (src, _) = resolve_img_url(tree, id, viewport)?;
+        let resolved_url = resolve_resource_url(&src, base_url).unwrap_or(src);
+        let bytes = if resolved_url.starts_with("data:") {
+            let mut scratch = RenderResourceCache::with_loader_and_limits(|_url: &str| None, 0, 0);
+            fetch_bytes(&resolved_url, None, &mut scratch)?
+        } else {
+            let key = image_resource_key(&resolved_url, image_request_profile(tree, id));
+            if self.stopped.contains(&key) { return None; }
+            let CachedResource::Bytes { bytes, canvas_origin, .. } = self.entries.get(&key)? else { return None; };
+            let origin = url::Url::parse(document_url).ok()?.origin().ascii_serialization();
+            if origin == "null" || canvas_origin.as_deref() != Some(origin.as_str()) {
+                return Some(false);
+            }
+            Arc::clone(bytes)
+        };
+        let pixmap = if is_svg(&bytes) {
+            render_svg(&bytes, width, height)?
+        } else {
+            let (source_width, source_height) = image_metadata_from_bytes(&bytes)?;
+            if !source_width.is_finite() || !source_height.is_finite()
+                || source_width as f64 * source_height as f64 > MAX_IMAGE_RASTER_PIXELS as f64 {
+                return None;
+            }
+            raster_to_pixmap(&bytes, width, height)?
+        };
+        for (target, pixel) in out.chunks_exact_mut(4).zip(pixmap.pixels()) {
+            let color = pixel.demultiply();
+            target.copy_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+        }
+        Some(true)
+    }
+
     /// Cache-only poster selection for one live `<video>`. Poster images use
     /// the element's media CORS settings and the same page-owned image cache as
     /// ordinary replaced images; they do not imply that any video frame has
@@ -642,6 +700,7 @@ impl RenderResourceCache {
             bytes,
             intrinsic: std::sync::OnceLock::new(),
             static_raster: std::sync::OnceLock::new(),
+            canvas_origin: None,
         });
     }
 
@@ -1782,6 +1841,17 @@ impl PreparedRender {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
+        if let Some((columns, rows)) = self.layout.grid_tracks(id) {
+            let resolved_tracks = |tracks: &[f32]| {
+                if tracks.is_empty() {
+                    "none".to_string()
+                } else {
+                    tracks.iter().map(|size| format!("{size}px")).collect::<Vec<_>>().join(" ")
+                }
+            };
+            out.insert("grid-template-columns", resolved_tracks(columns));
+            out.insert("grid-template-rows", resolved_tracks(rows));
+        }
         out.insert(
             "vertical-align",
             match style.vertical_align {
@@ -10992,6 +11062,8 @@ fn render_svg_with_font_database(
         return None;
     }
     let mut opts = usvg::Options::default();
+    // SVG image resources cannot load local files or external subresources.
+    opts.image_href_resolver.resolve_string = Box::new(|_, _| None);
     // The outer replaced element supplies the SVG document viewport. Force
     // that used CSS size onto the root before usvg resolves `viewBox`:
     // a missing height is represented as 100%, which usvg otherwise resolves
@@ -12455,6 +12527,20 @@ mod tests {
             panic!("seeded metadata must not issue a request")
         });
         cache.seed_image(url.into(), profile, svg(20, 10));
+        let tree = parse_html(&format!("<img id='image' src='{url}'>"));
+        let image = tree.get_element_by_id("image").unwrap();
+        let mut pixels = [7u8; 16];
+        assert_eq!(cache.cached_image_element_rgba(&tree, image, (800.0,600.0), None, url, 2,2, &mut pixels), Some(false));
+        assert_eq!(pixels, [7u8;16], "opaque output must remain untouched");
+        cache.set_image_canvas_origin(url, profile, Some("https://assets.test".into()));
+        assert_eq!(cache.cached_image_element_rgba(&tree, image, (800.0,600.0), None, url, 2,2, &mut pixels), Some(true));
+        assert_eq!(pixels, [0u8;16], "the empty SVG decodes to transparent pixels");
+        pixels.fill(7);
+        assert_eq!(cache.cached_image_element_rgba(&tree, image, (800.0,600.0), None, "https://other.test", 2,2, &mut pixels), Some(false));
+        for (width,height,length) in [(0,2,16),(2,2,3),(u32::MAX,u32::MAX,16)] {
+            assert_eq!(cache.cached_image_element_rgba(&tree, image, (800.0,600.0), None, url, width,height, &mut pixels[..length]), None);
+        }
+        assert_eq!(pixels, [7u8;16], "origin and size rejection must not write pixels");
         cache.seed_image(url.into(), ImageRequestProfile::CorsInclude, svg(80, 40));
         for _ in 0..2 {
             assert_eq!(cache.profiled_image_intrinsic(url, profile).unwrap().natural_size(), Some((20.0, 10.0)));
@@ -12462,6 +12548,8 @@ mod tests {
             assert_eq!(cache.profiled_image_intrinsic(url, ImageRequestProfile::CorsInclude).unwrap().natural_size(), Some((80.0, 40.0)));
         }
         cache.seed_image(url.into(), profile, svg(40, 30));
+        assert_eq!(cache.cached_image_element_rgba(&tree, image, (800.0,600.0), None, url, 2,2, &mut pixels), Some(false));
+        assert_eq!(pixels, [7u8;16], "replacement must discard the previous readback permission");
         assert_eq!(cache.profiled_image_intrinsic(url, profile).unwrap().natural_size(), Some((40.0, 30.0)));
         cache.seed_image(url.into(), profile, b"not an image".to_vec());
         assert_eq!(cache.profiled_image_intrinsic(url, profile), None);

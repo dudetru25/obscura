@@ -5009,3 +5009,29 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+
+#[test]
+fn closed_dialogs_leave_normal_flow_until_opened() {
+    let tree = parse_html(r#"<!doctype html><style>
+        body{margin:0} dialog{position:static;margin:0;padding:0;border:0;width:100px;height:30px}
+        #override{display:flex} #after{height:20px}
+        </style><dialog id="closed">Closed</dialog><dialog id="opened" open>Open</dialog>
+        <dialog id="override">Author display</dialog><div id="after">After</div>"#);
+    let closed = tree.get_element_by_id("closed").unwrap();
+    let opened = tree.get_element_by_id("opened").unwrap();
+    let override_id = tree.get_element_by_id("override").unwrap();
+    let after = tree.get_element_by_id("after").unwrap();
+    let layout = layout_dom(&tree, (400.0, 300.0));
+    assert_eq!(layout.styles[&closed].display, obscura_render::Display::None);
+    assert_ne!(layout.styles[&opened].display, obscura_render::Display::None);
+    assert_eq!(layout.styles[&override_id].display, obscura_render::Display::Flex);
+    assert_eq!(layout.rects[&after].y, 60.0);
+    tree.with_node_mut(closed, |node| node.set_attribute("open", "".into()));
+    let layout = layout_dom(&tree, (400.0, 300.0));
+    assert_ne!(layout.styles[&closed].display, obscura_render::Display::None);
+    assert_eq!(layout.rects[&after].y, 90.0);
+    tree.with_node_mut(closed, |node| node.remove_attribute_ns("", "open"));
+    let layout = layout_dom(&tree, (400.0, 300.0));
+    assert_eq!(layout.styles[&closed].display, obscura_render::Display::None);
+    assert_eq!(layout.rects[&after].y, 60.0);
+}

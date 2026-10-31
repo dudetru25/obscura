@@ -2,8 +2,7 @@
 # Requires Git, GNU timeout, and the pinned Python dependencies.
 # Run from any directory:
 # PYTHON_BIN=/path/to/python CHROME_BIN=/path/to/chrome bash scripts/ci/preflight.sh
-# Jenkins sources this file to keep the browser selection for both harnesses.
-# Linux reference-font and full rendering acceptance remain in jenkins.sh.
+# Source this file to keep the browser selection for both harnesses.
 set -euo pipefail
 
 : "${CHROME_BIN:?Set CHROME_BIN to the existing Chrome executable}"
@@ -42,9 +41,10 @@ if [[ "$(git -C "$benchmark" rev-parse HEAD)" != "$benchmark_revision" ]]; then
     exit 1
 fi
 
-bash -n "$preflight_root/scripts/ci/jenkins.sh" \
-    "$preflight_root/render-repros/run.sh" \
-    "$preflight_root/render-repros/representative-suite/run.sh"
+for script in "$preflight_root/render-repros/run.sh" \
+    "$preflight_root/render-repros/representative-suite/run.sh"; do
+    bash -n "$script"
+done
 "$PYTHON_BIN" -m unittest discover -s "$preflight_root/render-repros" -p 'test_*.py'
 "$PYTHON_BIN" -m unittest discover -s "$preflight_root/render-repros/representative-suite" -p 'test_*.py'
 "$PYTHON_BIN" - <<'CHECK'

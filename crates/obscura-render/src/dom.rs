@@ -309,6 +309,8 @@ pub struct DomLayout {
     /// Native grid track extents beyond the content box, including unoccupied
     /// tracks. Only element scroll containers expose these through CSSOM.
     grid_overflow: HashMap<NodeId, Rect>,
+    /// Used column and row track sizes for resolved grid CSSOM values.
+    grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     /// Per-line border-box fragments for ordinary non-replaced inline
     /// elements. `rects` retains their union for `getBoundingClientRect()`;
     /// this list is the source for background/border painting and
@@ -1005,6 +1007,10 @@ fn sticky_axis_position(
 }
 
 impl DomLayout {
+    pub(crate) fn grid_tracks(&self, id: NodeId) -> Option<&(Vec<f32>, Vec<f32>)> {
+        self.grid_tracks.get(&id)
+    }
+
     pub(crate) fn derived_layout_state(
         &self,
         tree: &DomTree,
@@ -2781,6 +2787,10 @@ fn cascade_node_style(
                 }
                 _ => {}
             }
+        }
+        // Closed dialogs have no box unless author display rules override the UA rule.
+        if elem.local.as_ref() == "dialog" && node.get_attribute("open").is_none() {
+            style.display = crate::Display::None;
         }
         // UA rule `[hidden]:not([hidden=until-found]) { display: none }`.
         // Applied before the author cascade so a matching author `display`
@@ -5303,6 +5313,7 @@ fn layout_dom_once(
 
     let mut rects = HashMap::new();
     let mut grid_overflow = HashMap::new();
+    let mut grid_tracks = HashMap::new();
     let mut inline_fragments = HashMap::new();
     let mut text_runs = HashMap::new();
     // Final absolute rects of anonymous inline-run leaves, keyed by the
@@ -5494,12 +5505,36 @@ fn layout_dom_once(
                             && rendered_parent(tree, id)
                                 .and_then(|parent| styles.get(&parent))
                                 .is_some_and(|parent| {
-                                    parent.display == crate::Display::Flex
+                                    let column_flex = parent.display == crate::Display::Flex
                                         && !parent.internal_flex_container
                                         && matches!(parent.flex_direction, Some(
                                             taffy::FlexDirection::Column
                                                 | taffy::FlexDirection::ColumnReverse
-                                        ))
+                                        ));
+                                    let alignment = style.align_self
+                                        .or(parent.align_items)
+                                        .unwrap_or(taffy::AlignItems::NORMAL);
+                                    let normal_alignment = if parent.display == crate::Display::Grid
+                                        && (style.has_replaced_sizing || style.aspect_ratio.is_some())
+                                    {
+                                        taffy::AlignItems::START
+                                    } else {
+                                        taffy::AlignItems::STRETCH
+                                    };
+                                    let stretched_block_axis = !style.margin_auto[0]
+                                        && !style.margin_auto[2]
+                                        && alignment.resolve_normal(normal_alignment)
+                                            == taffy::AlignItems::STRETCH
+                                        && (parent.display == crate::Display::Grid
+                                            || (parent.display == crate::Display::Flex
+                                                && !parent.internal_flex_container
+                                                && !matches!(parent.flex_direction, Some(
+                                                    taffy::FlexDirection::Column
+                                                        | taffy::FlexDirection::ColumnReverse
+                                                ))
+                                                && parent.flex_wrap.unwrap_or(taffy::FlexWrap::NoWrap)
+                                                    == taffy::FlexWrap::NoWrap));
+                                    column_flex || stretched_block_axis
                                 })
                     });
             let reused_computed_style = fresh_styles
@@ -7706,6 +7741,7 @@ fn layout_dom_once(
                 &words,
                 &mut rects,
                 &mut grid_overflow,
+                &mut grid_tracks,
                 &mut text_runs,
                 &mut anon_rects,
                 &generated_nodes,
@@ -7908,6 +7944,7 @@ fn layout_dom_once(
         DomLayout {
             rects,
             grid_overflow,
+            grid_tracks,
             inline_fragments,
             styles,
             custom_properties,
@@ -8936,6 +8973,7 @@ fn compute_absolute_rects(
     words: &HashMap<taffy::NodeId, (NodeId, String)>,
     rects: &mut HashMap<NodeId, Rect>,
     grid_overflow: &mut HashMap<NodeId, Rect>,
+    grid_tracks: &mut HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
     text_runs: &mut HashMap<NodeId, Vec<(Rect, String)>>,
     anon_rects: &mut HashMap<usize, Rect>,
     generated_nodes: &HashMap<taffy::NodeId, usize>,
@@ -8954,6 +8992,7 @@ fn compute_absolute_rects(
         if let Some(dom_id) = id_map.get(&taffy_id) {
             rects.insert(*dom_id, rect);
             if let taffy::tree::DetailedLayoutInfo::Grid(info) = taffy_tree.detailed_layout_info(taffy_id) {
+                grid_tracks.insert(*dom_id, (info.columns.sizes.clone(), info.rows.sizes.clone()));
                 let right = info.columns.end_offset;
                 let bottom = info.rows.end_offset;
                 if right + layout.padding.right > layout.size.width - layout.border.right
@@ -8991,6 +9030,7 @@ fn compute_absolute_rects(
                     words,
                     rects,
                     grid_overflow,
+                    grid_tracks,
                     text_runs,
                     anon_rects,
                     generated_nodes,
@@ -17167,6 +17207,56 @@ mod tests {
             "ordinary indefinite blocks must remain content-sized");
         assert_eq!(rect("fixed-math").height, 32.0,
             "explicit fixed heights retain their numeric basis for CSS math");
+    }
+
+    #[test]
+    fn stretched_block_size_preserves_descendant_percentages() {
+        for host in [
+            "display:flex",
+            "display:grid;grid-template-rows:minmax(0,1fr)",
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body{{margin:0}}
+                #host{{{host};height:300px;width:400px}}
+                #item{{display:flex;min-height:0;min-width:0}}
+                .column{{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}}
+                #inspector{{display:flex;flex-direction:column;height:100%;min-height:0;overflow:hidden}}
+                #scroll{{flex:1 1 0;min-height:0;overflow:auto}}
+                #control{{display:block;height:30px}}
+                #long{{height:600px}}
+                </style><div id="host"><div id="item"><div class="column"><form class="column">
+                <div id="inspector"><div id="scroll"><button id="control">Outline</button><div id="long"></div></div></div>
+                </form></div></div></div>"#));
+            let laid = layout_dom(&tree, (800.0, 800.0));
+            let rect = |id| laid.rects[&tree.get_element_by_id(id).unwrap()];
+            for id in ["item", "inspector", "scroll"] {
+                assert_eq!(rect(id).height, 300.0, "{host} {id}: {:?}", rect(id));
+            }
+            let control = rect("control");
+            let scroll = rect("scroll");
+            assert!(control.y >= scroll.y && control.y + control.height <= scroll.y + scroll.height,
+                "the control must remain within its scroll viewport: {control:?} {scroll:?}");
+        }
+        for (host, item) in [
+            ("display:flex;height:300px", "align-self:start"),
+            ("display:grid;height:300px", "align-self:start"),
+            ("display:flex;height:300px", "margin-block:auto"),
+            ("display:grid;height:300px", "margin-block:auto"),
+            ("display:flex", ""),
+            ("display:grid", ""),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body{{margin:0}}
+                #host{{{host};width:400px}}
+                #item{{{item}}}
+                #percent{{height:100%}}
+                #leaf{{height:25px}}
+                </style><div id="host"><div id="item"><div id="percent"><div id="leaf"></div></div></div></div>"#));
+            let laid = layout_dom(&tree, (800.0, 800.0));
+            let percent = laid.rects[&tree.get_element_by_id("percent").unwrap()];
+            assert_eq!(percent.height, 25.0,
+                "non-stretched or indefinite items must remain content-sized: {host} {item}");
+        }
     }
 
     #[test]
