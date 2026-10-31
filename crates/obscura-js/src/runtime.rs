@@ -2381,6 +2381,7 @@ impl ObscuraJsRuntime {
                                 url: raw,
                                 profile,
                                 is_font,
+                                canvas_origin: None,
                                 response: None,
                                 };
                         }
@@ -2439,6 +2440,9 @@ impl ObscuraJsRuntime {
                         url: raw,
                         profile,
                         is_font,
+                        canvas_origin: response.as_ref().and_then(|response| {
+                            crate::ops::canvas_response_origin(initiator.as_str(), profile, response)
+                        }),
                         response: response.map(|response| crate::ops::RenderResourceResponse {
                             url: response.url.to_string(),
                             status: response.status,
@@ -2458,6 +2462,7 @@ impl ObscuraJsRuntime {
                             url: fallback.0,
                             profile: fallback.1,
                             is_font: fallback.2,
+                            canvas_origin: None,
                             response: None,
                         })
                     })
@@ -2558,10 +2563,14 @@ impl ObscuraJsRuntime {
                 _ => None,
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
+            let resource_url = load.url.clone();
             match load.profile {
                 Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
                 None => self.seed_shared_render_resource(load.url, bytes),
             }
+            self.state.borrow_mut().render_resources.set_image_canvas_origin(
+                &resource_url, load.profile.unwrap_or(crate::ops::ImageRequestProfile::NoCorsInclude), load.canvas_origin,
+            );
             if let Some(response) = load.response {
                 self.state
                     .borrow_mut()
@@ -5017,6 +5026,7 @@ mod tests {
                 url: url.clone(),
                 profile: None,
                 is_font: false,
+                canvas_origin: None,
                 response: Some(crate::ops::RenderResourceResponse {
                     url: url.clone(),
                     status: 200,
@@ -18287,6 +18297,10 @@ mod tests {
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(rt.evaluate("(() => { const image=document.getElementById('image'); return [image.complete,image.naturalWidth,image.naturalHeight]; })()").unwrap(),
             serde_json::json!([true, 4, 4]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(new Image(),0,0); return context.getImageData(0,0,1,1).data[3];
+        })()"#).unwrap(), serde_json::json!(0));
         for kind in ["image", "canvas"] {
             for arguments in ["1,1", "1,1,2,2", "0,0,size,size,1,1,2,2"] {
                 let script = format!(r#"(() => {{
@@ -18305,6 +18319,11 @@ mod tests {
                     serde_json::json!([[0,70,139,255],[0,0,0,0]]), "{kind}: {arguments}");
             }
         }
+        rt.evaluate("globalThis.brokenImage = new Image(); brokenImage.src = 'data:image/png;base64,AAAA'; void brokenImage.complete").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[brokenImage.complete,brokenImage.naturalWidth]").unwrap(), serde_json::json!([true,0]));
+        assert!(rt.evaluate("document.createElement('canvas').getContext('2d').drawImage(brokenImage,0,0)")
+            .unwrap_err().contains("InvalidStateError"));
     }
 
     #[cfg(feature = "render")]
@@ -18515,11 +18534,17 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load"]])
         );
+        rt.evaluate(r#"globalThis.opaqueCanvas = document.createElement('canvas');
+            opaqueCanvas.getContext('2d').drawImage(image,0,0);"#).unwrap();
+        for readback in ["opaqueCanvas.getContext('2d').getImageData(0,0,1,1)", "opaqueCanvas.toDataURL()"] {
+            assert!(rt.evaluate(readback).unwrap_err().contains("SecurityError"));
+        }
         assert!(rt.evaluate(r#"(() => {
-            const canvas = document.createElement('canvas');
-            const context = canvas.getContext('2d'); context.drawImage(image,0,0);
-            return context.getImageData(0,0,1,1);
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(opaqueCanvas,0,0); return context.getImageData(0,0,1,1);
         })()"#).unwrap_err().contains("SecurityError"));
+        assert_eq!(rt.evaluate(r#"opaqueCanvas.width = 1;
+            opaqueCanvas.getContext('2d').getImageData(0,0,1,1).data[3]"#).unwrap(), serde_json::json!(0));
 
         rt.execute_script(
             "require-anonymous-cors",

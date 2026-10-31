@@ -16030,6 +16030,30 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+const _taintedCanvasContexts = new WeakSet();
+function _assertCanvasOriginClean(context) {
+  if (_taintedCanvasContexts.has(context)) {
+    throw new DOMException('The canvas contains cross-origin image data.', 'SecurityError');
+  }
+}
+function _canvasImageSource(image) {
+  const decode = __obscuraCore.ops.op_canvas_image_pixels;
+  if (typeof decode !== 'function') return null;
+  const naturalWidth = image.naturalWidth, naturalHeight = image.naturalHeight;
+  if (!image.complete || !naturalWidth || !naturalHeight) {
+    if (image.complete && image.currentSrc) {
+      throw new DOMException('The image could not be decoded.', 'InvalidStateError');
+    }
+    return null;
+  }
+  const scale = Math.min(1, _MAX_CANVAS_DIMENSION / naturalWidth, _MAX_CANVAS_DIMENSION / naturalHeight,
+    Math.sqrt(_MAX_CANVAS_PIXELS / (naturalWidth * naturalHeight)));
+  const w = Math.max(1, Math.floor(naturalWidth * scale)), h = Math.max(1, Math.floor(naturalHeight * scale));
+  const buf = new Uint8Array(w * h * 4);
+  const status = decode(image, image._nid >>> 0, w, h, buf);
+  if (status === 0) throw new DOMException('The cached image could not be decoded.', 'InvalidStateError');
+  return { w, h, buf, clean: status === 1, naturalWidth, naturalHeight };
+}
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -16062,6 +16086,7 @@ class _Canvas2D {
     this._w = valid ? requestedWidth : 0;
     this._h = valid ? requestedHeight : 0;
     this._buf = new Uint8ClampedArray(this._w * this._h * 4);
+    _taintedCanvasContexts.delete(this);
     this._resetDrawingState();
     const register = __obscuraCore.ops.op_canvas_register_surface;
     if (typeof register === 'function') {
@@ -16185,6 +16210,7 @@ class _Canvas2D {
     return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
   getImageData(x, y, w, h) {
+    _assertCanvasOriginClean(this);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     const data = new Uint8ClampedArray(w * h * 4);
     for (let py = 0; py < h; py++) {
@@ -16221,19 +16247,40 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
-  drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
-      for (let py = 0; py < dh; py++) {
-        for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
-          }
-        }
+  drawImage(image, ...args) {
+    if (args.length !== 2 && args.length !== 4 && args.length < 8) {
+      throw new TypeError('drawImage requires 3, 5 or 9 arguments.');
+    }
+    let source;
+    if (image && image.nodeType === 1 && image.localName === 'img') {
+      source = _canvasImageSource(image);
+      if (!source) return;
+    } else if (image && image._ctx && image._ctx._buf) {
+      const context = image._ctx;
+      source = { w: context._w, h: context._h, buf: context._buf,
+        clean: !_taintedCanvasContexts.has(context), naturalWidth: context._w, naturalHeight: context._h };
+    } else {
+      return;
+    }
+    let sx = 0, sy = 0, sw = source.naturalWidth, sh = source.naturalHeight, dx, dy, dw, dh;
+    if (args.length >= 8) [sx, sy, sw, sh, dx, dy, dw, dh] = args.slice(0,8).map(Number);
+    else if (args.length === 4) [dx, dy, dw, dh] = args.map(Number);
+    else { [dx, dy] = args.map(Number); dw = sw; dh = sh; }
+    if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite) || !sw || !sh || !dw || !dh) return;
+    if (sw < 0) { sx += sw; sw = -sw; } if (sh < 0) { sy += sh; sh = -sh; }
+    if (dw < 0) { dx += dw; dw = -dw; } if (dh < 0) { dy += dh; dh = -dh; }
+    if (!source.clean) { _taintedCanvasContexts.add(this); return; }
+    const scaleX = source.w / source.naturalWidth, scaleY = source.h / source.naturalHeight;
+    const left = Math.max(0, Math.floor(dx)), right = Math.min(this._w, Math.ceil(dx + dw));
+    const top = Math.max(0, Math.floor(dy)), bottom = Math.min(this._h, Math.ceil(dy + dh));
+    for (let y = top; y < bottom; y++) {
+      const sourceY = Math.floor((sy + (y + 0.5 - dy) * sh / dh) * scaleY);
+      if (sourceY < 0 || sourceY >= source.h) continue;
+      for (let x = left; x < right; x++) {
+        const sourceX = Math.floor((sx + (x + 0.5 - dx) * sw / dw) * scaleX);
+        if (sourceX < 0 || sourceX >= source.w) continue;
+        const index = (sourceY * source.w + sourceX) * 4;
+        this._setPixel(x, y, source.buf[index], source.buf[index+1], source.buf[index+2], source.buf[index+3]);
       }
     }
     this._markPaintDamage();
@@ -16462,6 +16509,7 @@ HTMLCanvasElement.prototype.getContext = function getContext(type) {
 };
 HTMLCanvasElement.prototype.toDataURL = function(type) {
   const ctx = this._ctx || this.getContext('2d');
+  if (ctx) _assertCanvasOriginClean(ctx);
   if (ctx && ctx._buf) {
     if (ctx._w === 0 || ctx._h === 0) return 'data:,';
     return _encodePNG(ctx._w, ctx._h, ctx._buf);

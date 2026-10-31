@@ -1772,6 +1772,8 @@ pub struct RenderResourceLoad {
     pub url: String,
     pub profile: Option<ImageRequestProfile>,
     pub is_font: bool,
+    /// Document origin allowed to read these pixels after redirect/CORS checks.
+    pub canvas_origin: Option<String>,
     /// Final URL, status, headers and body of the response; `None` when the
     /// request failed or was blocked.
     pub response: Option<RenderResourceResponse>,
@@ -1994,6 +1996,23 @@ fn stylesheet_origin_clean(document_url: &str, response_url: &str) -> bool {
         return false;
     };
     document.origin() == response.origin()
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn canvas_response_origin(
+    document_url: &str,
+    profile: Option<ImageRequestProfile>,
+    response: &Response,
+) -> Option<String> {
+    let origin = url::Url::parse(document_url).ok()?.origin();
+    let serialized = origin.ascii_serialization();
+    if serialized == "null" { return None; }
+    let cors = matches!(profile, Some(ImageRequestProfile::CorsSameOrigin | ImageRequestProfile::CorsInclude));
+    if !cors && (response.url.origin() != origin
+        || response.redirected_from.iter().any(|url| url.origin() != origin)) {
+        return None;
+    }
+    Some(serialized)
 }
 
 /// Install host-fetched CSS without manufacturing a page-visible `<style>`.
@@ -5196,6 +5215,30 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_readback_requires_clean_redirect_chain_or_validated_cors() {
+        use super::ImageRequestProfile::{CorsInclude, CorsSameOrigin, NoCorsInclude};
+        for (profile, final_url, redirected, expected) in [
+            (None, "https://app.test/image", false, true),
+            (Some(NoCorsInclude), "https://cdn.test/image", false, false),
+            (Some(NoCorsInclude), "https://app.test/image", true, false),
+            (Some(CorsSameOrigin), "https://cdn.test/image", true, true),
+            (Some(CorsInclude), "https://cdn.test/image", false, true),
+        ] {
+            let response = obscura_net::Response {
+                url: url::Url::parse(final_url).unwrap(), status: 200,
+                headers: Default::default(), body: Vec::new(),
+                redirected_from: if redirected { vec![url::Url::parse("https://cdn.test/redirect").unwrap()] } else { vec![] },
+            };
+            assert_eq!(super::canvas_response_origin("https://app.test/page", profile, &response),
+                expected.then(|| "https://app.test".to_string()), "{profile:?} {final_url} {redirected}");
+            for invalid_document in ["not a URL", "about:blank"] {
+                assert_eq!(super::canvas_response_origin(invalid_document, profile, &response), None);
+            }
+        }
+    }
+
     // #967 — a redirect must not forward the caller's credentials to a
     // different origin, and a 301/302/303 GET downgrade drops the body headers.
     #[test]
@@ -8125,6 +8168,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
+        ops.push(op_canvas_image_pixels());
         ops.push(op_load_image_metadata());
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
@@ -8779,6 +8823,33 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool, frame_id: u3
     cached_image_metadata_for_node(&gs, node_id)
 }
 
+/// Cache-only image pixels: 0 unavailable, 1 clean, 2 opaque (no bytes copied).
+/// The wrapper's native owner selects the live frame; page fields cannot name it.
+#[cfg(feature = "render")]
+#[op2(nofast)]
+fn op_canvas_image_pixels(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    nid: u32,
+    width: u32,
+    height: u32,
+    #[buffer] out: &mut [u8],
+) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let frame = crate::node_transfer::owner_frame(scope, state, receiver)?;
+        let shared = live_import_state(state, frame)?;
+        let gs = shared.try_borrow().ok()?;
+        let dom = gs.dom.as_ref()?;
+        let node = NodeId::new(nid);
+        if dom.get_node(node)?.as_element()?.local.as_ref() != "img" { return None; }
+        let base_url = document_base_url(&gs);
+        gs.render_resources.cached_image_element_rgba(
+            dom, node, gs.viewport, base_url.as_deref(), &gs.url, width, height, out,
+        ).map(|clean| if clean { 1 } else { 2 })
+    })).ok().flatten().unwrap_or(0)
+}
+
 /// Compatibility path for standalone render runtimes which deliberately
 /// install an in-memory `RenderResourceLoader` but have no owning page
 /// transport. Browser pages install their transport before page script runs;
@@ -9006,6 +9077,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
         response = fetch => response,
         _ = cancel_rx => None,
     };
+    let canvas_origin = response.as_ref().and_then(|response| {
+        canvas_response_origin(&shared.borrow().url, Some(request_profile), response)
+    });
     let bytes = response.and_then(|response| {
         (200..300)
             .contains(&response.status)
@@ -9022,6 +9096,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32, frame_id:
                             request_profile,
                             bytes,
                         );
+                        gs.render_resources.set_image_canvas_origin(&selected_url, request_profile, canvas_origin);
                         // The leader owns the unknown-to-known cache
                         // transition. Followers only observe this result and
                         // must not invalidate the retained render again.
