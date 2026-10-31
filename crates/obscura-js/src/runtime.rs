@@ -18300,7 +18300,7 @@ mod tests {
         assert_eq!(rt.evaluate(r#"(() => {
             const context = document.createElement('canvas').getContext('2d');
             context.drawImage(new Image(),0,0); return context.getImageData(0,0,1,1).data[3];
-        })()"#).unwrap(), serde_json::json!(0));
+        })()"#).unwrap(), serde_json::json!(0.0));
         for kind in ["image", "canvas"] {
             for arguments in ["1,1", "1,1,2,2", "0,0,size,size,1,1,2,2"] {
                 let script = format!(r#"(() => {{
@@ -18319,7 +18319,7 @@ mod tests {
                     serde_json::json!([[0,70,139,255],[0,0,0,0]]), "{kind}: {arguments}");
             }
         }
-        rt.evaluate("globalThis.brokenImage = new Image(); brokenImage.src = 'data:image/png;base64,AAAA'; void brokenImage.complete").unwrap();
+        rt.execute_script("broken-canvas-image", "globalThis.brokenImage = new Image(); brokenImage.src = 'data:image/png;base64,AAAA'; void brokenImage.complete").unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(rt.evaluate("[brokenImage.complete,brokenImage.naturalWidth]").unwrap(), serde_json::json!([true,0]));
         assert!(rt.evaluate("document.createElement('canvas').getContext('2d').drawImage(brokenImage,0,0)")
@@ -18534,7 +18534,7 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load"]])
         );
-        rt.evaluate(r#"globalThis.opaqueCanvas = document.createElement('canvas');
+        rt.execute_script("draw-opaque-canvas-image", r#"globalThis.opaqueCanvas = document.createElement('canvas');
             opaqueCanvas.getContext('2d').drawImage(image,0,0);"#).unwrap();
         for readback in ["opaqueCanvas.getContext('2d').getImageData(0,0,1,1)", "opaqueCanvas.toDataURL()"] {
             assert!(rt.evaluate(readback).unwrap_err().contains("SecurityError"));
@@ -18543,8 +18543,8 @@ mod tests {
             const context = document.createElement('canvas').getContext('2d');
             context.drawImage(opaqueCanvas,0,0); return context.getImageData(0,0,1,1);
         })()"#).unwrap_err().contains("SecurityError"));
-        assert_eq!(rt.evaluate(r#"opaqueCanvas.width = 1;
-            opaqueCanvas.getContext('2d').getImageData(0,0,1,1).data[3]"#).unwrap(), serde_json::json!(0));
+        assert_eq!(rt.evaluate(r#"(() => { opaqueCanvas.width = 1;
+            return opaqueCanvas.getContext('2d').getImageData(0,0,1,1).data[3]; })()"#).unwrap(), serde_json::json!(0.0));
 
         rt.execute_script(
             "require-anonymous-cors",
@@ -18583,7 +18583,7 @@ mod tests {
         assert_eq!(rt.evaluate(r#"(() => {
             const context = document.createElement('canvas').getContext('2d');
             context.drawImage(image,0,0); return context.getImageData(0,0,1,1).data[3];
-        })()"#).unwrap(), serde_json::json!(255));
+        })()"#).unwrap(), serde_json::json!(255.0));
 
         rt.execute_script(
             "require-credentialed-cors",
