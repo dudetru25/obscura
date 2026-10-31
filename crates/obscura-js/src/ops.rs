@@ -2324,12 +2324,25 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             state.activity_generation = state.activity_generation.wrapping_add(1);
         }
         #[cfg(feature = "render")]
-        // Native text values and indeterminate checkbox marks are consumed
+        // Native input values and indeterminate checkbox marks are consumed
         // directly by paint. They do not participate in the selector surface
         // or intrinsic control sizing, so keep the existing geometry. Checked
         // state is deliberately excluded because `:checked` can affect style.
-        let invalidate_geometry =
-            invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        // A dirty `<textarea>` value is shaped as the element's own text,
+        // so its value writes need fresh geometry.
+        let invalidate_geometry = invalidate
+            && match cmd.as_str() {
+                "set_form_indeterminate" => false,
+                "set_form_value" => arg1.parse::<u32>().ok().is_some_and(|target| {
+                    state.dom.as_ref().and_then(|dom| {
+                        dom.with_node(NodeId::new(target), |node| {
+                            node.as_element()
+                                .is_some_and(|name| name.local.as_ref() == "textarea")
+                        })
+                    }) == Some(true)
+                }),
+                _ => true,
+            };
         #[cfg(feature = "render")]
         let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
             state.dom.as_ref().and_then(|dom| {

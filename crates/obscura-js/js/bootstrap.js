@@ -5049,7 +5049,9 @@ class Element extends Node {
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
     if (_formValues[this._nid] !== undefined) return _sanitizeEmailValue(this, _formValues[this._nid]);
-    if (tag === 'textarea') return this.textContent;
+    // A pristine textarea's raw value follows its child text (defaultValue);
+    // the API value normalizes CRLF and CR to LF.
+    if (tag === 'textarea') return this.textContent.replace(/\r\n?/g, '\n');
     if (tag === 'option') {
       const attr = this.getAttribute('value');
       return attr !== null ? attr : this.textContent;
@@ -5099,12 +5101,12 @@ class Element extends Node {
       }
       return;
     }
-    const value = _sanitizeEmailValue(this, String(v));
+    // A textarea's dirty value is native form state, painted from layout; its
+    // child text stays the default value.
+    const text = String(v);
+    const value = tag === 'textarea' ? text.replace(/\r\n?/g, '\n') : _sanitizeEmailValue(this, text);
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
-    if (tag === 'textarea') {
-      this.textContent = value;
-    }
   }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
@@ -5628,7 +5630,7 @@ class Element extends Node {
         const opt = f.querySelector('option[selected]') || f.querySelector('option');
         val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
       } else if (tag === 'textarea') {
-        val = f.value || f.textContent || '';
+        val = f.value;
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
@@ -14336,6 +14338,12 @@ globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = class HTMLInputElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+  // The defaults reflect the content attributes. A pristine control follows
+  // them; a dirty value or checkedness stays in native form state.
+  get defaultValue() { const v = this.getAttribute('value'); return v === null ? '' : v; }
+  set defaultValue(v) { this.setAttribute('value', String(v)); }
+  get defaultChecked() { return this.hasAttribute('checked'); }
+  set defaultChecked(v) { if (v) this.setAttribute('checked', ''); else this.removeAttribute('checked'); }
 };
 // Framework value trackers read own prototype descriptors, not inherited ones.
 Object.defineProperties(HTMLInputElement.prototype, {
@@ -14384,6 +14392,10 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
     return Number.isFinite(v) && v > 0 ? v : 20;
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
+  // The default value is the child text (raw, without newline
+  // normalization). It is a DOMString, so null and undefined stringify.
+  get defaultValue() { return this.textContent; }
+  set defaultValue(v) { this.textContent = String(v); }
 };
 globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {

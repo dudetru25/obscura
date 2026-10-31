@@ -9955,6 +9955,27 @@ fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     children
 }
 
+/// Borrow a dirty HTML `<textarea>`'s live value: the text its inline
+/// formatting context shapes in place of the default child text.
+pub(crate) fn dirty_textarea_value<R>(
+    tree: &DomTree,
+    id: NodeId,
+    f: impl FnOnce(&str) -> R,
+) -> Option<R> {
+    let is_html_textarea = tree
+        .with_node(id, |node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                    && name.local.as_ref() == "textarea"
+            })
+        })
+        .unwrap_or(false);
+    if !is_html_textarea {
+        return None;
+    }
+    tree.with_form_control_value(id, f)
+}
+
 /// Resolve the named-slot assignment for one `<slot>` in a native shadow tree.
 ///
 /// Slot names are exact strings (the empty string is the default slot), and
@@ -9974,17 +9995,25 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         return assigned_or_fallback;
     }
 
-    // Box-tree traversal needs only this predicate, not an owned copy of the
-    // node's text and attributes.
-    let Some(is_closed_html_details) = tree.with_node(id, |node| {
-        node.as_element().is_some_and(|name| {
-            name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-                && name.local.as_ref() == "details"
-                && node.get_attribute("open").is_none()
+    // Box-tree traversal needs only these predicates, not an owned copy of
+    // the node's text and attributes.
+    let Some((is_closed_html_details, is_html_textarea)) = tree.with_node(id, |node| {
+        node.as_element().map_or((false, false), |name| {
+            let html = name.ns.as_ref() == "http://www.w3.org/1999/xhtml";
+            (
+                html && name.local.as_ref() == "details" && node.get_attribute("open").is_none(),
+                html && name.local.as_ref() == "textarea",
+            )
         })
     }) else {
         return Vec::new();
     };
+    // A dirty <textarea> shows its live value, not its child text (the
+    // default value). The value is shaped as the element's own inline text
+    // (see `dirty_textarea_value`), so the child text generates no boxes.
+    if is_html_textarea && tree.with_form_control_value(id, |_| ()).is_some() {
+        return Vec::new();
+    }
     if !is_closed_html_details {
         return tree.children(id);
     }
@@ -13363,7 +13392,11 @@ fn build(
     let is_closed_html_details = _name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
         && _name.local.as_ref() == "details"
         && !is_open;
-    if !is_closed_html_details && !ifc_items.float_aware_blocks.contains(&id) {
+    if !is_closed_html_details
+        && (!ifc_items.float_aware_blocks.contains(&id)
+            || (_name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && _name.local.as_ref() == "textarea"))
+    {
         if let Some(item) = engine.try_build(tree, id, styles) {
             if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
                 // A pure-text block is still a fill-available block. Its shaped

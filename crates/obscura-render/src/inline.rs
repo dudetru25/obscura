@@ -1414,15 +1414,31 @@ impl TextEngine {
         let ctx = base_span_ctx(base, font, &mut collector);
         let line_height = ctx.line_height;
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
-        collect_spans(
-            tree,
-            id,
-            styles,
-            ctx,
-            &mut spans,
-            &mut collector,
-            &self.loaded_families,
-        );
+        // A dirty <textarea> renders its live value, not its default text
+        // children, through this same shaped path.
+        if crate::dom::dirty_textarea_value(tree, id, |value| {
+            push_text(
+                value,
+                ctx.transform,
+                ctx.white_space,
+                &span_attrs(&ctx),
+                &mut spans,
+                &mut collector,
+                None,
+            )
+        })
+        .is_none()
+        {
+            collect_spans(
+                tree,
+                id,
+                styles,
+                ctx,
+                &mut spans,
+                &mut collector,
+                &self.loaded_families,
+            );
+        }
         self.push_shaped_item(
             base,
             line_height,
@@ -2662,6 +2678,32 @@ fn collect_spans(
     }
 }
 
+/// Text attributes a span inherits from its formatting context.
+fn span_attrs(ctx: &SpanCtx) -> SpanAttrs {
+    SpanAttrs {
+        font_size: ctx.font_size,
+        line_height: ctx.line_height,
+        letter_spacing: ctx.letter_spacing,
+        word_spacing: ctx.word_spacing,
+        letter_spacing_non_normal: ctx.letter_spacing_non_normal,
+        weight: ctx.weight,
+        optical_sizing: ctx.optical_sizing,
+        font_id: ctx.font_id,
+        variations: ctx.variations.clone(),
+        italic: ctx.italic,
+        synthetic_italic: ctx.synthetic_italic,
+        underline: ctx.underline,
+        overline: ctx.overline,
+        line_through: ctx.line_through,
+        color: ctx.color,
+        family: Arc::clone(&ctx.family),
+        clip_fill: ctx.clip_fill,
+        white_space: ctx.white_space,
+        overflow_wrap: ctx.overflow_wrap,
+        word_break: ctx.word_break,
+    }
+}
+
 /// Collect the spans contributed by one node (a text node's runs, or an
 /// element's whole subtree with its style threaded through). Split out of
 /// [`collect_spans`] so an inline *run* (a slice of siblings, not a whole
@@ -2680,29 +2722,15 @@ fn collect_node_spans(
     };
     match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
-            let attrs = SpanAttrs {
-                font_size: ctx.font_size,
-                line_height: ctx.line_height,
-                letter_spacing: ctx.letter_spacing,
-                word_spacing: ctx.word_spacing,
-                letter_spacing_non_normal: ctx.letter_spacing_non_normal,
-                weight: ctx.weight,
-                optical_sizing: ctx.optical_sizing,
-                font_id: ctx.font_id,
-                variations: ctx.variations.clone(),
-                italic: ctx.italic,
-                synthetic_italic: ctx.synthetic_italic,
-                underline: ctx.underline,
-                overline: ctx.overline,
-                line_through: ctx.line_through,
-                color: ctx.color,
-                family: Arc::clone(&ctx.family),
-                clip_fill: ctx.clip_fill,
-                white_space: ctx.white_space,
-                overflow_wrap: ctx.overflow_wrap,
-                word_break: ctx.word_break,
-            };
-            push_text(contents, ctx.transform, ctx.white_space, &attrs, out, c, Some(cid));
+            push_text(
+                contents,
+                ctx.transform,
+                ctx.white_space,
+                &span_attrs(&ctx),
+                out,
+                c,
+                Some(cid),
+            );
         }
         _ => {
             let Some(elem) = node.as_element() else {
@@ -3312,13 +3340,22 @@ fn is_pure_text_ifc(
         || style.is_inline_block
         || (style.display == Display::Flex
             && style.flex_direction == Some(taffy::FlexDirection::Column));
-    if !flow {
+    // The control's inner text flow is independent of its outer display.
+    if !flow
+        && !tree.with_node(id, |node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                    && name.local.as_ref() == "textarea"
+            })
+        }).unwrap_or(false)
+    {
         return false;
     }
     let mut has_text = false;
     let children = crate::dom::rendered_children(tree, id);
     if children.is_empty() {
-        return false;
+        return crate::dom::dirty_textarea_value(tree, id, |value| !value.trim().is_empty())
+            .unwrap_or(false);
     }
     for cid in &children {
         if !inline_child_ok(tree, *cid, styles, &mut has_text) {

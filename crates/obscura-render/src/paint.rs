@@ -5483,21 +5483,32 @@ fn paint_laid_dom_scrolled(
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
         if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
-            let live_value = tree
-                .form_control_state(nid)
-                .and_then(|control| control.value);
+            let is_textarea = name.local.as_ref() == "textarea";
+            // Only an `<input>` paints its value here, so only it copies one.
+            let live_value = if is_textarea {
+                None
+            } else {
+                tree.form_control_state(nid).and_then(|control| control.value)
+            };
             let value = live_value
                 .as_deref()
                 .or_else(|| node.get_attribute("value"));
-            let has_value = value.is_some_and(|v| !v.is_empty())
-                || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+            // A `<textarea>` value is its live state once dirty, else its child
+            // text; its `value` attribute means nothing.
+            let has_value = if is_textarea {
+                tree.with_form_control_value(nid, |value| !value.is_empty())
+                    .unwrap_or_else(|| !tree.text_content(nid).is_empty())
+            } else {
+                value.is_some_and(|v| !v.is_empty())
+            };
             // A text `<input>`'s value is not a DOM text node either, so it
             // needs painting from its live state, falling back to the attribute.
             // Without this the
             // control renders empty however it was filled in — from markup,
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
-            // `<textarea>` is unaffected: its value *is* a text node.
+            // `<textarea>` text is shaped as the element's own inline text
+            // instead: its child text while pristine, else its live value.
             if has_value && name.local.as_ref() == "input" {
                 if let Some(value) = value {
                     if !value.is_empty() {

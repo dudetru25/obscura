@@ -495,6 +495,17 @@ impl DomTree {
             == Some(value)
     }
 
+    /// Borrow the live value once script or input set it (the dirty value
+    /// flag). `None` means the control still shows its default.
+    pub fn with_form_control_value<R>(&self, node: NodeId, f: impl FnOnce(&str) -> R) -> Option<R> {
+        self.inner
+            .borrow()
+            .form_controls
+            .get(&node)
+            .and_then(|control| control.value.as_deref())
+            .map(f)
+    }
+
     pub fn form_control_checked(&self, node: NodeId) -> Option<bool> {
         self.inner
             .borrow()
