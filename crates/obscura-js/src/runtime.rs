@@ -18322,7 +18322,7 @@ mod tests {
         rt.execute_script("broken-canvas-image", "globalThis.brokenImage = new Image(); brokenImage.src = 'data:image/png;base64,AAAA'; void brokenImage.complete").unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(rt.evaluate("[brokenImage.complete,brokenImage.naturalWidth]").unwrap(), serde_json::json!([true,0]));
-        assert!(rt.evaluate("document.createElement('canvas').getContext('2d').drawImage(brokenImage,0,0)")
+        assert!(rt.evaluate_script("document.createElement('canvas').getContext('2d').drawImage(brokenImage,0,0)")
             .unwrap_err().contains("InvalidStateError"));
     }
 
@@ -18537,9 +18537,9 @@ mod tests {
         rt.execute_script("draw-opaque-canvas-image", r#"globalThis.opaqueCanvas = document.createElement('canvas');
             opaqueCanvas.getContext('2d').drawImage(image,0,0);"#).unwrap();
         for readback in ["opaqueCanvas.getContext('2d').getImageData(0,0,1,1)", "opaqueCanvas.toDataURL()"] {
-            assert!(rt.evaluate(readback).unwrap_err().contains("SecurityError"));
+            assert!(rt.evaluate_script(readback).unwrap_err().contains("SecurityError"));
         }
-        assert!(rt.evaluate(r#"(() => {
+        assert!(rt.evaluate_script(r#"(() => {
             const context = document.createElement('canvas').getContext('2d');
             context.drawImage(opaqueCanvas,0,0); return context.getImageData(0,0,1,1);
         })()"#).unwrap_err().contains("SecurityError"));
