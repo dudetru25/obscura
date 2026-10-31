@@ -16247,7 +16247,8 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
-  drawImage(image, ...args) {
+  drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh) {
+    const args = Array.prototype.slice.call(arguments, 1);
     if (args.length !== 2 && args.length !== 4 && args.length < 8) {
       throw new TypeError('drawImage requires 3, 5 or 9 arguments.');
     }
@@ -16262,7 +16263,7 @@ class _Canvas2D {
     } else {
       return;
     }
-    let sx = 0, sy = 0, sw = source.naturalWidth, sh = source.naturalHeight, dx, dy, dw, dh;
+    sx = 0; sy = 0; sw = source.naturalWidth; sh = source.naturalHeight;
     if (args.length >= 8) [sx, sy, sw, sh, dx, dy, dw, dh] = args.slice(0,8).map(Number);
     else if (args.length === 4) [dx, dy, dw, dh] = args.map(Number);
     else { [dx, dy] = args.map(Number); dw = sw; dh = sh; }
