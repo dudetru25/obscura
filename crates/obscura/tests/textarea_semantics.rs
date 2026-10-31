@@ -261,10 +261,13 @@ async fn textarea_paints_dirty_value_over_default_changes() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = spawn_server();
 
-    let browser = Browser::new().unwrap();
-    let mut page = browser.new_page().await.unwrap();
-    page.goto(&base).await.unwrap();
+    let context = std::sync::Arc::new(obscura_browser::BrowserContext::new(
+        "textarea-paint".to_string(),
+    ));
+    let mut page = obscura_browser::Page::new("textarea-paint".to_string(), context);
     let viewport = (400.0, 400.0);
+    page.set_viewport(viewport);
+    page.navigate(&base).await.unwrap();
 
     let pristine = page.screenshot(viewport).expect("pristine screenshot");
     page.evaluate("document.getElementById('t').value = 'abc'");
