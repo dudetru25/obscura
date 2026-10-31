@@ -18274,6 +18274,40 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_draw_image_uses_cached_svg_pixels_and_overloads() {
+        use base64::Engine as _;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4" viewBox="0 0 100 100"><defs><style>.mark{fill:#00468b}</style></defs><rect class="mark" width="100" height="100"/></svg>"##;
+        let source = base64::engine::general_purpose::STANDARD.encode(svg);
+        let mut rt = parser_image_runtime(
+            &format!(r#"<img id="image" src="data:image/svg+xml;base64,{source}">"#),
+            |_url: &str| panic!("canvas must not fetch an uncached image"),
+        );
+        rt.evaluate("void document.getElementById('image').complete").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("(() => { const image=document.getElementById('image'); return [image.complete,image.naturalWidth,image.naturalHeight]; })()").unwrap(),
+            serde_json::json!([true, 4, 4]));
+        for kind in ["image", "canvas"] {
+            for arguments in ["1,1", "1,1,2,2", "0,0,size,size,1,1,2,2"] {
+                let script = format!(r#"(() => {{
+                    let source = document.getElementById('image');
+                    if ('{kind}' === 'canvas') {{
+                        source = document.createElement('canvas'); source.width = source.height = 2;
+                        const paint = source.getContext('2d'); paint.fillStyle = '#00468b'; paint.fillRect(0,0,2,2);
+                    }}
+                    const size = source.naturalWidth || source.width;
+                    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 4;
+                    const context = canvas.getContext('2d'); context.drawImage(source,{arguments});
+                    return [Array.from(context.getImageData(2,2,1,1).data),
+                        Array.from(context.getImageData(0,0,1,1).data)];
+                }})()"#);
+                assert_eq!(rt.evaluate(&script).unwrap(),
+                    serde_json::json!([[0,70,139,255],[0,0,0,0]]), "{kind}: {arguments}");
+            }
+        }
+    }
+
+    #[cfg(feature = "render")]
     fn two_by_three_png() -> Vec<u8> {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
@@ -18481,6 +18515,11 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load"]])
         );
+        assert!(rt.evaluate(r#"(() => {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d'); context.drawImage(image,0,0);
+            return context.getImageData(0,0,1,1);
+        })()"#).unwrap_err().contains("SecurityError"));
 
         rt.execute_script(
             "require-anonymous-cors",
@@ -18516,6 +18555,10 @@ mod tests {
                 .unwrap(),
             serde_json::json!([true, 2, ["load", "error", "load", "load"]])
         );
+        assert_eq!(rt.evaluate(r#"(() => {
+            const context = document.createElement('canvas').getContext('2d');
+            context.drawImage(image,0,0); return context.getImageData(0,0,1,1).data[3];
+        })()"#).unwrap(), serde_json::json!(255));
 
         rt.execute_script(
             "require-credentialed-cors",
