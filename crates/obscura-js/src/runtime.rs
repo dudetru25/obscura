@@ -10470,6 +10470,37 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_exposes_used_grid_tracks_and_invalidates() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html(r#"<!doctype html><style>
+            #grid { display:grid; width:320px; grid-template-columns:repeat(3,minmax(0,1fr));
+                    grid-template-rows:repeat(2,40px); gap:5px 10px }
+            #empty { display:grid }
+        </style><body><div id=grid><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <div id=plain></div><div id=empty></div></body>"#));
+        rt.set_viewport(700.0, 200.0);
+        rt.run_page_init();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const grid = document.getElementById('grid');
+            const style = getComputedStyle(grid);
+            const display = style.display;
+            const columns = style.gridTemplateColumns;
+            const rows = style.getPropertyValue('grid-template-rows');
+            grid.style.width = '620px';
+            const updated = style.getPropertyValue('grid-template-columns');
+            const plain = getComputedStyle(document.getElementById('plain'));
+            const empty = getComputedStyle(document.getElementById('empty'));
+            return [display, columns, rows, updated,
+                plain.gridTemplateColumns, plain.gridTemplateRows,
+                empty.gridTemplateColumns, empty.gridTemplateRows];
+        })()"#).unwrap(), serde_json::json!([
+            "grid", "100px 100px 100px", "40px 40px", "200px 200px 200px",
+            "none", "none", "none", "none"
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
         let dom = parse_html(
             r#"<html><head><style>
