@@ -16928,22 +16928,30 @@ mod tests {
             ContainerLayoutTermination::GeometryStable
         );
 
-        // Units can first become active after a query-enabled pass. The
-        // decision signature can stabilize before their geometry does.
-        let tree = parse_html(
-            r#"<style>
-                #outer { container-type:inline-size; width:500px }
-                #inner { container-type:inline-size }
-                @container (width > 400px) { #inner { width:250px } }
-                @container (width > 100px) { #late { height:10cqi } }
-            </style><div id="outer"><div id="inner"><div id="late"></div></div></div>"#,
-        );
-        let (laid, telemetry) =
-            layout_dom_with_web_fonts_measured(&tree, (1280.0, 720.0), &HashMap::new(), &[]);
-        let target = tree.get_element_by_id("late").unwrap();
-        assert!((laid.rects[&target].height - 25.0).abs() < 0.1);
-        assert_eq!(telemetry.passes, 4);
-        assert_eq!(telemetry.termination, ContainerLayoutTermination::GeometryStable);
+        // Pass 3 resolves 10cqi against the inner box's final 250px width.
+        // Inline-size snapshots ignore the changed block size. A size
+        // container records that height and needs one more stable pass;
+        // unchanged query decisions alone cannot end that case early.
+        for (late_style, expected_passes) in [("", 3), ("container-type:size; width:1px", 4)] {
+            let tree = parse_html(&format!(
+                r#"<style>
+                    #outer {{ container-type:inline-size; width:500px }}
+                    #inner {{ container-type:inline-size }}
+                    #late {{ {late_style} }}
+                    @container (width > 400px) {{ #inner {{ width:250px }} }}
+                    @container (width > 100px) {{ #late {{ height:10cqi }} }}
+                </style><div id="outer"><div id="inner"><div id="late"></div></div></div>"#,
+            ));
+            let (laid, telemetry) =
+                layout_dom_with_web_fonts_measured(&tree, (1280.0, 720.0), &HashMap::new(), &[]);
+            let target = tree.get_element_by_id("late").unwrap();
+            assert!((laid.rects[&target].height - 25.0).abs() < 0.1, "{late_style}");
+            assert_eq!(telemetry.passes, expected_passes, "{late_style}");
+            assert_eq!(
+                telemetry.termination,
+                ContainerLayoutTermination::GeometryStable
+            );
+        }
     }
 
     #[test]
