@@ -334,8 +334,436 @@ async fn navigation_without_script_fetch_is_unaffected() {
     );
 }
 
+// EventSource fixture: streams stay open until a test barrier releases the
+// next write, so delivery before EOF is observable.
+#[derive(Default)]
+struct StreamFixture {
+    requests: std::sync::Mutex<Vec<String>>,
+    send_data: tokio::sync::Notify,
+    connected: tokio::sync::Notify,
+    send_change: tokio::sync::Notify,
+    after_close: tokio::sync::Notify,
+    stream_closed: tokio::sync::Notify,
+}
+
+impl StreamFixture {
+    fn record(&self, entry: String) {
+        self.requests.lock().unwrap().push(entry);
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    // Records whether the client closed the stream connection.
+    async fn record_peer_close(&self, socket: &mut tokio::net::TcpStream, path: &str) {
+        let mut buffer = [0u8; 256];
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while matches!(socket.read(&mut buffer).await, Ok(length) if length > 0) {}
+        }).await;
+        self.record(format!("{path} {}", if closed.is_ok() { "closed" } else { "still open after 10s" }));
+        self.stream_closed.notify_one();
+    }
+}
+
+async fn read_request_head(socket: &mut tokio::net::TcpStream) -> (String, String, std::collections::HashMap<String, String>) {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+        let length = socket.read(&mut chunk).await.unwrap();
+        assert!(length > 0, "fixture request headers must complete");
+        bytes.extend_from_slice(&chunk[..length]);
+        assert!(bytes.len() <= 16_384, "fixture request headers are bounded");
+    }
+    let request = String::from_utf8(bytes).unwrap();
+    let mut request_line = request.lines().next().unwrap().split_whitespace();
+    let method = request_line.next().unwrap().to_string();
+    let path = request_line.next().unwrap().to_string();
+    let headers = request.lines().skip(1).filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string())).collect();
+    (method, path, headers)
+}
+
+async fn serve_event_streams() -> (String, u16, std::sync::Arc<StreamFixture>) {
+    const STREAM_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    const CORS_STREAM_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fixture = std::sync::Arc::new(StreamFixture::default());
+    let server = fixture.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let fixture = server.clone();
+            tokio::spawn(async move {
+                let (method, path, headers) = read_request_head(&mut socket).await;
+                let last_event_id = headers.get("last-event-id");
+                if method == "OPTIONS" {
+                    fixture.record(format!("OPTIONS {path}"));
+                    socket.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: last-event-id, x-probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    return;
+                }
+                if path != "/" && path != "/next" {
+                    fixture.record(match last_event_id {
+                        Some(id) => format!("{path} last-event-id={id}"),
+                        None => path.clone(),
+                    });
+                }
+                let reply = |status: u16, content_type: &str, body: &str| format!(
+                    "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len());
+                match path.as_str() {
+                    "/sse" => {
+                        // Headers arrive alone, so `open` must not wait for data.
+                        socket.write_all(STREAM_HEAD.as_bytes()).await.unwrap();
+                        fixture.send_data.notified().await;
+                        socket.write_all(b": open\n\ndata: hello\n\nevent: ready\nid: r1\ndata: go\n\n").await.unwrap();
+                        fixture.send_change.notified().await;
+                        socket.write_all(b"event: change\ndata: next\n\n").await.unwrap();
+                        fixture.after_close.notified().await;
+                        // The client may already have reset the closed stream.
+                        let _ = socket.write_all(b"event: late\ndata: late\n\n").await;
+                        fixture.record_peer_close(&mut socket, "/sse").await;
+                    }
+                    "/frame-hold" => {
+                        fixture.connected.notify_one();
+                        fixture.record_peer_close(&mut socket, "/frame-hold").await;
+                    }
+                    "/frame-sse" => {
+                        socket.write_all(format!("{CORS_STREAM_HEAD}retry: 1\ndata: one\n\n").as_bytes()).await.unwrap();
+                        fixture.record_peer_close(&mut socket, "/frame-sse").await;
+                    }
+                    "/sse-navigate" => {
+                        socket.write_all(format!("{STREAM_HEAD}event: ready\ndata: go\n\n").as_bytes()).await.unwrap();
+                        fixture.record_peer_close(&mut socket, "/sse-navigate").await;
+                    }
+                    "/reconnect" if last_event_id.is_none() => {
+                        socket.write_all(format!("{STREAM_HEAD}\u{feff}: comment\r\nretry: 1\r\nid: a1\r\ndata: line1\rdata: line2\r\n\r\n").as_bytes()).await.unwrap();
+                        socket.write_all(b"data: caf\xC3").await.unwrap();
+                        socket.write_all(b"\xA9\n\nid: bad\0x\ndata: nul\n\ndata: partial").await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }
+                    "/reconnect" => {
+                        socket.write_all(format!("{STREAM_HEAD}data: second\n\n").as_bytes()).await.unwrap();
+                        fixture.record_peer_close(&mut socket, "/reconnect").await;
+                    }
+                    "/cors-reconnect" if last_event_id.is_none() => {
+                        socket.write_all(format!("{CORS_STREAM_HEAD}id: c1\nretry: 1\ndata: first\n\n").as_bytes()).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }
+                    "/cors-reconnect" => {
+                        socket.write_all(format!("{CORS_STREAM_HEAD}data: second\n\n").as_bytes()).await.unwrap();
+                        fixture.record_peer_close(&mut socket, "/cors-reconnect").await;
+                    }
+                    "/cors-preflight" => socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 8\r\nConnection: close\r\n\r\napproved").await.unwrap(),
+                    "/status" => socket.write_all(reply(500, "text/event-stream", "data: x\n\n").as_bytes()).await.unwrap(),
+                    "/mime" => socket.write_all(reply(200, "text/plain", "data: x\n\n").as_bytes()).await.unwrap(),
+                    "/cors" | "/blocked" => socket.write_all(format!("{STREAM_HEAD}data: x\n\n").as_bytes()).await.unwrap(),
+                    "/api/during" => socket.write_all(reply(200, "text/plain", "during").as_bytes()).await.unwrap(),
+                    "/api/refetch" => socket.write_all(reply(200, "text/plain", "refetched").as_bytes()).await.unwrap(),
+                    "/api/after-close" => {
+                        fixture.after_close.notify_one();
+                        fixture.stream_closed.notified().await;
+                        socket.write_all(reply(200, "text/plain", "after").as_bytes()).await.unwrap();
+                    }
+                    _ => socket.write_all(reply(200, "text/html", "<html><body>events</body></html>").as_bytes()).await.unwrap(),
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/"), addr.port(), fixture)
+}
+
+async fn event_stream_page(base: &str, session: &str) -> CdpContext {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    ctx.sessions.insert(session.to_string(), page);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"load"}), session).await;
+    ctx
+}
+
+// A bounded wait for a page promise. A timeout reports what the fixture
+// server saw, which names the missing stream step.
+async fn await_page(ctx: &mut CdpContext, id: u64, expression: &str, session: &str, fixture: &StreamFixture) -> Value {
+    let response = dispatch(&CdpRequest {
+        id, method: "Runtime.evaluate".into(), session_id: Some(session.into()),
+        params: json!({"expression":expression,"awaitPromise":true,"returnByValue":true,"timeout":10_000}),
+    }, ctx).await;
+    assert!(response.error.is_none(), "`{expression}` did not settle: {:?}; server saw {:?}", response.error, fixture.requests());
+    response.result.unwrap()["result"]["value"].clone()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn event_source_delivers_before_eof_keeps_fetch_live_and_close_cancels() {
+    let (base, _port, fixture) = serve_event_streams().await;
+    let session = "event-source";
+    let mut ctx = event_stream_page(&base, session).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":r#"
+        globalThis.__log = [];
+        globalThis.__reported = [];
+        globalThis.reportError = (error) => __reported.push(error.message);
+        globalThis.__source = new EventSource('/sse');
+        __source.onopen = (event) => {
+            __log.push('open:' + event.target.readyState + ':' + (event.currentTarget === __source));
+            throw new Error('event-source-handler');
+        };
+        __source.addEventListener('open', () => { throw new Error('event-source-listener'); });
+        __source.onmessage = (event) => __log.push('message:' + event.data + ':' + (event.target === __source) + ':' + (event.currentTarget === __source));
+        __source.onerror = () => __log.push('error:' + __source.readyState);
+        globalThis.__opened = new Promise((resolve) => __source.addEventListener('open', () => resolve(__log.slice())));
+        globalThis.__ready = new Promise((resolve) => __source.addEventListener('ready', (event) => {
+            __log.push('ready:' + event.data + ':' + event.lastEventId + ':' + (event.origin === location.origin));
+            globalThis.__during = fetch('/api/during').then((response) => response.text())
+                .then((text) => { __log.push('fetch:' + text); resolve(__log.slice()); });
+        }));
+        globalThis.__changed = new Promise((resolve) => __source.addEventListener('change', async (event) => {
+            await __during;
+            __log.push('change:' + event.data + ':' + event.lastEventId);
+            __log.push('refetch:' + await (await fetch('/api/refetch')).text());
+            __source.close();
+            __log.push('closed:' + __source.readyState);
+            __log.push('after:' + await (await fetch('/api/after-close')).text());
+            resolve(__log.slice());
+        }));
+        undefined
+    "#}), session).await;
+
+    // The server has sent only the response headers.
+    let opened = await_page(&mut ctx, 7, "__opened", session, &fixture).await;
+    assert_eq!(fixture.requests(), ["/sse"]);
+    assert_eq!(opened, json!(["open:1:true"]), "open must follow the headers, before any data");
+    let reported = cdp(&mut ctx, 8, "Runtime.evaluate", json!({"expression":"__reported","returnByValue":true}), session).await;
+    assert_eq!(reported["result"]["value"], json!(["event-source-handler", "event-source-listener"]), "callback errors must be reported without stopping later listeners");
+    fixture.send_data.notify_one();
+
+    // The server has sent `ready` and holds the stream open.
+    let ready = await_page(&mut ctx, 3, "__ready", session, &fixture).await;
+    assert_eq!(ready, json!(["open:1:true", "message:hello:true:true", "ready:go:r1:true", "fetch:during"]));
+    assert_eq!(fixture.requests(), ["/sse", "/api/during"], "the stream must still be open");
+    let live = cdp(&mut ctx, 4, "Runtime.evaluate", json!({"expression":"[__source.readyState, 6 * 7]","returnByValue":true}), session).await;
+    assert_eq!(live["result"]["value"], json!([1, 42]), "evaluate must stay live while the stream is open");
+
+    fixture.send_change.notify_one();
+    let changed = await_page(&mut ctx, 5, "__changed", session, &fixture).await;
+    assert_eq!(changed, json!([
+        "open:1:true", "message:hello:true:true", "ready:go:r1:true", "fetch:during",
+        "change:next:r1", "refetch:refetched", "closed:2", "after:after",
+    ]));
+    // /api/after-close answers only after the server saw the stream close.
+    assert_eq!(fixture.requests(), ["/sse", "/api/during", "/api/refetch", "/api/after-close", "/sse closed"]);
+    let after = cdp(&mut ctx, 6, "Runtime.evaluate", json!({"expression":"[__source.readyState, __log.length]","returnByValue":true}), session).await;
+    assert_eq!(after["result"]["value"], json!([2, 8]), "a closed source must not deliver late events");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn event_source_parses_the_stream_and_reconnects_with_last_event_id() {
+    let (base, _port, fixture) = serve_event_streams().await;
+    let session = "event-source-reconnect";
+    let mut ctx = event_stream_page(&base, session).await;
+    let log = await_page(&mut ctx, 2, r#"new Promise((resolve) => {
+        const log = [];
+        const source = new EventSource('/reconnect');
+        source.onopen = () => log.push('open:' + source.readyState);
+        source.onerror = () => log.push('error:' + source.readyState);
+        source.onmessage = (event) => {
+            log.push(event.data + '|' + event.lastEventId);
+            if (event.data === 'second') { source.close(); resolve(log); }
+        };
+    })"#, session, &fixture).await;
+    assert_eq!(log, json!([
+        "open:1", "line1\nline2|a1", "caf\u{e9}|a1", "nul|a1", "error:0", "open:1", "second|a1",
+    ]), "BOM, CR/CRLF, comments, split UTF-8, NUL ids and the incomplete EOF event follow the HTML parser");
+    tokio::time::timeout(std::time::Duration::from_secs(10), fixture.stream_closed.notified()).await
+        .unwrap_or_else(|_| panic!("close must end the reconnected stream; server saw {:?}", fixture.requests()));
+    assert_eq!(fixture.requests(), ["/reconnect", "/reconnect last-event-id=a1", "/reconnect closed"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn event_source_fails_closed_for_status_mime_cors_and_blocked_urls() {
+    let (base, port, fixture) = serve_event_streams().await;
+    let session = "event-source-policy";
+    let mut ctx = event_stream_page(&base, session).await;
+    cdp(&mut ctx, 2, "Network.setBlockedURLs", json!({"urls":["/blocked"]}), session).await;
+    let cases = [
+        ("/status".to_string(), "a non-200 status"),
+        ("/mime".to_string(), "a MIME type other than text/event-stream"),
+        (format!("http://localhost:{port}/cors"), "a cross-origin stream without CORS approval"),
+        ("/blocked".to_string(), "a blocked URL"),
+    ];
+    for (id, (url, reason)) in (3..).zip(cases) {
+        let result = await_page(&mut ctx, id, &format!(r#"new Promise((resolve) => {{
+            const log = [];
+            const source = new EventSource({url:?});
+            source.onopen = () => log.push('open');
+            source.onmessage = () => log.push('message');
+            source.onerror = () => resolve([source.readyState, log]);
+        }})"#), session, &fixture).await;
+        assert_eq!(result, json!([2, []]), "{reason} must fail the connection without reconnecting");
+    }
+    assert_eq!(fixture.requests(), ["/status", "/mime", "/cors"], "blocked URLs must not reach the network");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn navigation_cancels_an_open_event_source() {
+    let (base, _port, fixture) = serve_event_streams().await;
+    let session = "event-source-navigation";
+    let mut ctx = event_stream_page(&base, session).await;
+    let ready = await_page(&mut ctx, 2, r#"new Promise((resolve) => {
+        new EventSource('/sse-navigate').addEventListener('ready', (event) => resolve(event.data));
+    })"#, session, &fixture).await;
+    assert_eq!(ready, "go");
+    cdp(&mut ctx, 3, "Page.navigate", json!({"url":format!("{base}next"),"waitUntil":"load"}), session).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), fixture.stream_closed.notified()).await
+        .unwrap_or_else(|_| panic!("navigation must close the stream; server saw {:?}", fixture.requests()));
+    assert_eq!(fixture.requests(), ["/sse-navigate", "/sse-navigate closed"]);
+}
+
+// The host keeps the old frame realm and its source. Retiring the frame must
+// still close the connecting or open stream and deliver nothing to the realm.
+#[tokio::test(flavor = "current_thread")]
+async fn retiring_a_frame_stops_its_event_source_without_late_callbacks() {
+    let (base, port, fixture) = serve_event_streams().await;
+    let session = "event-source-frame";
+    let mut ctx = event_stream_page(&base, session).await;
+    let cases = [
+        ("/frame-hold", "__frame.remove()", vec![], "removing a frame while its stream waits for headers"),
+        ("/frame-sse", "__frame.src = '/next'", vec!["open:1", "message:1"], "replacing the src of a frame with an open stream"),
+    ];
+    for (id, (path, retire, delivered, reason)) in (10..).step_by(10).zip(cases) {
+        let seen = fixture.requests().len();
+        cdp(&mut ctx, id, "Runtime.evaluate", json!({"expression":format!(r#"
+            globalThis.__frame = document.body.appendChild(document.createElement('iframe'));
+            globalThis.__oldWindow = __frame.contentWindow;
+            globalThis.__oldSource = new __oldWindow.EventSource('http://127.0.0.1:{port}{path}');
+            globalThis.__frameLog = [];
+            for (const type of ['open', 'message', 'error']) {{
+                __oldSource['on' + type] = () => __frameLog.push(type + ':' + __oldSource.readyState);
+            }}
+            globalThis.__delivered = new Promise((resolve) => __oldSource.addEventListener('message', () => resolve(__frameLog.slice())));
+            undefined
+        "#)}), session).await;
+        if delivered.is_empty() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), fixture.connected.notified()).await
+                .unwrap_or_else(|_| panic!("{reason}: the request must arrive; server saw {:?}", fixture.requests()));
+        } else {
+            assert_eq!(await_page(&mut ctx, id + 1, "__delivered", session, &fixture).await, json!(delivered), "{reason}");
+        }
+        cdp(&mut ctx, id + 2, "Runtime.evaluate", json!({"expression":retire}), session).await;
+        // The fixture records "still open after 10s" if the client keeps the stream.
+        tokio::time::timeout(std::time::Duration::from_secs(15), fixture.stream_closed.notified()).await
+            .unwrap_or_else(|_| panic!("{reason}: the fixture must record the stream end; server saw {:?}", fixture.requests()));
+        let during = await_page(&mut ctx, id + 3, "fetch('/api/during').then((response) => response.text())", session, &fixture).await;
+        assert_eq!(during, "during", "{reason}: the page must stay live");
+        assert_eq!(fixture.requests()[seen..], [path.to_string(), format!("{path} closed"), "/api/during".into()],
+            "{reason}: the stream must close without a reconnect");
+        let log = cdp(&mut ctx, id + 4, "Runtime.evaluate", json!({"expression":"__frameLog","returnByValue":true}), session).await;
+        assert_eq!(log["result"]["value"], json!(delivered), "{reason}: the retired realm must get no late events");
+    }
+}
+
+// The CDP server rejects malformed base64 before it resolves an interception.
+// The op's own checks are proven at the resolver seam that server uses.
+#[tokio::test(flavor = "current_thread")]
+async fn fulfilled_event_source_opens_only_for_a_decodable_body_within_the_cap() {
+    use base64::Engine;
+    let (base, _port, fixture) = serve_event_streams().await;
+    let session = "event-source-fulfill";
+    let mut ctx = event_stream_page(&base, session).await;
+    let (intercept_tx, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    ctx.intercept_tx = Some(intercept_tx);
+    cdp(&mut ctx, 2, "Fetch.enable", json!({"patterns":[{"urlPattern":"*/api/fulfilled"}]}), session).await;
+    let encode = |body: &str| base64::engine::general_purpose::STANDARD.encode(body);
+    let cases = [
+        (encode("data: ok\n\n"), None, json!([2, ["open:1", "message:ok"]]), "a decodable fulfilled stream"),
+        ("!!!".to_string(), None, json!([2, []]), "a malformed base64 body"),
+        (encode(&format!("data: {}\n\n", "x".repeat(80))), Some("64"), json!([2, []]), "a decoded body above the cap"),
+    ];
+    for (id, (body_base64, max_body_bytes, expected, reason)) in (3..).zip(cases) {
+        if let Some(max) = max_body_bytes {
+            // The op reads the cap per request. nextest runs each test in its own process.
+            std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", max);
+        }
+        let fulfill = async {
+            let request: obscura_js::ops::InterceptedRequest = intercepted.recv().await
+                .expect("the stream request must reach the interception boundary");
+            assert!(request.resolver.send(obscura_js::ops::InterceptResolution::Fulfill {
+                status: 200,
+                headers: std::collections::HashMap::from([("Content-Type".into(), "text/event-stream".into())]),
+                body: String::new(), body_base64,
+            }).is_ok(), "{reason}: the fulfillment must be delivered");
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(await_page(&mut ctx, id, r#"new Promise((resolve) => {
+                const log = [];
+                const source = new EventSource('/api/fulfilled');
+                source.onopen = () => log.push('open:' + source.readyState);
+                source.onmessage = (event) => {
+                    log.push('message:' + event.data);
+                    source.close();
+                    resolve([source.readyState, log]);
+                };
+                source.onerror = () => resolve([source.readyState, log]);
+            })"#, session, &fixture), fulfill)
+        }).await.unwrap_or_else(|_| panic!("{reason}: the fulfilled connection must settle"));
+        assert_eq!(result, expected, "{reason}");
+    }
+    assert!(fixture.requests().is_empty(), "fulfilled streams must not reach the network: {:?}", fixture.requests());
+}
+
+// Last-Event-ID is not a CORS-safelisted header, but EventSource sends it
+// without a preflight. An ordinary fetch with an unsafe header still sends one.
+#[tokio::test(flavor = "current_thread")]
+async fn approved_cross_origin_event_source_reconnects_without_a_preflight() {
+    let (base, port, fixture) = serve_event_streams().await;
+    let session = "event-source-cors-reconnect";
+    let mut ctx = event_stream_page(&base, session).await;
+    let log = await_page(&mut ctx, 2, &format!(r#"new Promise((resolve) => {{
+        const log = [];
+        const source = new EventSource('http://localhost:{port}/cors-reconnect');
+        source.onerror = () => log.push('error:' + source.readyState);
+        source.onmessage = (event) => {{
+            log.push(event.data + '|' + event.lastEventId);
+            if (event.data === 'second') {{ source.close(); resolve(log); }}
+        }};
+    }})"#), session, &fixture).await;
+    assert_eq!(log, json!(["first|c1", "error:0", "second|c1"]));
+    tokio::time::timeout(std::time::Duration::from_secs(10), fixture.stream_closed.notified()).await
+        .unwrap_or_else(|_| panic!("close must end the reconnected stream; server saw {:?}", fixture.requests()));
+    let probe = await_page(&mut ctx, 3, &format!(
+        "fetch('http://localhost:{port}/cors-preflight', {{headers: {{'X-Probe': '1'}}}}).then((response) => response.text())"),
+        session, &fixture).await;
+    assert_eq!(probe, "approved");
+    assert_eq!(fixture.requests(), [
+        "/cors-reconnect", "/cors-reconnect last-event-id=c1", "/cors-reconnect closed",
+        "OPTIONS /cors-preflight", "/cors-preflight",
+    ]);
+}
+
+// networkidle0 waits until the page HTTP client has no active request. An open
+// stream must not count, or readiness waits for the idle deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn an_open_event_source_does_not_hold_network_idle() {
+    let (base, _port, fixture) = serve_event_streams().await;
+    let session = "event-source-idle";
+    let mut ctx = event_stream_page(&base, session).await;
+    cdp(&mut ctx, 2, "Page.addScriptToEvaluateOnNewDocument", json!({"source":r#"
+        globalThis.__live = new EventSource('/sse-navigate');
+        globalThis.__ready = new Promise((resolve) => __live.addEventListener('ready', () => resolve(__live.readyState)));
+    "#}), session).await;
+    cdp(&mut ctx, 3, "Page.navigate", json!({"url":format!("{base}next"),"waitUntil":"networkidle0"}), session).await;
+    assert_eq!(await_page(&mut ctx, 4, "__ready", session, &fixture).await.as_f64(), Some(1.0), "the stream must be open");
+    let page = ctx.get_session_page_mut(&Some(session.to_string())).unwrap();
+    assert_eq!(page.http_client.active_requests(), 0, "the open stream must not count as an active request");
+    assert_eq!(fixture.requests(), ["/sse-navigate"], "the stream must still be open");
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({"expression":"__live.close()"}), session).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), fixture.stream_closed.notified()).await
+        .unwrap_or_else(|_| panic!("close must end the stream; server saw {:?}", fixture.requests()));
+    assert_eq!(fixture.requests(), ["/sse-navigate", "/sse-navigate closed"]);
+}
+
 #[cfg(feature = "stealth")]
-async fn stealth_context() -> (CdpContext, String, String) {
+async fn stealth_context() -> (CdpContext, String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
     let mut ctx = CdpContext::new();
     ctx.default_context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
         "stealth-events".into(), None, true, None, None, true,
@@ -343,9 +771,9 @@ async fn stealth_context() -> (CdpContext, String, String) {
     let page = ctx.create_page();
     let session = "stealth-session".to_string();
     ctx.sessions.insert(session.clone(), page);
-    let (base, _observed) = serve().await;
+    let (base, observed) = serve().await;
     cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), &session).await;
-    (ctx, session, base)
+    (ctx, session, observed)
 }
 
 #[cfg(feature = "stealth")]
@@ -364,7 +792,7 @@ fn recorded_live_request_id(ctx: &mut CdpContext, session: &str) -> String {
 #[cfg(feature = "stealth")]
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_fetch_records_redirect_identity_and_readable_response_body() {
-    let (mut ctx, session, _base) = stealth_context().await;
+    let (mut ctx, session, _observed) = stealth_context().await;
     let request_id = response_request_id(&ctx, "/api/data.json").expect("stealth response event");
     let events = ctx.pending_events.iter().filter(|event|
         event.method.starts_with("Network.") && event.params["requestId"] == request_id
@@ -381,7 +809,7 @@ async fn stealth_fetch_records_redirect_identity_and_readable_response_body() {
 #[cfg(feature = "stealth")]
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_xhr_records_events_after_navigation() {
-    let (mut ctx, session, _base) = stealth_context().await;
+    let (mut ctx, session, _observed) = stealth_context().await;
     ctx.pending_events.clear();
     let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({
         "expression":"new Promise((resolve,reject)=>{let xhr=new XMLHttpRequest();xhr.open('GET','/api/data.json');xhr.onload=()=>resolve(xhr.responseText);xhr.onerror=reject;xhr.send()})",
@@ -397,7 +825,7 @@ async fn stealth_xhr_records_events_after_navigation() {
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_events_survive_disabled_response_body_retention() {
     std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "0");
-    let (mut ctx, session, _base) = stealth_context().await;
+    let (mut ctx, session, _observed) = stealth_context().await;
     let request_id = response_request_id(&ctx, "/api/data.json").expect("retention opt-out must not disable observation");
     let response = dispatch(&CdpRequest { id: 2, method: "Network.getResponseBody".into(),
         params: json!({"requestId":request_id}), session_id: Some(session) }, &mut ctx).await;
@@ -408,7 +836,7 @@ async fn stealth_events_survive_disabled_response_body_retention() {
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_response_body_buffer_evicts_old_requests() {
     std::env::set_var("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", "2");
-    let (mut ctx, session, _base) = stealth_context().await;
+    let (mut ctx, session, _observed) = stealth_context().await;
     let oldest = response_request_id(&ctx, "/api/data.json").expect("first response");
     let mut latest = String::new();
     for id in 2..6 {
@@ -426,7 +854,7 @@ async fn stealth_response_body_buffer_evicts_old_requests() {
 #[cfg(feature = "stealth")]
 #[tokio::test(flavor = "current_thread")]
 async fn stealth_http_error_response_keeps_status_and_body() {
-    let (mut ctx, session, _base) = stealth_context().await;
+    let (mut ctx, session, _observed) = stealth_context().await;
     let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":"fetch('/api/missing.json').then(async r=>{await r.text();return r.status})","awaitPromise":true,"returnByValue":true}), &session).await;
     assert_eq!(response["result"]["value"].as_f64(), Some(404.0));
     let page = ctx.get_session_page_mut(&Some(session.clone())).unwrap();
@@ -435,4 +863,20 @@ async fn stealth_http_error_response_keeps_status_and_body() {
     assert_eq!(event.status, 404);
     assert!(event.url.ends_with("/api/missing.json"));
     assert_eq!(cdp(&mut ctx, 3, "Network.getResponseBody", json!({"requestId":event.request_id}), &session).await["body"], r#"{"error":"missing"}"#);
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test(flavor = "current_thread")]
+async fn stealth_event_source_fails_closed_without_a_request() {
+    let (mut ctx, session, observed) = stealth_context().await;
+    let seen = observed.lock().unwrap().len();
+    let response = cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":r#"new Promise((resolve) => {
+        const log = [];
+        const source = new EventSource('/api/stream');
+        source.onopen = () => log.push('open');
+        source.onmessage = () => log.push('message');
+        source.onerror = () => resolve([source.readyState, log]);
+    })"#, "awaitPromise":true, "returnByValue":true}), &session).await;
+    assert_eq!(response["result"]["value"], json!([2, []]), "the stealth transport must fail EventSource closed");
+    assert_eq!(observed.lock().unwrap().len(), seen, "the stealth transport must not send the stream request");
 }
