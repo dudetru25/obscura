@@ -19,7 +19,7 @@ fixture=$(python3 -c 'from pathlib import Path; print(Path("tests/fixtures/place
 OBSCURA_SHOT_W=1920 OBSCURA_SHOT_H=1080 OBSCURA_RENDER_TIMING=1 \
   timeout --kill-after=5s 45s "$package_stage/obscura" fetch "$fixture" --quiet --timeout 30 \
   --screenshot ci-output/placement-probe/placement.png --eval 'window.__placementRepro' \
-  -o ci-output/placement-probe/result.json 2> ci-output/placement-probe/timing.log
+  > ci-output/placement-probe/result.json 2> ci-output/placement-probe/timing.log
 python3 - <<'PROBE'
 import json
 import math
