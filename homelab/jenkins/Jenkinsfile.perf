@@ -12,11 +12,14 @@ try {
         pipelineRevision: params.SOURCE_SHA,
         timeoutMinutes: 60,
         queueProfile: 'small-web',
-        // Retained native packages: build 67 owns the base, build 72 the candidate.
-        checkCommand: 'OBSCURA_BASE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-67/ci-output/obscura-9008b337bc299286e5216631a34d661fb00a0bf7-x86_64-linux.tar.gz ' +
-            'OBSCURA_BASE_SHA256=c0b734d0fb027fab2e486348b2a5dc54aa1e66a79554d723d68dbc50dd7c8c63 ' +
-            'OBSCURA_CANDIDATE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-72/ci-output/obscura-07f560a929988c89c6864ac34e19d67875004504-x86_64-linux.tar.gz ' +
-            'OBSCURA_CANDIDATE_SHA256=280a8b7dc5b1eabb5663a1e640db89f0aeb54dfdce39312a431ec8d5ab579cf1 ' +
+        // Retained native packages: build 72 owns the base, build 80 the candidate.
+        // Build 79 has the same source but a different binary and is not a substitute.
+        checkCommand: 'OBSCURA_BASE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-72/ci-output/obscura-07f560a929988c89c6864ac34e19d67875004504-x86_64-linux.tar.gz ' +
+            'OBSCURA_BASE_SHA256=280a8b7dc5b1eabb5663a1e640db89f0aeb54dfdce39312a431ec8d5ab579cf1 ' +
+            'OBSCURA_BASE_SUMS_SHA256=25fc34fad358fc1632d2dfaed64d3c0582722f3f9af6457add55ee25a0c8a516 ' +
+            'OBSCURA_CANDIDATE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-80/ci-output/obscura-75dfd8a1c501637ada405a9ed5789bb8688db5bb-x86_64-linux.tar.gz ' +
+            'OBSCURA_CANDIDATE_SHA256=affd9a4234cd8b4e7f7d9fa8d1763312725f15916da9b6042217f0ac13499af1 ' +
+            'OBSCURA_CANDIDATE_SUMS_SHA256=ff70b68892baf5ec67ca114d9119c26a27f9709ddeff39bba5ecf551e20d0520 ' +
             'bash homelab/jenkins/jenkins-perf.sh'
     )
 } finally {
