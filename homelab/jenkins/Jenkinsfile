@@ -12,7 +12,7 @@ try {
         pipelineRevision: params.SOURCE_SHA,
         timeoutMinutes: 60,
         queueProfile: 'small-web',
-        checkCommand: 'CHROME_BIN=/mnt/g/GithubProjects/.jenkins-workspace/.tools/chrome-155.0.8059.84/chrome bash homelab/jenkins/jenkins.sh'
+        checkCommand: 'CHROME_BIN=/mnt/g/GithubProjects/.jenkins-workspace/.tools/chrome-155.0.8059.84/chrome bash homelab/jenkins/jenkins.sh tests'
     )
 } finally {
     node('homelab-dev3-linux') {
