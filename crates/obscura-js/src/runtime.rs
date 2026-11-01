@@ -5688,15 +5688,57 @@ mod tests {
             d.body.innerHTML = '<style>body{margin:8px}div{width:100px;height:20px}</style><div id="child"></div>';
             const child = d.getElementById('child'), parent = document.getElementById('parent');
             const foreign = iframe.contentWindow.Document.prototype;
+            const same = (list, expected) => list.length === expected.length && list.every((el, i) => el === expected[i]);
             return [document.elementFromPoint(10, 10) === parent,
                 d.elementFromPoint(10, 10) === child,
                 Document.prototype.elementFromPoint.call(d, 10, 10) === child,
                 foreign.elementFromPoint.call(document, 10, 10) === parent,
                 Document.prototype.elementFromPoint.call(d, 400, 10) === null,
                 foreign.elementFromPoint.call(document, 400, 10) === document.body,
-                Document.prototype.elementsFromPoint.call(d, 10, 10)[0] === child,
-                foreign.elementsFromPoint.call(document, 10, 10)[0] === parent];
-        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
+                same(Document.prototype.elementsFromPoint.call(d, 10, 10), [child, d.body, d.documentElement]),
+                same(foreign.elementsFromPoint.call(document, 10, 10), [parent, document.body, document.documentElement]),
+                Document.prototype.elementsFromPoint.call(d, 400, 10).length === 0,
+                same(foreign.elementsFromPoint.call(document, 400, 10), [document.body, document.documentElement])];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn elements_from_point_lists_every_hit_box_topmost_first() {
+        let mut rt = setup_runtime(concat!(
+            "<style>body{margin:0;height:400px}div{width:20px;height:20px}",
+            "#wrap{position:relative;width:300px;height:100px}",
+            "#neg{position:absolute;left:0;top:0;z-index:-1}",
+            "#low,#high,#hidden,#none{position:absolute;top:0;width:60px;height:60px}",
+            "#low{left:0;z-index:1}#high{left:30px;z-index:2}",
+            "#hidden{left:100px;visibility:hidden}#shown{visibility:visible}",
+            "#none{left:170px;pointer-events:none}#auto{pointer-events:auto}",
+            "#clip{position:absolute;left:240px;top:0;overflow:hidden}#over{width:50px}",
+            "#moved{position:absolute;left:0;top:200px;transform:translate(100px,0)}",
+            "html{position:relative;z-index:0}",
+            "#a,#b{position:absolute;left:0;top:300px;width:100px;height:100px;z-index:1}",
+            "#a1{position:relative;width:100px;height:50px}",
+            "#host{position:absolute;left:200px;top:300px;width:100px;height:100px}</style>",
+            "<div id='neg'></div><div id='wrap'><div id='low'></div><div id='high'></div>",
+            "<div id='hidden'><div id='shown'></div></div><div id='none'><div id='auto'></div></div>",
+            "<div id='clip'><div id='over'></div></div><div id='moved'></div></div>",
+            "<div id='a'><div id='a1'></div></div><div id='b'></div><div id='host'></div>"));
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.getElementById('host').attachShadow({mode:'open'}).innerHTML =
+                '<div style="width:50px;height:40px"></div>';
+            const rows = [[40, 10], [10, 10], [110, 10], [180, 10], [250, 10], [270, 10],
+                [40, 60], [110, 210], [10, 210], [10, 500], [-1, 0], [0, innerHeight + 1], [10, 310]]
+                .map(([x, y]) => document.elementsFromPoint(x, y).map((el) => el.id || el.tagName).join());
+            const shadowHits = document.elementsFromPoint(210, 310);
+            rows.push([shadowHits.filter((el) => el === document.documentElement).length,
+                shadowHits[shadowHits.length - 1] === document.documentElement].join());
+            return rows;
+        })()"#)
+            .unwrap(), serde_json::json!([
+                "high,low,wrap,BODY,HTML", "low,wrap,BODY,neg,HTML", "shown,wrap,BODY,HTML",
+                "auto,wrap,BODY,HTML", "over,clip,wrap,BODY,HTML", "wrap,BODY,HTML",
+                "wrap,BODY,HTML", "moved,BODY,HTML", "BODY,HTML", "HTML", "", "",
+                "b,a1,a,BODY,HTML", "1,true"]));
     }
 
     #[cfg(feature = "render")]
@@ -24882,14 +24924,20 @@ mod tests {
     #[test]
     fn test_elements_from_point_returns_array() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let len_in = rt
-            .evaluate("document.elementsFromPoint(10, 10).length")
+        let tags = rt
+            .evaluate("document.elementsFromPoint(10, 10).map((el) => el.tagName).join()")
             .unwrap();
-        assert_eq!(len_in.as_f64().unwrap() as i64, 1);
+        // The renderer gives an empty body no height; synthetic geometry
+        // makes the body viewport-sized.
+        assert_eq!(tags, if cfg!(feature = "render") { "HTML" } else { "BODY,HTML" });
         let len_out = rt
             .evaluate("document.elementsFromPoint(-1, -1).length")
             .unwrap();
         assert_eq!(len_out.as_f64().unwrap() as i64, 0);
+        let len_nan = rt
+            .evaluate("document.elementsFromPoint(NaN, 10).length")
+            .unwrap();
+        assert_eq!(len_nan.as_f64().unwrap() as i64, 0);
     }
 
     #[test]
