@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -56,12 +57,27 @@ SCENARIOS = {
         "(() => {let r=document.getElementById('root');r.innerHTML='<input>'.repeat(200);let a=r.querySelectorAll('input');let n=0;for(let i=0;i<1000;i++){let t=a[i%200];t.value='v'+i;if(t.offsetHeight>0)n++;}for(let i=0;i<200;i++)if(a[i].value==='v'+(800+i))n++;return n;})()",
         1200,
     ),
+    # Each write resizes a query container; its child is 50cqw. 1000 reads
+    # plus 200 final widths, each half of the even container width.
+    "container-units-layout": (
+        "(() => {let r=document.getElementById('root');r.innerHTML='<section style=\"container-type:inline-size;width:100px\"><div style=\"width:50cqw;height:4px;background:black\"></div></section>'.repeat(200);let s=r.querySelectorAll('section');let n=0;for(let i=0;i<1000;i++){let w=102+2*(i%51);s[i%200].style.width=w+'px';if(s[i%200].firstChild.offsetWidth===w/2)n++;}for(let i=0;i<200;i++)if(s[i].firstChild.offsetWidth===(102+2*((800+i)%51))/2)n++;return n;})()",
+        1200,
+    ),
     # A div control on the shared layout path, without form state.
     "div-text-layout": (
         "(() => {let r=document.getElementById('root');r.innerHTML='<div></div>'.repeat(200);let a=r.querySelectorAll('div');let n=0;for(let i=0;i<1000;i++){let d=a[i%200];d.textContent='v'+i+' '+i*7;if(d.offsetHeight>0)n++;}for(let i=0;i<200;i++)if(a[i].textContent==='v'+(800+i)+' '+(800+i)*7)n++;return n;})()",
         1200,
     ),
 }
+
+
+# The base engine predates this feature. Measure only the candidate feature
+# cost; shared controls retain the paired regression thresholds.
+CANDIDATE_ONLY = {"container-units-layout"}
+FALLBACK_TERMINATIONS = {"PassCapFallback", "OscillationFallback"}
+TIMING_LINE = re.compile(
+    r"^\[timing\] .*\bcq_passes=(\d+) cq_termination=(\S+) .*\bretained_fallback=(\d+)$"
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -76,9 +92,37 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def probe_layout(binary: Path, url: str, expression: str, expected: int) -> tuple[int, dict[str, object]]:
+    """Untimed run with the existing render telemetry; returns result and pass summary."""
+    _, _, _, result, stderr = run_once(binary, url, expression, expected, render_timing=True)
+    passes: dict[str, int] = {}
+    terminations: dict[str, int] = {}
+    retained_fallback = 0
+    for line in stderr.splitlines():
+        match = TIMING_LINE.match(line)
+        if match is None:
+            continue
+        passes[match[1]] = passes.get(match[1], 0) + 1
+        terminations[match[2]] = terminations.get(match[2], 0) + 1
+        retained_fallback += int(match[3])
+    if not passes:
+        raise RuntimeError(f"{binary} emitted no container layout telemetry")
+    return result, {
+        "layouts": sum(passes.values()),
+        "cq_passes": passes,
+        "cq_termination": terminations,
+        "retained_fallback": retained_fallback,
+    }
+
+
 def run_once(
-    binary: Path, url: str, expression: str, expected: int, screenshot: Path | None = None
-) -> tuple[float, int, float]:
+    binary: Path,
+    url: str,
+    expression: str,
+    expected: int,
+    screenshot: Path | None = None,
+    render_timing: bool = False,
+) -> tuple[float, int, float, int, str]:
     with tempfile.NamedTemporaryFile(prefix="obscura-rss-", delete=False) as rss_file:
         rss_path = Path(rss_file.name)
     with tempfile.NamedTemporaryFile(prefix="obscura-stdout-", delete=False) as stdout_file:
@@ -94,11 +138,7 @@ def run_once(
         "--fsize=2097152",
         "--nofile=256",
         "--",
-        "/usr/bin/time",
-        "-f",
-        "%M %U %S",
-        "-o",
-        str(rss_path),
+        "/usr/bin/time", "-f", "%M %U %S", "-o", str(rss_path),
         str(binary),
         "fetch",
         url,
@@ -114,6 +154,9 @@ def run_once(
     if screenshot is not None:
         # The timed sample also paints; fetch then wraps the value in a JSON report.
         command += ["--screenshot", str(screenshot)]
+    environment = {name: value for name, value in os.environ.items() if name != "OBSCURA_RENDER_TIMING"}
+    if render_timing:
+        environment["OBSCURA_RENDER_TIMING"] = "1"
     started = time.perf_counter()
     try:
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
@@ -121,6 +164,7 @@ def run_once(
                 command,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
+                env=environment,
                 start_new_session=True,
             )
             try:
@@ -147,11 +191,17 @@ def run_once(
             if not screenshot.is_file() or screenshot.stat().st_size == 0:
                 raise RuntimeError(f"{binary} wrote no screenshot")
             result = result["evaluation"]
+        if type(result) is not int and not (
+            type(result) is float and math.isfinite(result) and result.is_integer()
+        ):
+            raise RuntimeError(f"{binary} produced a non-integer evaluation result")
+        result = int(result)
         if result != expected:
             raise RuntimeError(
                 f"{binary} returned {result!r}; expected {expected!r}"
             )
-        return elapsed_ms, int(rss), (float(user_seconds) + float(system_seconds)) * 1000
+        return (elapsed_ms, int(rss), (float(user_seconds) + float(system_seconds)) * 1000,
+                result, stderr_path.read_text(encoding="utf-8"))
     finally:
         rss_path.unlink(missing_ok=True)
         stdout_path.unlink(missing_ok=True)
@@ -197,20 +247,23 @@ def main() -> None:
     url = f"http://127.0.0.1:{server.server_port}/"
     samples: dict[str, dict[str, dict[str, list[float | int]]]] = {}
     pair_orders: dict[str, list[list[str]]] = {}
+    evaluations: dict[str, dict[str, list[int]]] = {}
+    probes: dict[str, dict[str, dict[str, object]]] = {}
     try:
         for scenario in scenarios:
             expression, expected = SCENARIOS[scenario]
+            engines = (
+                (("candidate", args.candidate),) if scenario in CANDIDATE_ONLY
+                else (("base", args.base), ("candidate", args.candidate))
+            )
             samples[scenario] = {
                 label: {"latency_ms": [], "cpu_ms": [], "rss_kib": []}
-                for label in ("base", "candidate")
+                for label, _ in engines
             }
             pair_orders[scenario] = []
+            evaluations[scenario] = {label: [] for label, _ in engines}
             for round_number in range(ROUNDS):
-                order = (
-                    (("base", args.base), ("candidate", args.candidate))
-                    if round_number % 2 == 0
-                    else (("candidate", args.candidate), ("base", args.base))
-                )
+                order = engines if round_number % 2 == 0 else tuple(reversed(engines))
                 pair_orders[scenario].append([label for label, _ in order])
                 for label, binary in order:
                     screenshot = (
@@ -218,12 +271,17 @@ def main() -> None:
                         if args.screenshot_dir is not None
                         else None
                     )
-                    latency_ms, rss_kib, cpu_ms = run_once(
+                    latency_ms, rss_kib, cpu_ms, result, _ = run_once(
                         binary, url, expression, expected, screenshot
                     )
+                    evaluations[scenario][label].append(result)
                     samples[scenario][label]["latency_ms"].append(latency_ms)
                     samples[scenario][label]["cpu_ms"].append(cpu_ms)
                     samples[scenario][label]["rss_kib"].append(rss_kib)
+            probes[scenario] = {}
+            for label, binary in engines:
+                result, telemetry = probe_layout(binary, url, expression, expected)
+                probes[scenario][label] = {"result": result, **telemetry}
     finally:
         server.shutdown()
         server.server_close()
@@ -241,12 +299,30 @@ def main() -> None:
     ]
     failures = []
     for scenario in scenarios:
-        base_latency = median(samples[scenario]["base"]["latency_ms"])
+        candidate_probe = probes[scenario]["candidate"]
+        if FALLBACK_TERMINATIONS & set(candidate_probe["cq_termination"]):
+            failures.append(f"{scenario} candidate layout fell back: {candidate_probe['cq_termination']}")
+        if scenario not in CANDIDATE_ONLY:
+            for label in ("base", "candidate"):
+                if set(probes[scenario][label]["cq_passes"]) != {"1"}:
+                    failures.append(f"{scenario} {label} left the one-pass layout path")
+        if scenario in CANDIDATE_ONLY and (
+            candidate_probe["cq_passes"].get("2", 0) < 1000
+            or set(candidate_probe["cq_passes"]) - {"1", "2"}
+            or "GeometryStable" not in candidate_probe["cq_termination"]
+        ):
+            failures.append(f"{scenario} candidate did not use the expected two-pass layout path")
+        comparable = scenario not in CANDIDATE_ONLY
+        if comparable and (
+            candidate_probe["retained_fallback"] > probes[scenario]["base"]["retained_fallback"]
+        ):
+            failures.append(f"{scenario} candidate increased retained layout fallbacks")
+        base_latency = median(samples[scenario]["base"]["latency_ms"]) if comparable else None
         pr_latency = median(samples[scenario]["candidate"]["latency_ms"])
-        base_rss = median(samples[scenario]["base"]["rss_kib"])
+        base_rss = median(samples[scenario]["base"]["rss_kib"]) if comparable else None
         pr_rss = median(samples[scenario]["candidate"]["rss_kib"])
-        latency_ratio = pr_latency / base_latency
-        rss_ratio = pr_rss / base_rss
+        latency_ratio = pr_latency / base_latency if comparable else None
+        rss_ratio = pr_rss / base_rss if comparable else None
         report["scenarios"][scenario] = {
             "base_latency_ms": base_latency,
             "candidate_latency_ms": pr_latency,
@@ -259,16 +335,25 @@ def main() -> None:
                     metric: [median(values), p95(values)]
                     for metric, values in samples[scenario][label].items()
                 }
-                for label in ("base", "candidate")
+                for label in samples[scenario]
             },
             "pair_order": pair_orders[scenario],
+            "comparison_valid": comparable,
+            "evaluations": evaluations[scenario],
+            "telemetry": probes[scenario],
             "samples": samples[scenario],
         }
+        latency_change = f"{(latency_ratio - 1) * 100:+.1f}%" if comparable else "n/a: base unsupported"
+        rss_change = f"{(rss_ratio - 1) * 100:+.1f}%" if comparable else "n/a: base unsupported"
+        base_latency_text = f"{base_latency:.1f} ms" if comparable else "n/a"
+        base_rss_text = f"{base_rss / 1024:.1f} MiB" if comparable else "n/a"
         lines.append(
-            f"| {scenario} | {base_latency:.1f} ms | {pr_latency:.1f} ms | "
-            f"{(latency_ratio - 1) * 100:+.1f}% | {base_rss / 1024:.1f} MiB | "
-            f"{pr_rss / 1024:.1f} MiB | {(rss_ratio - 1) * 100:+.1f}% |\n"
+            f"| {scenario} | {base_latency_text} | {pr_latency:.1f} ms | "
+            f"{latency_change} | {base_rss_text} | "
+            f"{pr_rss / 1024:.1f} MiB | {rss_change} |\n"
         )
+        if not comparable:
+            continue
         latency_delta = pr_latency - base_latency
         rss_delta = pr_rss - base_rss
         if (

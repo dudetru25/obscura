@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare two retained release packages with interleaved textarea, input and control samples.
+# Compare two retained release packages with interleaved form, container-unit and control samples.
 # The packages own the engine revisions; this checkout owns only the harness.
 set -euo pipefail
 : "${OBSCURA_BASE_PACKAGE:?}" "${OBSCURA_BASE_SHA256:?}"
@@ -32,7 +32,8 @@ done
 perf_status=0
 python3 scripts/ci/perf_smoke.py \
     --base "$package_stage/base/obscura" --candidate "$package_stage/candidate/obscura" \
-    --scenario textarea-value-layout --scenario input-value-layout --scenario div-text-layout \
+    --scenario textarea-value-layout --scenario input-value-layout \
+    --scenario container-units-layout --scenario div-text-layout \
     --screenshot-dir ci-output/perf/captures --output ci-output/perf/results.json \
     2>&1 | tee ci-output/perf/perf.log || perf_status=$?
 # Apply the paired-corpus contentless rule to every capture of each engine.
@@ -59,7 +60,7 @@ for path in sorted(Path("ci-output/perf/captures").glob("*.png")):
 Path("ci-output/perf/captures.json").write_text(json.dumps(report, indent=2) + "\n")
 contentless = [name for name, entry in report.items() if entry["contentless"]]
 print(f"{len(report)} captures, {len(contentless)} contentless")
-if len(report) != 30 or contentless:
-    raise SystemExit(f"expected 30 captures with content; contentless: {contentless}")
+if len(report) != 35 or contentless:
+    raise SystemExit(f"expected 35 captures with content; contentless: {contentless}")
 CAPTURES
 exit "$perf_status"

@@ -12,11 +12,11 @@ try {
         pipelineRevision: params.SOURCE_SHA,
         timeoutMinutes: 60,
         queueProfile: 'small-web',
-        // Retained native packages: build 62 owns the base, build 67 the candidate.
-        checkCommand: 'OBSCURA_BASE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-62/ci-output/obscura-1de5fa606e8447b5472d3e270467a348cac785bd-x86_64-linux.tar.gz ' +
-            'OBSCURA_BASE_SHA256=a3f4e71794e67c8513cb909fccc1e3b0b8e9a45ad96f22f544872dd357d05721 ' +
-            'OBSCURA_CANDIDATE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-67/ci-output/obscura-9008b337bc299286e5216631a34d661fb00a0bf7-x86_64-linux.tar.gz ' +
-            'OBSCURA_CANDIDATE_SHA256=c0b734d0fb027fab2e486348b2a5dc54aa1e66a79554d723d68dbc50dd7c8c63 ' +
+        // Retained native packages: build 67 owns the base, build 72 the candidate.
+        checkCommand: 'OBSCURA_BASE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-67/ci-output/obscura-9008b337bc299286e5216631a34d661fb00a0bf7-x86_64-linux.tar.gz ' +
+            'OBSCURA_BASE_SHA256=c0b734d0fb027fab2e486348b2a5dc54aa1e66a79554d723d68dbc50dd7c8c63 ' +
+            'OBSCURA_CANDIDATE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-72/ci-output/obscura-07f560a929988c89c6864ac34e19d67875004504-x86_64-linux.tar.gz ' +
+            'OBSCURA_CANDIDATE_SHA256=280a8b7dc5b1eabb5663a1e640db89f0aeb54dfdce39312a431ec8d5ab579cf1 ' +
             'bash homelab/jenkins/jenkins-perf.sh'
     )
 } finally {
