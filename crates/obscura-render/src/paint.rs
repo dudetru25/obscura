@@ -1660,6 +1660,160 @@ impl PreparedRender {
                 .collect()
         }
 
+        Self::topmost_hit(
+            tree,
+            self.hit_candidates(tree, scroll, x, y)?.map(|hit| {
+                let path = stacking_path(tree, &self.layout, hit.id);
+                (path, hit.positioned, tree.ancestors(hit.id).len(), hit.order, hit.id)
+            }),
+        )
+    }
+
+    /// CSSOM View `elementsFromPoint()` over the same hit-testable boxes as
+    /// `hit_test`, topmost first. The root element carries the root stacking
+    /// context background, so it stays last. The order uses modeled CSS
+    /// stacking context levels and tree order, then positioned boxes
+    /// above in-flow boxes, then tree order.
+    /// `hit_test` keeps its existing single-hit fold independently.
+    pub fn hit_list(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Vec<obscura_dom::tree::NodeId> {
+        let Some(candidates) = self.hit_candidates(tree, scroll, x, y) else {
+            return Vec::new();
+        };
+        let document = tree.document();
+        // One ancestor walk per hit finds its stacking context roots, nearest
+        // first, and whether a positioned box below the nearest root puts the
+        // hit in that context's positioned layer.
+        let hits: Vec<_> = candidates
+            .map(|hit| {
+                let ancestors = tree.ancestors(hit.id);
+                let mut contexts = Vec::new();
+                let mut in_positioned_layer = false;
+                for node in std::iter::once(hit.id).chain(ancestors.iter().copied()) {
+                    if let Some(z) = stacking_z_index(tree, &self.layout, node) {
+                        contexts.push((node, z));
+                    } else if contexts.is_empty()
+                        && self.layout.styles.get(&node).is_some_and(|style| {
+                            !style.display_contents && style.position.is_some()
+                        })
+                    {
+                        in_positioned_layer = true;
+                    }
+                }
+                let is_root = ancestors.first() == Some(&document);
+                (hit, is_root, contexts, in_positioned_layer)
+            })
+            .collect();
+        // Sibling stacking contexts at one z-index paint in tree order. Hits
+        // arrive in preorder, so the first hit inside a context root gives
+        // that root's tree position relative to unrelated roots.
+        let mut context_order = HashMap::new();
+        for (hit, _, contexts, _) in &hits {
+            for (node, _) in contexts {
+                context_order.entry(*node).or_insert(hit.order);
+            }
+        }
+        let root = hits.iter().find(|(_, is_root, _, _)| *is_root).map(|(hit, ..)| hit.id);
+        // A built-in lexicographic key keeps the order total. A context root
+        // paints its own background below everything in its context,
+        // including negative z-index children; the root element's background
+        // is the root context background. Other boxes paint in normal flow,
+        // between negative and non-negative child contexts.
+        let mut ordered: Vec<_> = hits
+            .iter()
+            .map(|(hit, is_root, contexts, in_positioned_layer)| {
+                let mut levels: Vec<(i64, usize)> = contexts
+                    .iter()
+                    .rev()
+                    .map(|(node, z)| (2 * i64::from(*z), context_order[node]))
+                    .collect();
+                let own_context =
+                    *is_root || contexts.first().is_some_and(|(node, _)| *node == hit.id);
+                levels.push(if own_context { (i64::MIN, 0) } else { (-1, 0) });
+                ((levels, *in_positioned_layer, hit.order), hit.id)
+            })
+            .collect();
+        ordered.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut list: Vec<_> = ordered.into_iter().map(|(_, id)| id).collect();
+        if let Some(root) = root {
+            list.retain(|id| *id != root);
+            list.push(root);
+        }
+        list
+    }
+
+    /// Hit-testable boxes that contain a viewport point, in flat-tree
+    /// preorder. `None` means the point is outside the viewport.
+    fn hit_candidates<'a>(
+        &'a self,
+        tree: &'a DomTree,
+        scroll: &'a ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<impl Iterator<Item = HitCandidate> + 'a> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x > self.viewport.0
+            || y > self.viewport.1
+        {
+            return None;
+        }
+        let point = crate::Rect {
+            x,
+            y,
+            // `f32::EPSILON` is smaller than one ULP at ordinary viewport
+            // coordinates, so x + width can round back to x and appear empty
+            // to `intersect_rect`. A sub-pixel probe remains point-like while
+            // retaining a representable extent across the supported viewport.
+            width: 0.001,
+            height: 0.001,
+        };
+        let candidates = crate::dom::rendered_descendants(tree, tree.document())
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(order, id)| {
+                let style = self.layout.styles.get(&id)?;
+                if style.display == crate::Display::None
+                    || style.display_contents
+                    || style.visibility_hidden.unwrap_or(false)
+                    || style.pointer_events_none.unwrap_or(false)
+                {
+                    return None;
+                }
+                let rect = self.viewport_rect_with_scroll(id, scroll)?;
+                if x < rect.x
+                    || x >= rect.x + rect.width
+                    || y < rect.y
+                    || y >= rect.y + rect.height
+                {
+                    return None;
+                }
+                if scroll
+                    .inherited_clip_for(id)
+                    .is_some_and(|clip| clip.intersect_rect(&point).is_none())
+                {
+                    return None;
+                }
+                let positioned =
+                    style.position.is_some() || style.position_fixed || style.position_sticky;
+                Some(HitCandidate { order, id, positioned })
+            });
+        Some(candidates)
+    }
+
+    /// The paint-topmost hit among `(stacking path, positioned, depth,
+    /// preorder index, node)` entries in flat-tree preorder.
+    fn topmost_hit(
+        tree: &DomTree,
+        hits: impl Iterator<Item = (Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)>,
+    ) -> Option<obscura_dom::tree::NodeId> {
         fn compare_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
             use std::cmp::Ordering;
             let common = a.len().min(b.len());
@@ -1688,55 +1842,8 @@ impl PreparedRender {
             }
         }
 
-        if !x.is_finite()
-            || !y.is_finite()
-            || x < 0.0
-            || y < 0.0
-            || x > self.viewport.0
-            || y > self.viewport.1
-        {
-            return None;
-        }
-        let point = crate::Rect {
-            x,
-            y,
-            // `f32::EPSILON` is smaller than one ULP at ordinary viewport
-            // coordinates, so x + width can round back to x and appear empty
-            // to `intersect_rect`. A sub-pixel probe remains point-like while
-            // retaining a representable extent across the supported viewport.
-            width: 0.001,
-            height: 0.001,
-        };
         let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
-        for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
-            .into_iter()
-            .enumerate()
-        {
-            let Some(style) = self.layout.styles.get(&id) else {
-                continue;
-            };
-            if style.display == crate::Display::None
-                || style.display_contents
-                || style.visibility_hidden.unwrap_or(false)
-                || style.pointer_events_none.unwrap_or(false)
-            {
-                continue;
-            }
-            let Some(rect) = self.viewport_rect_with_scroll(id, scroll) else {
-                continue;
-            };
-            if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
-                continue;
-            }
-            if scroll
-                .inherited_clip_for(id)
-                .is_some_and(|clip| clip.intersect_rect(&point).is_none())
-            {
-                continue;
-            }
-            let path = stacking_path(tree, &self.layout, id);
-            let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
-            let depth = tree.ancestors(id).len();
+        for (path, positioned, depth, order, id) in hits {
             let replace = best
                 .as_ref()
                 .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
@@ -3782,6 +3889,15 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
             })
         })
     })
+}
+
+/// A hit-testable box under a viewport point.
+struct HitCandidate {
+    /// Flat-tree preorder index.
+    order: usize,
+    id: obscura_dom::tree::NodeId,
+    /// Whether the box itself is positioned.
+    positioned: bool,
 }
 
 /// The used `z-index` for an element which participates in stacking order.

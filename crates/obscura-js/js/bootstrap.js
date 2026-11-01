@@ -18504,14 +18504,20 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       // before renderer-backed hit testing was available.
       return this.body || this.documentElement || null;
     }
-    var all = this.querySelectorAll('*');
+    return _syntheticHit(this, x, y, null) || this.body || this.documentElement || null;
+  };
+  // Synthetic-geometry hit test for builds without the renderer. Returns the
+  // topmost element; when hits is an array, it also receives every element
+  // under the point in tree order.
+  function _syntheticHit(doc, x, y, hits) {
+    var all = doc.querySelectorAll('*');
     var best = null;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
       // documentElement / body span the viewport; skip them so we pick a
       // real descendant instead of falling back to <html>/<body>.
-      if (el === this.documentElement || el === this.body) continue;
+      if (el === doc.documentElement || el === doc.body) continue;
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       // The renderer resolves this inherited property and carries it with the
@@ -18525,7 +18531,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         // instead of the page behind it.
         var visible = true;
         var ancestor = el.parentElement;
-        while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
+        while (ancestor && ancestor !== doc.documentElement && ancestor !== doc.body) {
           var style = null;
           try { style = getComputedStyle(ancestor); } catch (_e) {}
           var ox = style ? (style.overflowX || style.overflow || '') : '';
@@ -18552,6 +18558,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
+        if (hits) hits.push(el);
         if (!best || best.contains(el)) {
           best = el;
         } else if (!el.contains(best)) {
@@ -18564,11 +18571,35 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         }
       }
     }
-    return best || this.body || this.documentElement || null;
-  };
+    return best;
+  }
+  // CSSOM View: every hit-testable element at the point, topmost first, with
+  // the document element last. Unlike elementFromPoint, the root is not
+  // replaced with the body.
   Document.prototype.elementsFromPoint = function(x, y) {
-    var el = this.elementFromPoint(x, y);
-    return el ? [el] : [];
+    const method = _documentRealmMember(this, 'elementsFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return [];
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return [];
+    var hits = [];
+    if (typeof __obscuraCore.ops.op_layout_hit_list === 'function') {
+      var raw = __obscuraCore.ops.op_layout_hit_list(x, y, _realmFrameId);
+      if (raw) hits = JSON.parse(raw).map(_wrapEl).filter(Boolean);
+    } else {
+      // Later synthetic boxes cover earlier ones; the elementFromPoint winner
+      // stays first. The viewport-sized body and root are under every point.
+      var best = _syntheticHit(this, x, y, hits);
+      hits.reverse();
+      if (best) hits.unshift(hits.splice(hits.indexOf(best), 1)[0]);
+      if (this.body) hits.push(this.body);
+    }
+    var root = this.documentElement;
+    if (root && hits[hits.length - 1] !== root) hits.push(root);
+    return hits;
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {

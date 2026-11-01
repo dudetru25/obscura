@@ -8186,6 +8186,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
+        ops.push(op_layout_hit_list());
         ops.push(op_layout_caret());
         ops.push(op_layout_caret_rect());
         ops.push(op_resize_observer_measurements());
@@ -9290,6 +9291,29 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
     prepared
         .hit_test(dom, scroll, x as f32, y as f32)
         .map_or(-1, |id| id.index() as i32)
+}
+
+/// Renderer-backed CSSOM `elementsFromPoint()`. Returns a JSON array of native
+/// node ids, topmost first, or an empty string when no layout is available.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_hit_list(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let prepared = gs.prepared_render.as_ref()?;
+        let dom = gs.dom.as_ref()?;
+        let ids: Vec<usize> = prepared
+            .hit_list(dom, scroll, x as f32, y as f32)
+            .into_iter()
+            .map(|id| id.index())
+            .collect();
+        Some(serde_json::json!(ids).to_string())
+    })).ok().flatten().unwrap_or_default()
 }
 
 #[cfg(feature = "render")]
