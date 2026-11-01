@@ -19,14 +19,15 @@ class ProcessMeasurementTests(unittest.TestCase):
             commands.append(command)
             kwargs["stdout"].write(b"5000\n")
             kwargs["stdout"].flush()
-            Path(command[command.index("-o") + 1]).write_text("1024\n")
+            Path(command[command.index("-o") + 1]).write_text("1024 0.10 0.02\n")
             self.assertTrue(kwargs["start_new_session"])
             return process
 
         with patch.object(perf_smoke.subprocess, "Popen", side_effect=start), \
                 patch.object(perf_smoke.os, "killpg") as cleanup:
-            _, rss = perf_smoke.run_once(Path("/fake/engine"), "http://localhost/", "5000", 5000)
+            _, rss, cpu_ms = perf_smoke.run_once(Path("/fake/engine"), "http://localhost/", "5000", 5000)
         self.assertEqual(rss, 1024)
+        self.assertAlmostEqual(cpu_ms, 120.0)
         process.wait.assert_called_once_with()
         self.assertEqual(commands[0][:4], ["timeout", "--signal=KILL", "45", "prlimit"])
         self.assertIn("--fsize=2097152", commands[0])
