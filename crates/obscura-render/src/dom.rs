@@ -16753,8 +16753,29 @@ mod tests {
                 #target { width:1px; height:1px }
                 @container (width >= 440px) { #target { width:44px } }
                 @container (width > 499px) { #target { width:50px } }
+                #unit-var { --quarter: calc(100cqw / 4); width: var(--quarter) }
+                #unit-bare { width:25cqw }
+                #unit-skip { display:contents; container-type:inline-size }
+                #unit-contents { width:10cqw }
+                #unit-block-axis { width:10cqmin; height:10cqh }
+                #unit-max { width:10cqmax }
+                #unit-inner { container-type:inline-size; width:200px }
+                #unit-nested { width:50cqi }
+                #unit-margin { width:1px; margin-left:10cqw }
+                #unit-inset { width:1px; position:relative; left:5cqw }
+                #unit-infinite { width:infcqw }
+                #unit-nan { width:nancqw }
+                #unit-overflow { width:1e39cqw }
             </style></head><body>
-                <div id="container"><div id="target"></div></div>
+                <div id="container"><div id="target"></div>
+                    <div id="unit-var"></div><div id="unit-bare"></div>
+                    <div id="unit-skip"><div id="unit-contents"></div></div>
+                    <div id="unit-block-axis"></div><div id="unit-max"></div>
+                    <div id="unit-inner"><div id="unit-nested"></div></div>
+                    <div id="unit-margin"></div><div id="unit-inset"></div>
+                    <div id="unit-infinite"></div><div id="unit-nan"></div>
+                    <div id="unit-overflow"></div>
+                </div>
             </body></html>"#,
         );
         let (laid, telemetry) =
@@ -16763,11 +16784,49 @@ mod tests {
         let target = tree.get_element_by_id("target").unwrap();
         assert!((laid.rects[&container].width - 500.0).abs() < 0.1);
         assert_eq!(laid.styles[&target].width, crate::Dimension::Px(44.0));
+        // cq units resolve against the 440px content box of the nearest
+        // eligible container. The inline-size container has no block axis,
+        // so cqh falls back to the 720px viewport height.
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let content_x = laid.rects[&container].x + 30.0;
+        for (id, width) in [
+            ("unit-var", 110.0),
+            ("unit-bare", 110.0),
+            ("unit-contents", 44.0),
+            ("unit-block-axis", 44.0),
+            ("unit-max", 72.0),
+            ("unit-nested", 100.0),
+        ] {
+            assert!((rect(id).width - width).abs() < 0.1, "{id}: {:?}", rect(id));
+        }
+        assert!((rect("unit-block-axis").height - 72.0).abs() < 0.1);
+        assert!((rect("unit-margin").x - (content_x + 44.0)).abs() < 0.1);
+        assert!((rect("unit-inset").x - (content_x + 22.0)).abs() < 0.1);
+        for id in ["unit-infinite", "unit-nan", "unit-overflow"] {
+            assert!((rect(id).width - 440.0).abs() < 0.1, "{id}: {:?}", rect(id));
+        }
         assert_eq!(telemetry.passes, 2);
         assert_eq!(
             telemetry.termination,
             ContainerLayoutTermination::GeometryStable
         );
+
+        // Units can first become active after a query-enabled pass. The
+        // decision signature can stabilize before their geometry does.
+        let tree = parse_html(
+            r#"<style>
+                #outer { container-type:inline-size; width:500px }
+                #inner { container-type:inline-size }
+                @container (width > 400px) { #inner { width:250px } }
+                @container (width > 100px) { #late { height:10cqi } }
+            </style><div id="outer"><div id="inner"><div id="late"></div></div></div>"#,
+        );
+        let (laid, telemetry) =
+            layout_dom_with_web_fonts_measured(&tree, (1280.0, 720.0), &HashMap::new(), &[]);
+        let target = tree.get_element_by_id("late").unwrap();
+        assert!((laid.rects[&target].height - 25.0).abs() < 0.1);
+        assert_eq!(telemetry.passes, 4);
+        assert_eq!(telemetry.termination, ContainerLayoutTermination::GeometryStable);
     }
 
     #[test]
@@ -17806,11 +17865,15 @@ mod tests {
     #[test]
     fn layout_without_container_queries_keeps_one_pass_fast_path() {
         let tree = parse_html(
-            r#"<html><head><style>#target{width:25px}</style></head>
-               <body><div id="target"></div></body></html>"#,
+            r#"<html><head><style>#target{width:25px}#units{width:10cqw}</style></head>
+               <body><div id="target"></div><div id="units"></div></body></html>"#,
         );
-        let (_, telemetry) =
+        let (laid, telemetry) =
             layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+        // Without an eligible container, cq units use the viewport and need
+        // no container-query pass.
+        let units = tree.get_element_by_id("units").unwrap();
+        assert!((laid.rects[&units].width - 80.0).abs() < 0.1);
         assert_eq!(
             telemetry,
             ContainerLayoutTelemetry {
@@ -17822,6 +17885,26 @@ mod tests {
                 retained_fallback: 0,
             }
         );
+
+        // Danse uses container units without @container rules. A query
+        // container is enough to require geometry convergence. A fallback
+        // axis alone must keep the one-pass path.
+        for (declaration, width, height, passes, termination) in [
+            ("width:25cqw", 125.0, 0.0, 2, ContainerLayoutTermination::GeometryStable),
+            ("height:10cqh", 500.0, 60.0, 1, ContainerLayoutTermination::NoQueries),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<style>#container{{container-type:inline-size;width:500px}}
+                #unit{{{declaration}}}</style><div id="container"><div id="unit"></div></div>"#,
+            ));
+            let (laid, telemetry) =
+                layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+            let unit = tree.get_element_by_id("unit").unwrap();
+            assert!((laid.rects[&unit].width - width).abs() < 0.1, "{declaration}");
+            assert!((laid.rects[&unit].height - height).abs() < 0.1, "{declaration}");
+            assert_eq!(telemetry.passes, passes, "{declaration}");
+            assert_eq!(telemetry.termination, termination, "{declaration}");
+        }
     }
 
     #[test]
