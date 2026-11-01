@@ -6446,7 +6446,41 @@ fn px(value: &str) -> Option<f32> {
 }
 
 fn deferred_length_expression(value: &str) -> Option<String> {
-    value.trim().contains('(').then(|| value.trim().to_string())
+    let value = value.trim();
+    (value.contains('(') || container_length(value).is_some()).then(|| value.to_string())
+}
+
+/// CSS Containment 3 container query length units. The renderer supports only
+/// horizontal-tb, so the inline axis is width and the block axis is height.
+const CONTAINER_LENGTH_UNITS: [&str; 6] = ["cqmin", "cqmax", "cqw", "cqh", "cqi", "cqb"];
+
+fn container_length(value: &str) -> Option<(f32, &'static str)> {
+    CONTAINER_LENGTH_UNITS.iter().find_map(|&unit| {
+        let split = value.len().checked_sub(unit.len())?;
+        value
+            .get(split..)?
+            .eq_ignore_ascii_case(unit)
+            .then_some(())?;
+        value[..split]
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(|number| (number, unit))
+    })
+}
+
+/// Content-box sizes of the query containers that resolve `cq*` units for one
+/// element. Each axis holds the nearest eligible ancestor container on that
+/// axis, else the small viewport size. `used` records whether a resolved
+/// expression consumed either axis.
+pub(crate) struct ContainerUnits {
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) width_is_container: bool,
+    pub(crate) height_is_container: bool,
+    pub(crate) dependent: std::cell::Cell<bool>,
+    pub(crate) used: std::cell::Cell<bool>,
 }
 
 /// Resolve functional CSS lengths once the actual layout context is known.
@@ -6467,6 +6501,30 @@ pub(crate) fn resolve_contextual_length(
         vw,
         vh,
         percent_base,
+        container: None,
+    };
+    resolve_contextual(value, &context)
+}
+
+/// `resolve_contextual_length` for box lengths that may contain `cq*` units.
+/// Other callers have no query-container context, so those units stay
+/// unresolved there instead of using an invented basis.
+pub(crate) fn resolve_container_relative_length(
+    value: &str,
+    em_px: f32,
+    rem_px: f32,
+    vw: f32,
+    vh: f32,
+    percent_base: f32,
+    container: &ContainerUnits,
+) -> Option<f32> {
+    let context = LengthContext {
+        em_px,
+        rem_px,
+        vw,
+        vh,
+        percent_base,
+        container: Some(container),
     };
     resolve_contextual(value, &context)
 }
@@ -6497,12 +6555,13 @@ pub(crate) fn functional_percentage_factor(value: &str) -> Option<f32> {
 }
 
 #[derive(Clone, Copy)]
-struct LengthContext {
+struct LengthContext<'a> {
     em_px: f32,
     rem_px: f32,
     vw: f32,
     vh: f32,
     percent_base: f32,
+    container: Option<&'a ContainerUnits>,
 }
 
 // CSS math functions recurse through nested calc()/min()/max()/clamp()
@@ -6646,6 +6705,25 @@ fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
     }
     if let Some(value) = lower.strip_suffix("vh").and_then(parse) {
         return Some(value * context.vh);
+    }
+    if let Some((value, unit)) = container_length(&lower) {
+        let container = context.container?;
+        container.used.set(true);
+        container.dependent.set(container.dependent.get() || match unit {
+            "cqw" | "cqi" => container.width_is_container,
+            "cqh" | "cqb" => container.height_is_container,
+            _ => container.width_is_container || container.height_is_container,
+        });
+        let (width, height) = (container.width / 100.0, container.height / 100.0);
+        return Some(
+            value
+                * match unit {
+                    "cqw" | "cqi" => width,
+                    "cqh" | "cqb" => height,
+                    "cqmin" => width.min(height),
+                    _ => width.max(height),
+                },
+        );
     }
     if let Some(value) = lower.strip_suffix('%').and_then(parse) {
         return Some(value * context.percent_base / 100.0);

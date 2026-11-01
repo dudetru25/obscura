@@ -4884,13 +4884,16 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         if !stylesheet_cache_hit {
             return None;
         }
-        let active_containers = retained
-            .styles
-            .iter()
-            .filter_map(|(node, style)| {
-                (style.container_type != crate::ContainerType::Normal).then_some(*node)
-            })
-            .collect::<HashSet<_>>();
+        let mut active_containers = HashSet::new();
+        let mut container_unit_users = Vec::new();
+        for (node, style) in &retained.styles {
+            if style.container_type != crate::ContainerType::Normal {
+                active_containers.insert(*node);
+            }
+            if style.uses_container_units {
+                container_unit_users.push(*node);
+            }
+        }
         let connected = std::iter::once(tree.document())
             .chain(rendered_descendants(tree, tree.document()))
             .collect::<HashSet<_>>();
@@ -4915,6 +4918,14 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                         false,
                         &mut dirty,
                     );
+                }
+                // A retained cq length was resolved against earlier container
+                // geometry. Damage elsewhere can resize that container, so
+                // the user and its percentage-based subtree resolve again.
+                for node in container_unit_users {
+                    if connected.contains(&node) {
+                        add_style_subtree(tree, node, &mut dirty);
+                    }
                 }
                 // Once animation damage reaches at least half of the retained
                 // style graph, sparse HashMap reuse no longer offsets dirty-set
@@ -4951,8 +4962,11 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     // Query passes are speculative. Only the chosen layout may commit CSS
     // animation start/stop history; provisional display:none must not restart
     // an animation that is visible in the final container-query cascade.
+    // A page with cq units but no container queries only changes lengths
+    // between passes. Display and animation names stay the same, so repeated
+    // timeline sampling is idempotent and needs no restore copy.
     let animation_before = sheet.has_container_queries().then(|| animation_timeline.clone());
-    let (mut laid, _, mut query, mut cascade_time) = layout_dom_once(
+    let (mut laid, _, mut query, mut cascade_time, mut container_units) = layout_dom_once(
             tree,
             viewport,
             intrinsic,
@@ -4964,7 +4978,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             animation_sample,
             animation_timeline,
         );
-    if !sheet.has_container_queries() {
+    if !sheet.has_container_queries() && !container_units {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
             eprintln!(
@@ -5005,7 +5019,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     // one-pass path avoids a redundant whole-document layout.
     let inactive = if snapshot.boxes.is_empty() {
         Some(ContainerLayoutTermination::NoContainers)
-    } else if shadow_sheets.is_empty() && !has_container_query_subject(tree, &sheet) {
+    } else if !container_units
+        && shadow_sheets.is_empty()
+        && !has_container_query_subject(tree, &sheet)
+    {
         // Geometry cannot activate an unmatched selector. Recheck on every
         // flush so DOM/state changes can activate normal and pseudo rules.
         // Shadow scopes keep their existing convergence path.
@@ -5047,6 +5064,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     }
     let mut previous_candidate: Option<(DomLayout, crate::css::ContainerDecisionSignature, crate::AnimationTimelineState)> = None;
     let mut seen_signatures = Vec::new();
+    // Container-relative lengths depend on geometry, not only on applied
+    // query decisions. Equal signatures then prove nothing; only a stable
+    // snapshot ends the loop, and a repeated earlier snapshot is a cycle.
+    let mut seen_snapshots = Vec::new();
     let mut passes = 1;
     let mut termination = ContainerLayoutTermination::PassCapFallback;
     // Gecko permits at most one CQ-triggered update per container element in
@@ -5079,8 +5100,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     });
     let mut needs_fallback = false;
     for pass in 2..=max_passes {
-        *animation_timeline = animation_before.as_ref().expect("query timeline").clone();
-        let (next, signature, pass_query, pass_cascade) = layout_dom_once(
+        if let Some(before) = animation_before.as_ref() {
+            *animation_timeline = before.clone();
+        }
+        let (next, signature, pass_query, pass_cascade, pass_units) = layout_dom_once(
                 tree,
                 viewport,
                 intrinsic,
@@ -5097,6 +5120,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         query.cache_hits += pass_query.cache_hits;
         query.ancestor_steps += pass_query.ancestor_steps;
         cascade_time += pass_cascade;
+        container_units |= pass_units;
         let next_snapshot = container_snapshot(tree, &next);
         // The first query-enabled pass replaces the initial layout. Move its
         // query-disabled style maps into the owning preparation instead of
@@ -5117,7 +5141,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         if let Some(reason) = container_iteration_termination(
             next_snapshot == snapshot,
             &signature,
-            previous_candidate.as_ref().map(|(_, signature, _)| signature),
+            previous_candidate
+                .as_ref()
+                .filter(|_| !container_units)
+                .map(|(_, signature, _)| signature),
         ) {
             termination = reason;
             // Equal adjacent signatures prove that the *previous* candidate's
@@ -5135,14 +5162,22 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             };
             break;
         }
-        if seen_signatures.contains(&signature) {
+        let repeated = if container_units {
+            seen_snapshots.contains(&next_snapshot)
+        } else {
+            seen_signatures.contains(&signature)
+        };
+        if repeated {
             termination = ContainerLayoutTermination::OscillationFallback;
             needs_fallback = true;
             break;
         }
         seen_signatures.push(signature.clone());
         previous_candidate = Some((next, signature, animation_timeline.clone()));
-        snapshot = next_snapshot;
+        let previous_snapshot = std::mem::replace(&mut snapshot, next_snapshot);
+        if container_units {
+            seen_snapshots.push(previous_snapshot);
+        }
         if pass == max_passes {
             needs_fallback = true;
         }
@@ -5153,8 +5188,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         // we return a layout whose conditional declarations contradict the
         // geometry used to choose them. Disable the unstable conditional
         // rules for this render and expose the downgrade in telemetry.
-        *animation_timeline = animation_before.as_ref().expect("query timeline").clone();
-        let (fallback, _, fallback_query, fallback_cascade) = layout_dom_once(
+        if let Some(before) = animation_before.as_ref() {
+            *animation_timeline = before.clone();
+        }
+        let (fallback, _, fallback_query, fallback_cascade, _) = layout_dom_once(
                 tree,
                 viewport,
                 intrinsic,
@@ -5226,6 +5263,7 @@ fn layout_dom_once(
     Option<crate::css::ContainerDecisionSignature>,
     crate::css::ContainerQueryStats,
     std::time::Duration,
+    bool,
 ) {
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
@@ -5320,6 +5358,9 @@ fn layout_dom_once(
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
+    // Some resolved cq length used a query container's geometry. Its value is
+    // provisional until that geometry converges.
+    let mut container_units_dependent = false;
     if let Some(root_id) = root {
         // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
         // `scrollbar-gutter:stable` reserves it even when the scrollbar track
@@ -5398,6 +5439,7 @@ fn layout_dom_once(
             /// A definite post-flexing height whose numeric basis is only
             /// available during layout. Keep descendant percentages intact.
             cb_height_deferred: bool,
+            container_units: ContainerUnitScope,
         }
         impl Default for Inherited {
             fn default() -> Self {
@@ -5448,6 +5490,12 @@ fn layout_dom_once(
                     cb_height: 0.0,
                     cb_height_definite: false,
                     cb_height_deferred: false,
+                    container_units: ContainerUnitScope {
+                        width: 0.0,
+                        height: 0.0,
+                        width_is_container: false,
+                        height_is_container: false,
+                    },
                 }
             }
         }
@@ -5484,6 +5532,14 @@ fn layout_dom_once(
         root_inh.cb_width = initial_cb_width;
         root_inh.cb_height = viewport.1;
         root_inh.cb_height_definite = true;
+        // Without an eligible query container, cq units use the small
+        // viewport size. Obscura has one viewport size for all three.
+        root_inh.container_units = ContainerUnitScope {
+            width: viewport.0,
+            height: viewport.1,
+            width_is_container: false,
+                        height_is_container: false,
+        };
         // This set records computed definiteness after walking the real
         // containing-block chain. Merely retaining `height:Percent` is not
         // sufficient: under an auto-height containing block it computes to
@@ -5692,6 +5748,8 @@ fn layout_dom_once(
                 inh.cb_height = child_cb_height;
                 inh.cb_height_definite = child_cb_height_definite;
                 inh.cb_height_deferred = child_cb_height_deferred;
+                inh.container_units =
+                    descendant_container_units(id, styles.get(&id), snapshot, inh.container_units);
                 for child in style_children(tree, id).into_iter().rev() {
                     queue.push((child, inh.clone()));
                 }
@@ -5891,6 +5949,14 @@ fn layout_dom_once(
                     style.line_height = Some(crate::LineHeight::Px(pixels));
                 }
                 let cb_w = inh.cb_width;
+                let container_units = crate::style::ContainerUnits {
+                    width: inh.container_units.width,
+                    height: inh.container_units.height,
+                    width_is_container: inh.container_units.width_is_container,
+                    height_is_container: inh.container_units.height_is_container,
+                    dependent: std::cell::Cell::new(false),
+                    used: std::cell::Cell::new(false),
+                };
                 for index in 0..6 {
                     let Some(expression) = style.size_expressions[index].as_deref() else {
                         continue;
@@ -5923,13 +5989,14 @@ fn layout_dom_once(
                     } else {
                         cb_w
                     };
-                    let Some(px) = crate::style::resolve_contextual_length(
+                    let Some(px) = crate::style::resolve_container_relative_length(
                         expression,
                         em_px,
                         root_fs,
                         vw,
                         vh,
                         percent_base,
+                        &container_units,
                     ) else {
                         continue;
                     };
@@ -5975,13 +6042,14 @@ fn layout_dom_once(
                     } else {
                         viewport.1
                     };
-                    style.inset[index] = crate::style::resolve_contextual_length(
+                    style.inset[index] = crate::style::resolve_container_relative_length(
                         expression,
                         em_px,
                         root_fs,
                         vw,
                         vh,
                         percent_base,
+                        &container_units,
                     )
                     .map(crate::Dimension::Px);
                 }
@@ -6146,8 +6214,8 @@ fn layout_dom_once(
                 // back into `LayoutStyle` after the final layout.
                 for i in 0..4 {
                     if let Some(expression) = style.padding_expressions[i].as_deref() {
-                        if let Some(px) = crate::style::resolve_contextual_length(
-                            expression, em_px, root_fs, vw, vh, cb_w,
+                        if let Some(px) = crate::style::resolve_container_relative_length(
+                            expression, em_px, root_fs, vw, vh, cb_w, &container_units,
                         ) {
                             match i {
                                 0 => style.padding.top = px.max(0.0),
@@ -6158,8 +6226,8 @@ fn layout_dom_once(
                         }
                     }
                     if let Some(expression) = style.margin_expressions[i].as_deref() {
-                        if let Some(px) = crate::style::resolve_contextual_length(
-                            expression, em_px, root_fs, vw, vh, cb_w,
+                        if let Some(px) = crate::style::resolve_container_relative_length(
+                            expression, em_px, root_fs, vw, vh, cb_w, &container_units,
                         ) {
                             match i {
                                 0 => style.margin.top = px,
@@ -6199,6 +6267,8 @@ fn layout_dom_once(
                         }
                     }
                 }
+                style.uses_container_units = container_units.used.get();
+                container_units_dependent |= container_units.dependent.get();
 
                 // Pseudo-elements inherit the originating element's COMPUTED
                 // values. They were cascaded beside the host before this
@@ -6519,6 +6589,8 @@ fn layout_dom_once(
             inh.cb_height = child_cb_height;
             inh.cb_height_definite = child_cb_height_definite;
             inh.cb_height_deferred = child_cb_height_deferred;
+            inh.container_units =
+                descendant_container_units(id, styles.get(&id), snapshot, inh.container_units);
             for child in style_children(tree, id).into_iter().rev() {
                 queue.push((child, inh.clone()));
             }
@@ -7965,6 +8037,7 @@ fn layout_dom_once(
         signature,
         query_stats,
         cascade_time,
+        container_units_dependent,
     )
 }
 
@@ -12211,6 +12284,50 @@ fn build_table(
         ifc_items.table_cols.insert(table_node, (col_px, col_pct));
     }
     Some(table_node)
+}
+
+/// Query-container content sizes that resolve `cq*` units for the children
+/// of one element. Each axis holds the nearest ancestor container that is
+/// eligible for size queries on that axis, else the viewport size.
+#[derive(Clone, Copy)]
+struct ContainerUnitScope {
+    width: f32,
+    height: f32,
+    /// Whether each axis depends on a query container rather than the viewport.
+    width_is_container: bool,
+    height_is_container: bool,
+}
+
+fn descendant_container_units(
+    id: NodeId,
+    style: Option<&crate::LayoutStyle>,
+    snapshot: Option<&crate::css::ContainerSnapshot>,
+    inherited: ContainerUnitScope,
+) -> ContainerUnitScope {
+    let Some(style) = style.filter(|style| !style.display_contents) else {
+        return inherited;
+    };
+    let container_type = effective_container_type(style);
+    if container_type == crate::ContainerType::Normal {
+        return inherited;
+    }
+    let mut scope = ContainerUnitScope {
+        width_is_container: true,
+        height_is_container: inherited.height_is_container
+            || container_type == crate::ContainerType::Size,
+        ..inherited
+    };
+    // Pass 1 has no geometry. Its provisional values keep the outer basis and
+    // the convergence loop replaces them with the measured content box.
+    if let Some(container) = snapshot.and_then(|snapshot| snapshot.boxes.get(&id)) {
+        if container.available_type != crate::ContainerType::Normal {
+            scope.width = container.content_width;
+        }
+        if container.available_type == crate::ContainerType::Size {
+            scope.height = container.content_height;
+        }
+    }
+    scope
 }
 
 /// Effective size-query containment for this generated box.
