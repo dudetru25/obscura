@@ -16,5 +16,5 @@ cargo nextest run --locked --release --features render -p obscura-cdp \
     2>&1 | tee ci-output/hit-list-pointer.log || suite_status=$?
 cargo nextest run --locked --release --features paint -p obscura-render \
     --lib --no-fail-fast -E 'test(hit_testing)' \
-    2>&1 | tee ci-output/hit-list-render.log || suite_status=$?
+    2>&1 | tee ci-output/hit-list-paint.log || suite_status=$?
 exit "$suite_status"
