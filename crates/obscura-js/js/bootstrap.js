@@ -17762,7 +17762,7 @@ if (typeof FileReader === 'undefined') {
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
-// Real network sockets aren't implemented; we don't have a runtime WS / SSE
+// Real network sockets aren't implemented; we don't have a runtime WebSocket
 // client in V8. But pages that wait for an `open` event (Vite HMR clients
 // embedded on docs sites, live-dashboards, anything calling
 // `await new Promise(r => ws.addEventListener('open', r))`) silently hang
@@ -17772,7 +17772,7 @@ if (typeof FileReader === 'undefined') {
 // Minimal EventTarget shared by socket-like classes. Real `EventTarget` is
 // currently aliased to `Node`, which would drag DOM-tree assumptions into a
 // `WebSocket`. Defining a private shim avoids that.
-function _makeListenerBox(self) {
+function _makeListenerBox(self, reportError) {
   const map = new Map();
   self.addEventListener = function (type, fn) {
     if (typeof fn !== 'function') return;
@@ -17790,30 +17790,113 @@ function _makeListenerBox(self) {
     const bucket = map.get(event.type);
     if (!bucket) return true;
     for (const fn of bucket.slice()) {
-      try { fn.call(self, event); } catch (e) { /* swallow */ }
+      try { fn.call(self, event); } catch (e) { if (reportError) reportError(e); }
     }
     return true;
   };
 }
 
 if (typeof EventSource === 'undefined') {
+  // HTML EventSource over the scripted-fetch transport. The native op parses
+  // the open response incrementally; close() cancels the request. A frame's
+  // stream stops with the frame's timers, and its retired realm gets no events.
+  const CONNECTING = 0, OPEN = 1, CLOSED = 2;
   globalThis.EventSource = class EventSource {
+    #generation = 0; #cancelRid; #streamRid; #timer = null;
+    #retry = 3000; #lastEventId = ''; #origin = '';
     constructor(url, init) {
-      this.url = url;
-      this.readyState = 0; // CONNECTING
+      let resolved;
+      try { resolved = new URL(_resolveUrl(url)).href; } catch (e) {
+        throw new DOMException("Failed to construct 'EventSource': The URL '" + url + "' is invalid.", 'SyntaxError');
+      }
+      this.url = resolved;
+      this.readyState = CONNECTING;
       this.withCredentials = !!(init && init.withCredentials);
       this.onopen = null; this.onmessage = null; this.onerror = null;
-      _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      _makeListenerBox(this, _reportMutationObserverError);
+      this.#connect();
     }
-    close() { this.readyState = 2; }
-    static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+    close() {
+      this.#generation++;
+      this.readyState = CLOSED;
+      if (this.#timer !== null) { clearTimeout(this.#timer); this.#timer = null; }
+      this.#release();
+    }
+    #fire(event) {
+      event.target = event.currentTarget = this;
+      const handler = event.type === 'open' || event.type === 'message' || event.type === 'error'
+        ? this['on' + event.type] : null;
+      if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) { _reportMutationObserverError(e); } }
+      this.dispatchEvent(event);
+    }
+    #retired() {
+      if (_browserPostedTaskGeneration() >= 0) return false;
+      this.close();
+      return true;
+    }
+    #release() {
+      if (this.#streamRid !== undefined) { __obscuraCore.ops.op_try_close(this.#streamRid); this.#streamRid = undefined; }
+      if (this.#cancelRid !== undefined) { __obscuraCore.ops.op_try_close(this.#cancelRid); this.#cancelRid = undefined; }
+    }
+    async #connect() {
+      const generation = ++this.#generation;
+      const cancelRid = this.#cancelRid = __obscuraCore.ops.op_fetch_cancel_handle();
+      const headers = { Accept: 'text/event-stream' };
+      if (this.#lastEventId) headers['Last-Event-ID'] = this.#lastEventId;
+      const pageOrigin = (function() { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch(e) { return ""; } })();
+      let response;
+      try {
+        response = JSON.parse(await __obscuraCore.ops.op_fetch_url(this.url, 'GET', JSON.stringify(headers),
+          new Uint8Array(0), pageOrigin, 'cors', this.withCredentials ? 'include' : 'same-origin',
+          { cancel_rid: cancelRid, destination: 'EventSource', frame_id: _realmFrameId }));
+      } catch (e) {
+        return this.#reconnect(generation);
+      }
+      if (generation !== this.#generation || this.#retired()) {
+        if (response.streamRid != null) __obscuraCore.ops.op_try_close(response.streamRid);
+        return;
+      }
+      // Policy blocks, CORS failures, non-200 status and other MIME types
+      // fail the connection without a stream.
+      if (response.streamRid == null) return this.#fail(generation);
+      this.#streamRid = response.streamRid;
+      this.#origin = new URL(response.url).origin;
+      this.readyState = OPEN;
+      this.#fire(new Event('open'));
+      while (generation === this.#generation) {
+        let batch = null;
+        try { batch = await __obscuraCore.ops.op_event_stream_read(response.streamRid); } catch (e) {}
+        if (generation !== this.#generation || batch === null) break;
+        if (batch.retry != null) this.#retry = batch.retry;
+        for (const message of batch.events) {
+          if (generation !== this.#generation || this.#retired()) return;
+          this.#lastEventId = message.lastEventId;
+          this.#fire(new MessageEvent(message.type, {
+            data: message.data, origin: this.#origin, lastEventId: message.lastEventId,
+          }));
+        }
+        if (generation === this.#generation) this.#lastEventId = batch.lastEventId;
+      }
+      this.#reconnect(generation);
+    }
+    #reconnect(generation) {
+      if (generation !== this.#generation || this.readyState === CLOSED || this.#retired()) return;
+      this.#release();
+      this.readyState = CONNECTING;
+      this.#fire(new Event('error'));
+      if (generation !== this.#generation || this.readyState !== CONNECTING) return;
+      this.#timer = setTimeout(() => {
+        this.#timer = null;
+        if (generation === this.#generation && this.readyState === CONNECTING) this.#connect();
+      }, Math.min(this.#retry, 2147483647));
+    }
+    #fail(generation) {
+      if (generation !== this.#generation || this.readyState === CLOSED || this.#retired()) return;
+      this.#release();
+      this.readyState = CLOSED;
+      this.#fire(new Event('error'));
+    }
+    static CONNECTING = CONNECTING; static OPEN = OPEN; static CLOSED = CLOSED;
   };
 }
 
