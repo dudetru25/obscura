@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>placement-repro:pending</title>
+<style>
+  html, body { margin: 0; }
+  body { font: 16px/1.45 sans-serif; }
+  .block { box-sizing: border-box; padding: 0 24px; }
+  h2.block { font-size: 28px; line-height: 1.2; margin: 0 0 16px; }
+  p.block { margin: 0 0 16px; }
+  button.block { font: inherit; padding: 6px 24px; border: 1px solid currentColor; background: none; }
+  [data-role="root"] { display: block; padding: 48px 0; }
+  [data-role="nested"] { display: block; box-sizing: border-box; min-height: 512px; padding: 40px 0; }
+  [data-role="piece"] { width: 760px; }
+
+  /* Converted state: a fixed-row grid that is an inline-size container. */
+  [data-grid] {
+    position: relative;
+    --gap-inset: 11px;
+    --rows: var(--d-rows);
+    --overflow: 0px;
+    --grid-height: max(var(--min-h), calc(var(--rows) * (var(--row-h) + var(--row-gap)) - var(--row-gap) - var(--row-tail)));
+    display: grid;
+    container-type: inline-size;
+    grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
+    grid-template-rows: repeat(var(--rows), var(--row-h));
+    grid-auto-rows: var(--row-h);
+    column-gap: min(var(--col-gap), max(0px, calc((100% - var(--cols) * 1px) / (var(--cols) - 1))));
+    row-gap: var(--row-gap);
+    align-content: start;
+    align-items: stretch;
+  }
+  [data-grid] > [data-zone] { display: contents; }
+  [data-role][data-grid] {
+    min-height: var(--min-h);
+    height: calc(var(--grid-height) + var(--overflow));
+    padding: 0 var(--gap-inset) var(--overflow) !important;
+  }
+  [data-cell] {
+    --col: var(--d-col); --row: var(--d-row); --col-span: var(--d-col-span); --row-span: var(--d-row-span);
+    --x: var(--d-x); --y: var(--d-y); --w: var(--d-w); --h: var(--d-h);
+    --eff-gap: min(var(--col-gap), max(0px, calc((100cqw - var(--cols) * 1px) / (var(--cols) - 1))));
+    --cell-w: calc((100cqw - (var(--cols) - 1) * var(--eff-gap)) / var(--cols));
+    --frame-h: max(1px, calc(var(--h) * (var(--row-h) + var(--row-gap)) - var(--row-gap)));
+    position: relative;
+    grid-column: var(--col) / span var(--col-span);
+    grid-row: var(--row) / span var(--row-span);
+    left: calc(var(--x) * (var(--cell-w) + var(--eff-gap)));
+    top: calc(var(--y) * (var(--row-h) + var(--row-gap)));
+    width: max(1px, calc(var(--w) * var(--cell-w) + (var(--w) - 1) * var(--eff-gap)));
+    min-width: 0;
+    min-height: var(--frame-h);
+    margin: 0;
+    align-self: start;
+  }
+  [data-cell] > * { width: 100%; max-width: none !important; margin: 0 !important; }
+  [data-cell] > .block { padding-inline: 0; }
+  [data-probe] { position: absolute; top: 0; left: 0; width: 100cqw; height: 0; }
+</style>
+</head>
+<body>
+<section class="block" data-role="root">
+  <div class="block" data-role="nested">
+    <h2 class="block" data-role="title" data-content-sized>Arrange the pieces on this surface</h2>
+    <p class="block" data-role="piece" data-content-sized>Pick up this paragraph and move it two columns right and six rows down.</p>
+    <button class="block" data-role="sibling">Stay in place</button>
+  </div>
+</section>
+<script>
+(() => {
+  const ROW_H = 32, ROW_GAP = 11, COLS = 24, INSET = 11, PITCH = ROW_H + ROW_GAP
+  const MOVE = { columns: 2, rows: 6 }, TOLERANCE = 0.2, MAX_FRAMES = 30
+  const q = role => document.querySelector(`[data-role="${role}"]`)
+  const root = q('root'), nested = q('nested')
+  const roles = ['title', 'piece', 'sibling']
+  const px = value => parseFloat(value) || 0
+  const rect = node => { const r = node.getBoundingClientRect(); return { left: r.left, top: r.top, width: r.width, height: r.height } }
+  const frame = () => new Promise(resolve => requestAnimationFrame(resolve))
+  const out = { complete: false, phase: 'flow', viewport: { width: innerWidth, height: innerHeight }, hookRuns: [], verdicts: [], errors: [] }
+  window.__placementRepro = out
+  const fail = message => { out.errors.push(message); out.pass = false }
+
+  // Phase 1: flow geometry, read exactly like the acceptance readback (content box for padded blocks).
+  const flowBox = role => { const node = q(role), r = rect(node), s = getComputedStyle(node); const pl = node.classList.contains('block') ? px(s.paddingLeft) : 0, pr = node.classList.contains('block') ? px(s.paddingRight) : 0; return { left: r.left + pl, top: r.top, width: r.width - pl - pr, height: r.height } }
+  out.before = { root: rect(root), nested: rect(nested), title: flowBox('title'), sibling: flowBox('sibling'), piece: flowBox('piece') }
+
+  // Phase 2: convert the nested flow section into a placement grid with exact fractional cells.
+  out.phase = 'conversion'
+  const sectionRect = rect(nested), sectionStyle = getComputedStyle(nested)
+  const borders = ['Left', 'Right', 'Top', 'Bottom'].map(side => px(sectionStyle[`border${side}Width`]))
+  const gridWidth = sectionRect.width - borders[0] - borders[1] - INSET * 2
+  let customHeight = sectionRect.height - borders[2] - borders[3]
+  const columnGap = Math.min(ROW_GAP, Math.max(0, (gridWidth - COLS) / (COLS - 1)))
+  const columnPitch = (gridWidth + columnGap) / COLS
+  let rows = Math.max(1, Math.ceil((customHeight + ROW_GAP) / PITCH))
+  const cells = Object.fromEntries(roles.map(role => {
+    const b = flowBox(role)
+    return [role, { column: (b.left - sectionRect.left - borders[0] - INSET) / columnPitch + 1, row: (b.top - sectionRect.top - borders[2]) / PITCH + 1, width: (b.width + columnGap) / columnPitch, height: (b.height + ROW_GAP) / PITCH }]
+  }))
+  for (const cell of Object.values(cells)) rows = Math.max(rows, Math.ceil(cell.row + cell.height - 1))
+  out.conversion = { gridWidth, customHeight, rows, columnGap, columnPitch, cells: JSON.parse(JSON.stringify(cells)) }
+
+  const rowTail = height => Math.ceil((height + ROW_GAP) / PITCH) * PITCH - ROW_GAP - height
+  const applyGrid = () => {
+    for (const [name, value] of Object.entries({ '--cols': COLS, '--d-rows': rows, '--row-h': `${ROW_H}px`, '--row-gap': `${ROW_GAP}px`, '--col-gap': `${columnGap}px`, '--min-h': `${customHeight}px`, '--row-tail': `${rowTail(customHeight)}px` })) nested.style.setProperty(name, String(value))
+  }
+  const applyCell = (item, cell) => {
+    const column = Math.floor(cell.column), row = Math.floor(cell.row)
+    const vars = { col: column, row, 'col-span': Math.ceil(cell.column + cell.width - 1) - column + 1, 'row-span': Math.ceil(cell.row + cell.height - 1) - row + 1, x: cell.column - column, y: cell.row - row, w: cell.width, h: cell.height }
+    for (const [name, value] of Object.entries(vars)) item.style.setProperty(`--d-${name}`, String(value))
+  }
+  const items = {}, zone = document.createElement('div')
+  zone.setAttribute('data-zone', '')
+  nested.setAttribute('data-grid', '')
+  applyGrid()
+  nested.prepend(zone)
+  for (const role of roles) {
+    const block = q(role), item = document.createElement('div')
+    item.setAttribute('data-cell', role)
+    if (block.hasAttribute('data-content-sized')) item.setAttribute('data-content-sized', '')
+    zone.append(item); item.append(block); applyCell(item, cells[role]); items[role] = item
+  }
+  const probe = document.createElement('div'); probe.setAttribute('data-probe', ''); nested.append(probe)
+
+  // Overflow hook: same measurement as the editor, scheduled on rAF from ResizeObserver and MutationObserver.
+  let pending = 0
+  const measure = () => {
+    pending = 0
+    const style = getComputedStyle(nested), contentHeight = nested.clientHeight - px(style.paddingBottom)
+    let bottom = contentHeight, culprit = null
+    for (const [role, item] of Object.entries(items)) {
+      if (!item.hasAttribute('data-content-sized')) continue
+      let top = 0, node = item
+      while (node && node !== nested) { top += node.offsetTop; node = node.offsetParent instanceof HTMLElement ? node.offsetParent : null }
+      if (node === nested && top + item.offsetHeight > bottom) { bottom = top + item.offsetHeight; culprit = { role, chainTop: top, offsetHeight: item.offsetHeight } }
+    }
+    const overflow = `${Math.ceil(bottom - contentHeight)}px`
+    out.hookRuns.push({ clientHeight: nested.clientHeight, paddingBottom: style.paddingBottom, contentHeight, bottom, overflow, culprit })
+    if (nested.style.getPropertyValue('--overflow') !== overflow) nested.style.setProperty('--overflow', overflow)
+  }
+  const schedule = () => { if (!pending) pending = requestAnimationFrame(measure) }
+  if (typeof ResizeObserver !== 'function' || typeof MutationObserver !== 'function') { fail('ResizeObserver or MutationObserver is missing'); return }
+  const resize = new ResizeObserver(schedule), mutation = new MutationObserver(schedule)
+  resize.observe(nested)
+  for (const item of Object.values(items)) resize.observe(item.firstElementChild)
+  mutation.observe(nested, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'style'] })
+  schedule()
+
+  // The hook is settled when two frames pass with no pending measure and no overflow change.
+  const settle = async label => {
+    let stable = 0, last = null
+    for (let index = 0; index < MAX_FRAMES; index += 1) {
+      await frame()
+      const current = nested.style.getPropertyValue('--overflow')
+      stable = !pending && current === last ? stable + 1 : 0
+      last = current
+      if (stable >= 2) return
+    }
+    fail(`overflow hook did not settle within ${MAX_FRAMES} frames after ${label}`)
+  }
+
+  const snapshot = () => {
+    const style = getComputedStyle(nested)
+    const contentWidth = nested.clientWidth - px(style.paddingLeft) - px(style.paddingRight)
+    const effectiveGap = Math.min(columnGap, Math.max(0, (contentWidth - COLS) / (COLS - 1)))
+    const cellWidth = (contentWidth - (COLS - 1) * effectiveGap) / COLS
+    const gridRect = rect(nested)
+    const transforms = []
+    for (let node = items.piece; node && node !== document.documentElement; node = node.parentElement) { const t = getComputedStyle(node).transform; if (t && t !== 'none') transforms.push({ node: node.getAttribute('data-role') ?? node.getAttribute('data-cell') ?? node.tagName, transform: t }) }
+    const overflow = px(nested.style.getPropertyValue('--overflow'))
+    return {
+      root: rect(root), nested: gridRect,
+      grid: { computedHeight: style.height, minHeight: style.minHeight, paddingBottom: style.paddingBottom, boxSizing: style.boxSizing, overflowVar: nested.style.getPropertyValue('--overflow'), clientHeight: nested.clientHeight, gridTemplateRows: style.gridTemplateRows, expectedBorderBoxHeight: Math.max(customHeight, rows * PITCH - ROW_GAP - rowTail(customHeight)) + overflow + (style.boxSizing === 'border-box' ? 0 : overflow) },
+      container: { contentWidth, probeWidth: rect(probe).width },
+      items: Object.fromEntries(Object.entries(items).map(([role, item]) => {
+        const cell = cells[role], block = item.firstElementChild, r = rect(item)
+        return [role, { cell, offsetTop: item.offsetTop, offsetParent: item.offsetParent === nested ? 'grid' : item.offsetParent?.tagName ?? null, rectTop: r.top - gridRect.top - nested.clientTop, expectedTop: (cell.row - 1) * PITCH, offsetHeight: item.offsetHeight, rectHeight: r.height, frameHeight: Math.max(1, cell.height * PITCH - ROW_GAP), blockHeight: rect(block).height, blockScrollHeight: block.scrollHeight, rectWidth: r.width, expectedWidth: Math.max(1, cell.width * cellWidth + (cell.width - 1) * effectiveGap) }]
+      })),
+      transforms
+    }
+  }
+
+  const run = async () => {
+    await settle('conversion')
+    out.staged = snapshot()
+
+    // Phase 3: move the piece by whole cells and apply the section height rule for the moved cell.
+    out.phase = 'move'
+    const piece = cells.piece
+    piece.column += MOVE.columns; piece.row += MOVE.rows
+    rows = Math.max(rows, Math.ceil(piece.row + piece.height - 1))
+    const movedBottom = (piece.row + piece.height - 1) * PITCH - ROW_GAP
+    out.move = { cell: { ...piece }, movedBottom, customHeight, raisesCustomHeight: movedBottom > customHeight }
+    if (movedBottom > customHeight) customHeight = movedBottom
+    applyCell(items.piece, piece); applyGrid()
+    await settle('move')
+    out.after = snapshot()
+
+    // Cold control: one fresh subtree with the final inline state, laid out in a single insertion.
+    out.phase = 'cold'
+    const cold = root.cloneNode(true)
+    Object.assign(cold.style, { position: 'absolute', left: '0px', top: '0px', width: `${out.after.root.width}px` })
+    const coldNested = cold.querySelector('[data-grid]')
+    root.after(cold)
+    out.cold = { root: rect(cold), nested: rect(coldNested), sameWidth: Math.abs(rect(coldNested).width - out.after.nested.width) < TOLERANCE, computedHeight: getComputedStyle(coldNested).height }
+    cold.remove()
+    resize.disconnect(); mutation.disconnect()
+
+    // Assertions and the deciding verdicts.
+    const delta = name => out.after.root[name] - out.before.root[name]
+    out.rootDelta = { top: delta('top'), height: delta('height'), nestedHeight: out.after.nested.height - out.before.nested.height }
+    if (out.move.raisesCustomHeight) out.verdicts.push('A:model-raised-custom-height')
+    if (px(out.after.grid.overflowVar) >= 1) {
+      const c = out.hookRuns.at(-1).culprit, i = c ? out.after.items[c.role] : null
+      out.verdicts.push('B:overflow-hook')
+      if (i && Math.abs(i.offsetTop - Math.round(i.expectedTop)) > 0.5) out.verdicts.push('B2:offset-top-chain')
+      if (i && i.offsetHeight > Math.round(i.frameHeight) + 0.5) out.verdicts.push(Math.abs(i.rectWidth - i.expectedWidth) > TOLERANCE ? 'B3:item-width-wrap' : 'B1:text-taller-than-frame')
+    }
+    if (Math.abs(out.after.nested.height - out.after.grid.expectedBorderBoxHeight) > TOLERANCE) out.verdicts.push(out.cold.sameWidth && Math.abs(out.cold.nested.height - out.after.nested.height) > TOLERANCE ? 'C2:stale-incremental-height' : 'C1:height-chain')
+    if (Object.values(out.after.items).some(item => Math.abs(item.rectTop - item.expectedTop) > TOLERANCE)) out.verdicts.push('C4:item-placement')
+    if (!out.cold.sameWidth) out.verdicts.push('C0:cold-width-mismatch')
+    if (Math.abs(out.after.container.probeWidth - out.after.container.contentWidth) > TOLERANCE) out.verdicts.push('C3:container-width')
+    if (out.after.transforms.length) out.verdicts.push('D:transform-in-offset-chain')
+    out.pass = out.errors.length === 0 && Math.abs(out.rootDelta.height) < TOLERANCE && Math.abs(out.rootDelta.top) < TOLERANCE
+    document.title = `placement-repro:${out.pass ? 'PASS' : 'FAIL'}:${out.verdicts.join(',') || 'none'}`
+    out.phase = 'complete'; out.complete = true
+    const result = document.createElement('pre'); result.id = 'placement-repro-result'; result.style.display = 'none'; result.textContent = JSON.stringify(out); document.body.append(result)
+  }
+  addEventListener('load', run)
+})()
+</script>
+</body>
+</html>

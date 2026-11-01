@@ -1087,6 +1087,318 @@ async fn fetch_body_result(
     Ok(metadata.to_string())
 }
 
+/// HTML "Parsing an event stream". Line ends are ASCII, so each complete line
+/// decodes as UTF-8 even when a code point spans transport chunks.
+///
+/// One read is bounded by `max_pending_bytes`: the chunk being parsed, the line
+/// being decoded, the retained field buffers and every string the batch owns
+/// count against it before each copy is made. String capacity, V8 copies made
+/// when the batch crosses into JavaScript and the request headers are outside
+/// this count.
+struct EventStreamParser {
+    line: Vec<u8>,
+    after_cr: bool,
+    first_line: bool,
+    data: String,
+    event_type: String,
+    id_buffer: String,
+    last_event_id: String,
+    max_pending_bytes: usize,
+    chunk_bytes: usize,
+    batch_bytes: usize,
+}
+
+#[derive(serde::Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct EventStreamBatch {
+    events: Vec<EventStreamMessage>,
+    last_event_id: String,
+    retry: Option<u64>,
+}
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct EventStreamMessage {
+    #[serde(rename = "type")]
+    event_type: String,
+    data: String,
+    last_event_id: String,
+}
+
+impl EventStreamMessage {
+    fn owned_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.event_type.len() + self.data.len() + self.last_event_id.len()
+    }
+}
+
+/// Length of `String::from_utf8_lossy(bytes)`, computed without decoding.
+fn lossy_utf8_len(bytes: &[u8]) -> usize {
+    bytes.utf8_chunks().map(|chunk| chunk.valid().len()
+        + if chunk.invalid().is_empty() { 0 } else { char::REPLACEMENT_CHARACTER.len_utf8() }).sum()
+}
+
+/// Appends `String::from_utf8_lossy(bytes)` without an intermediate copy.
+fn push_lossy_utf8(out: &mut String, bytes: &[u8]) {
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() { out.push(char::REPLACEMENT_CHARACTER); }
+    }
+}
+
+impl EventStreamParser {
+    // Browsers keep the last event ID across reconnections.
+    fn new(last_event_id: String, max_pending_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(), after_cr: false, first_line: true, data: String::new(),
+            event_type: String::new(), id_buffer: last_event_id.clone(), last_event_id,
+            max_pending_bytes, chunk_bytes: 0, batch_bytes: 0,
+        }
+    }
+
+    /// Fails before `additional` more bytes would exceed the read budget.
+    fn reserve(&self, additional: usize) -> Result<(), String> {
+        let used = self.chunk_bytes + self.batch_bytes + self.line.len() + self.data.len()
+            + self.event_type.len() + self.id_buffer.len() + self.last_event_id.len();
+        if used.saturating_add(additional) > self.max_pending_bytes {
+            return Err(format!(
+                "event stream exceeds the maximum of {} pending bytes", self.max_pending_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    fn feed(&mut self, chunk: &[u8], batch: &mut EventStreamBatch) -> Result<(), String> {
+        // A read may feed several chunks into one batch before it returns.
+        self.chunk_bytes = chunk.len();
+        self.batch_bytes = batch.last_event_id.len()
+            + batch.events.iter().map(EventStreamMessage::owned_bytes).sum::<usize>();
+        self.reserve(0)?;
+        for &byte in chunk {
+            let after_cr = std::mem::take(&mut self.after_cr);
+            match byte {
+                b'\n' if after_cr => {}
+                b'\n' => self.process_line(batch)?,
+                b'\r' => {
+                    self.process_line(batch)?;
+                    self.after_cr = true;
+                }
+                _ => {
+                    // An event that never completes must not grow without bound.
+                    self.reserve(1)?;
+                    self.line.push(byte);
+                }
+            }
+        }
+        if batch.last_event_id != self.last_event_id {
+            self.reserve(self.last_event_id.len())?;
+            batch.last_event_id.clone_from(&self.last_event_id);
+        }
+        self.chunk_bytes = 0;
+        Ok(())
+    }
+
+    fn process_line(&mut self, batch: &mut EventStreamBatch) -> Result<(), String> {
+        let mut bytes = std::mem::take(&mut self.line);
+        if std::mem::take(&mut self.first_line) && bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(..3);
+        }
+        if bytes.is_empty() {
+            return self.dispatch(batch);
+        }
+        if bytes[0] == b':' {
+            return Ok(());
+        }
+        // Field names are ASCII and U+FFFD never contains ':', ' ' or NUL, so
+        // matching bytes gives the same result as matching the decoded line.
+        let (field, value) = match bytes.iter().position(|&byte| byte == b':') {
+            Some(colon) => {
+                let value = &bytes[colon + 1..];
+                (&bytes[..colon], value.strip_prefix(b" ").unwrap_or(value))
+            }
+            None => (&bytes[..], &[][..]),
+        };
+        // The undecoded line stays alive while its value is decoded.
+        let held = bytes.len();
+        match field {
+            b"event" => {
+                self.reserve(held + lossy_utf8_len(value))?;
+                self.event_type.clear();
+                push_lossy_utf8(&mut self.event_type, value);
+            }
+            b"data" => {
+                self.reserve(held + lossy_utf8_len(value) + 1)?;
+                push_lossy_utf8(&mut self.data, value);
+                self.data.push('\n');
+            }
+            b"id" if !value.contains(&0) => {
+                self.reserve(held + lossy_utf8_len(value))?;
+                self.id_buffer.clear();
+                push_lossy_utf8(&mut self.id_buffer, value);
+            }
+            b"retry" if !value.is_empty() && value.iter().all(u8::is_ascii_digit) => {
+                if let Some(retry) = std::str::from_utf8(value).ok().and_then(|value| value.parse().ok()) {
+                    batch.retry = Some(retry);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, batch: &mut EventStreamBatch) -> Result<(), String> {
+        if self.last_event_id != self.id_buffer {
+            self.reserve(self.id_buffer.len())?;
+            self.last_event_id.clone_from(&self.id_buffer);
+        }
+        if self.data.is_empty() {
+            self.event_type.clear();
+            return Ok(());
+        }
+        let default_type = if self.event_type.is_empty() { "message".len() } else { 0 };
+        self.reserve(std::mem::size_of::<EventStreamMessage>() + default_type + self.last_event_id.len())?;
+        let event_type = std::mem::take(&mut self.event_type);
+        let mut data = std::mem::take(&mut self.data);
+        data.pop();
+        let message = EventStreamMessage {
+            event_type: if event_type.is_empty() { "message".into() } else { event_type },
+            data,
+            last_event_id: self.last_event_id.clone(),
+        };
+        self.batch_bytes += message.owned_bytes();
+        batch.events.push(message);
+        Ok(())
+    }
+}
+
+fn is_event_stream_response(status: u16, headers: &HashMap<String, String>) -> bool {
+    status == 200 && headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+        && value.split(';').next().is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream")))
+}
+
+enum EventStreamBody {
+    Transport(reqwest::Response),
+    Fulfilled(Option<Vec<u8>>),
+}
+
+struct EventStreamReader {
+    body: EventStreamBody,
+    parser: EventStreamParser,
+    body_size: usize,
+    network_guard: FetchNetworkGuard,
+}
+
+impl EventStreamReader {
+    /// Reads one transport chunk. Returns false at end of stream.
+    async fn read_chunk(&mut self, batch: &mut EventStreamBatch) -> Result<bool, String> {
+        let chunk_len = match &mut self.body {
+            EventStreamBody::Transport(response) => match response.chunk().await.map_err(|e| e.to_string())? {
+                Some(chunk) => {
+                    self.parser.feed(&chunk, batch)?;
+                    chunk.len()
+                }
+                None => return Ok(false),
+            },
+            EventStreamBody::Fulfilled(body) => match body.take() {
+                Some(chunk) => {
+                    self.parser.feed(&chunk, batch)?;
+                    chunk.len()
+                }
+                None => return Ok(false),
+            },
+        };
+        self.body_size = self.body_size.saturating_add(chunk_len);
+        Ok(true)
+    }
+}
+
+/// An open EventSource response. Closing it, or retiring its frame, cancels
+/// the shared fetch handle and drops the response, which closes the transport
+/// connection.
+struct EventStreamResource {
+    reader: RefCell<Option<EventStreamReader>>,
+    cancel: Rc<CancelHandle>,
+    frame_cancel: Option<Rc<CancelHandle>>,
+}
+
+impl EventStreamResource {
+    fn new(
+        body: EventStreamBody, last_event_id: String, network_guard: FetchNetworkGuard,
+        cancel: Option<Rc<CancelHandle>>, frame_cancel: Option<Rc<CancelHandle>>,
+    ) -> Self {
+        Self {
+            reader: RefCell::new(Some(EventStreamReader {
+                body, parser: EventStreamParser::new(last_event_id, fetch_max_body_bytes()),
+                body_size: 0, network_guard,
+            })),
+            cancel: cancel.unwrap_or_else(CancelHandle::new_rc),
+            frame_cancel,
+        }
+    }
+}
+
+impl Resource for EventStreamResource {
+    fn close(self: Rc<Self>) {
+        self.cancel.cancel();
+        self.reader.borrow_mut().take();
+    }
+}
+
+/// Resolves with the next non-empty batch, or null at end of stream.
+#[op2]
+#[serde]
+async fn op_event_stream_read(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<Option<EventStreamBatch>, deno_error::JsErrorBox> {
+    let resource = state.borrow().resource_table.get::<EventStreamResource>(rid)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    let mut reader = resource.reader.borrow_mut().take()
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Event stream is already being read"))?;
+    let read = async {
+        let initial_last_event_id = reader.parser.last_event_id.clone();
+        let mut batch = EventStreamBatch::default();
+        while reader.read_chunk(&mut batch).await? {
+            if !batch.events.is_empty() || batch.retry.is_some()
+                || batch.last_event_id != initial_last_event_id
+            {
+                return Ok(Some(batch));
+            }
+        }
+        Ok::<_, String>(None)
+    }.or_cancel(resource.cancel.clone());
+    let read = match resource.frame_cancel.clone() {
+        Some(frame_cancel) => read.or_cancel(frame_cancel).await.unwrap_or(Err(deno_core::Canceled)),
+        None => read.await,
+    };
+    let read = match read {
+        Ok(_) if resource.cancel.is_canceled() => Err(None),
+        Ok(Ok(Some(batch))) => {
+            *resource.reader.borrow_mut() = Some(reader);
+            return Ok(Some(batch));
+        }
+        Ok(Ok(None)) => {
+            let EventStreamReader { mut network_guard, body_size, .. } = reader;
+            if let Some(mut event) = network_guard.event.take() {
+                event.body_size = body_size;
+                event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64();
+                record_js_network_completion(&state, event, "", false);
+            }
+            Ok(None)
+        }
+        Ok(Err(error)) => Err(Some(error)),
+        Err(_) => {
+            // A frame cancel also aborts the fetch handle the guard reports.
+            resource.cancel.cancel();
+            Err(None)
+        }
+    };
+    // A dropped reader's guard emits the failure event for errors and cancels.
+    let _ = state.borrow_mut().resource_table.take_any(rid);
+    read.map_err(|error| deno_error::JsErrorBox::generic(
+        error.unwrap_or_else(|| "Event stream was cancelled".into())))
+}
+
 /// Cap on the append-only `fetched_urls` asset list. A page can otherwise loop
 /// `fetch()`/XHR and grow it without bound on the process heap (where V8's
 /// heap-limit guard never sees it). It only feeds the CLI's `--dump assets`
@@ -1255,6 +1567,14 @@ impl RealmStates {
                 state.document_generation = state.document_generation.wrapping_add(1);
             }
         }
+    }
+
+    /// The handle that stops a frame's timers and streams, or `None` once the
+    /// frame is gone or retired.
+    fn active_frame_cancel(&self, frame_id: u32) -> Option<Rc<CancelHandle>> {
+        self.cancel_inactive_frame_timers();
+        self.frame_timers.get(&frame_id).map(|timers| timers.cancel.clone())
+            .filter(|cancel| !cancel.is_canceled())
     }
 
     fn cancel_frame_timers(&self, frame_id: u32) {
@@ -2324,12 +2644,25 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             state.activity_generation = state.activity_generation.wrapping_add(1);
         }
         #[cfg(feature = "render")]
-        // Native text values and indeterminate checkbox marks are consumed
+        // Native input values and indeterminate checkbox marks are consumed
         // directly by paint. They do not participate in the selector surface
         // or intrinsic control sizing, so keep the existing geometry. Checked
         // state is deliberately excluded because `:checked` can affect style.
-        let invalidate_geometry =
-            invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        // A dirty `<textarea>` value is shaped as the element's own text,
+        // so its value writes need fresh geometry.
+        let invalidate_geometry = invalidate
+            && match cmd.as_str() {
+                "set_form_indeterminate" => false,
+                "set_form_value" => arg1.parse::<u32>().ok().is_some_and(|target| {
+                    state.dom.as_ref().and_then(|dom| {
+                        dom.with_node(NodeId::new(target), |node| {
+                            node.as_element()
+                                .is_some_and(|name| name.local.as_ref() == "textarea")
+                        })
+                    }) == Some(true)
+                }),
+                _ => true,
+            };
         #[cfg(feature = "render")]
         let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
             state.dom.as_ref().and_then(|dom| {
@@ -3994,19 +4327,42 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     // Keep the existing op arity rather than exceeding deno_core's
     // async-op code-generation limit with another positional argument.
-    let (destination, cancel_rid) = match options {
-        FetchOptions::Destination(destination) => (destination, None),
-        FetchOptions::Cancelable { cancel_rid, destination } => (destination, Some(cancel_rid)),
+    let (destination, cancel_rid, frame_id) = match options {
+        FetchOptions::Destination(destination) => (destination, None, 0),
+        FetchOptions::Cancelable { cancel_rid, destination, frame_id } =>
+            (destination, Some(cancel_rid), frame_id),
     };
     let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
         .map(|resource| resource.0.clone())
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
+    let cancelled = || deno_error::JsErrorBox::generic("Fetch was cancelled");
+    // A frame-owned stream stops with the frame's timers. A retired frame
+    // starts no request.
+    let frame_cancel = match frame_id {
+        0 => None,
+        id => {
+            let state = state.borrow();
+            let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+            Some(registry.active_frame_cancel(id).ok_or_else(cancelled)?)
+        }
+    };
     let future = fetch_url_inner(state, url, method, headers_json, body, origin, mode, credentials,
-        destination, cancel.clone());
-    match cancel {
-        Some(cancel) => future.or_cancel(cancel).await
-            .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
-        None => future.await,
+        destination, cancel.clone(), frame_cancel.clone());
+    match (cancel, frame_cancel) {
+        (Some(cancel), Some(frame_cancel)) => {
+            let mut fetch = std::pin::pin!(future.or_cancel(cancel.clone()));
+            tokio::select! {
+                biased;
+                result = &mut fetch => result.map_err(|_| cancelled())?,
+                _ = std::future::pending::<()>().or_cancel(frame_cancel) => {
+                    // Cancel the shared handle so the network guard reports an abort.
+                    cancel.cancel();
+                    Err(cancelled())
+                }
+            }
+        }
+        (Some(cancel), None) => future.or_cancel(cancel).await.map_err(|_| cancelled())?,
+        (None, _) => future.await,
     }
 }
 
@@ -4014,23 +4370,50 @@ async fn op_fetch_url(
 #[serde(untagged)]
 enum FetchOptions {
     Destination(String),
-    Cancelable { cancel_rid: u32, destination: String },
+    Cancelable {
+        cancel_rid: u32,
+        destination: String,
+        #[serde(default)]
+        frame_id: u32,
+    },
 }
 
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
-    destination: String, cancel: Option<Rc<CancelHandle>>,
+    destination: String, cancel: Option<Rc<CancelHandle>>, frame_cancel: Option<Rc<CancelHandle>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let (resource_type, resource_type_name) = match destination.as_str() {
         "Script" => (ResourceType::Script, "Script"),
         "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
         "Document" => (ResourceType::Document, "Document"),
         "XHR" => (ResourceType::Xhr, "XHR"),
+        "EventSource" => (ResourceType::Other, "EventSource"),
         _ => (ResourceType::Fetch, "Fetch"),
     };
     let internal_load = matches!(resource_type,
         ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
+    let event_stream = resource_type_name == "EventSource";
+    // The stealth transport only exposes whole bodies. Fail closed rather than
+    // buffer an open stream or route it around the configured transport.
+    #[cfg(feature = "stealth")]
+    {
+        let stealth = state.borrow().borrow::<SharedState>().borrow().stealth_client.is_some();
+        if event_stream && stealth {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {}, "blocked": true,
+                "error": "EventSource streaming is not supported by the stealth transport",
+            })
+            .to_string());
+        }
+    }
+    let last_event_id = if event_stream {
+        serde_json::from_str::<HashMap<String, String>>(&headers_json).unwrap_or_default().into_iter()
+            .find_map(|(name, value)| name.eq_ignore_ascii_case("last-event-id").then_some(value))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let body = body.to_vec();
     let post_data = request_post_data(&body);
     tracing::debug!(
@@ -4191,6 +4574,39 @@ async fn fetch_url_inner(
                         internal_load,
                     );
                     response["requestId"] = serde_json::json!(request_id);
+                    if event_stream && response["status"].as_u64() == Some(200)
+                        && response["opaque"].as_bool() == Some(false)
+                    {
+                        let headers = serde_json::from_value::<HashMap<String, String>>(response["headers"].clone())
+                            .map_err(|_| deno_error::JsErrorBox::generic("Invalid EventSource response headers"))?;
+                        if is_event_stream_response(200, &headers) {
+                            // The stream owns the body; JavaScript never reads a second copy.
+                            response["body"] = serde_json::json!("");
+                            response["bodyBase64"] = serde_json::json!("");
+                            let max = fetch_max_body_bytes();
+                            // Check the decoded size before allocating the decoded copy.
+                            let stream = if body_size > max {
+                                Err(format!("response body of {body_size} bytes exceeds the maximum of {max}"))
+                            } else if encoded {
+                                BASE64.decode(&bb).map_err(|_| "Invalid EventSource fulfilled body encoding".to_string())
+                            } else {
+                                Ok(b.into_bytes())
+                            };
+                            let stream = match stream {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    response["status"] = serde_json::json!(0);
+                                    response["error"] = serde_json::json!(error);
+                                    return Ok(response.to_string());
+                                }
+                            };
+                            let rid = state.borrow_mut().resource_table.add(EventStreamResource::new(
+                                EventStreamBody::Fulfilled(Some(stream)), last_event_id, network_guard, cancel,
+                                frame_cancel,
+                            ));
+                            response["streamRid"] = serde_json::json!(rid);
+                        }
+                    }
                     return Ok(response.to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
@@ -4307,7 +4723,9 @@ async fn fetch_url_inner(
         }
     }
 
-    let unsafe_header_names = if is_cross_origin && mode == "cors" {
+    // EventSource creates a user-agent request without Fetch's unsafe-request
+    // flag; its Last-Event-ID header does not trigger a preflight.
+    let unsafe_header_names = if is_cross_origin && mode == "cors" && !event_stream {
         cors_unsafe_request_header_names(&custom_headers)
     } else {
         Vec::new()
@@ -4667,6 +5085,47 @@ async fn fetch_url_inner(
         "opaque": opaque,
         "headers": script_headers,
     });
+    if event_stream {
+        if let Some(ref cbs) = callbacks {
+            if cbs.has_response_callbacks().await {
+                // The body is still open, so observers see headers only.
+                let resp = fetch_response(current_url.as_str(), status, resp_headers.clone(),
+                    Vec::new(), redirected_from);
+                let info = RequestInfo {
+                    url: resp.url.clone(), method: current_method.as_str().to_string(),
+                    headers: resp_headers.clone(), resource_type,
+                };
+                cbs.fire_response(&info, &resp).await;
+            }
+        }
+        let stream_ok = is_event_stream_response(status, &resp_headers);
+        let event = JsNetworkEvent {
+            request_id, intercepted: was_intercepted, error_text: None,
+            url: current_url, method: current_method.as_str().to_string(),
+            post_data: request_post_data(&current_body), status,
+            resource_type: resource_type_name.to_string(),
+            response_headers: resp_headers, body_size: 0,
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64(),
+        };
+        // An open stream is not page-load work. Keeping it counted would hold
+        // network-idle readiness for the lifetime of the stream.
+        drop(_page_in_flight);
+        let mut metadata = metadata;
+        if stream_ok {
+            network_guard.event = Some(event);
+            let rid = state.borrow_mut().resource_table.add(EventStreamResource::new(
+                EventStreamBody::Transport(response), last_event_id, network_guard, cancel,
+                frame_cancel,
+            ));
+            metadata["streamRid"] = serde_json::json!(rid);
+        } else {
+            // HTML "fail the connection": record the response, read no body.
+            network_guard.event = None;
+            record_js_network_completion(&state, event, "", false);
+        }
+        return Ok(metadata.to_string());
+    }
     // A resource must not form an ownership cycle with its OpState table.
     let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
@@ -4996,9 +5455,112 @@ mod tests {
         glob_match, is_cors_safelisted_content_type, is_cors_safelisted_request_header,
         parse_cors_header_list, preflight_allows_header, preflight_allows_method,
         sanitize_redirect_headers, validate_fetch_url,
+        EventStreamBatch, EventStreamMessage, EventStreamParser, is_event_stream_response,
+        lossy_utf8_len, push_lossy_utf8,
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    fn stream_message(event_type: &str, data: &str, last_event_id: &str) -> EventStreamMessage {
+        EventStreamMessage { event_type: event_type.into(), data: data.into(), last_event_id: last_event_id.into() }
+    }
+
+    // HTML "Parsing an event stream", fed in the given transport chunks.
+    #[test]
+    fn event_stream_parser_follows_the_html_grammar_across_chunk_boundaries() {
+        let cases: Vec<(&str, &str, Vec<&[u8]>, Vec<EventStreamMessage>, &str, Option<u64>)> = vec![
+            ("lf, default type", "", vec![&b"data: one\n\n"[..]], vec![stream_message("message", "one", "")], "", None),
+            ("crlf split between chunks", "", vec![&b"data: a\r"[..], &b"\n\r"[..], &b"\n"[..]], vec![stream_message("message", "a", "")], "", None),
+            ("bare cr", "", vec![&b"event: change\rdata: b\r\r"[..]], vec![stream_message("change", "b", "")], "", None),
+            ("leading bom stripped once", "", vec![&b"\xEF\xBB"[..], &b"\xBFdata: c\n\n\xEF\xBB\xBFdata: d\n\n"[..]],
+                vec![stream_message("message", "c", "")], "", None),
+            ("comments and unknown fields", "", vec![&b": keepalive\nfoo: bar\ndata\n\n"[..]], vec![stream_message("message", "", "")], "", None),
+            ("multiline data, one space stripped", "", vec![&b"data:x\ndata:  y\n\n"[..]], vec![stream_message("message", "x\n y", "")], "", None),
+            ("utf-8 split inside a code point", "", vec![&b"data: caf\xC3"[..], &b"\xA9\n\n"[..]], vec![stream_message("message", "caf\u{e9}", "")], "", None),
+            ("id applies on dispatch, nul id ignored", "", vec![&b"id: 7\ndata: e\n\nid: bad\0id\ndata: f\n\n"[..]],
+                vec![stream_message("message", "e", "7"), stream_message("message", "f", "7")], "7", None),
+            ("id without data updates last id only", "4", vec![&b"id: 9\n\n"[..]], vec![], "9", None),
+            ("empty id resets", "4", vec![&b"id\ndata: g\n\n"[..]], vec![stream_message("message", "g", "")], "", None),
+            ("retry digits only", "", vec![&b"retry: 25\nretry: 2x\nretry:\n\n"[..]], vec![], "", Some(25)),
+            ("event type resets without data", "", vec![&b"event: ready\n\ndata: h\n\n"[..]], vec![stream_message("message", "h", "")], "", None),
+            ("incomplete event at eof discarded", "", vec![&b"data: done\n\ndata: partial\n"[..], &b"data: no-end"[..]],
+                vec![stream_message("message", "done", "")], "", None),
+        ];
+        for (name, initial_last_event_id, chunks, events, last_event_id, retry) in cases {
+            let mut parser = EventStreamParser::new(initial_last_event_id.into(), 1024);
+            let mut batch = EventStreamBatch::default();
+            for chunk in chunks {
+                parser.feed(chunk, &mut batch).unwrap();
+            }
+            assert_eq!(batch, EventStreamBatch { events, last_event_id: last_event_id.into(), retry }, "{name}");
+        }
+
+        let mut parser = EventStreamParser::new(String::new(), 8);
+        let mut batch = EventStreamBatch::default();
+        let error = parser.feed(b"data: 0123456789", &mut batch).unwrap_err();
+        assert!(error.contains("maximum of 8 pending bytes"), "{error}");
+    }
+
+    // One read holds its chunk, the line being decoded, the field buffers and
+    // every string in the batch. Each over-budget stream keeps its pending line
+    // and data far below the cap, so only complete accounting rejects it.
+    #[test]
+    fn event_stream_parser_bounds_every_copy_one_read_retains() {
+        let id_then_events = [&b"id: "[..], &[b'x'; 200][..], &b"\n"[..], &b"data\n\n".repeat(8)[..]].concat();
+        let events = b"data\n\n".repeat(8);
+        let invalid_type = [&b"event: "[..], &[0xFF; 100][..], &b"\ndata: x\n\n"[..]].concat();
+        let ascii_type = [&b"event: "[..], &[b'x'; 100][..], &b"\ndata: x\n\n"[..]].concat();
+        let large_event = [&b"data: "[..], &[b'a'; 300][..], &b"\n\n"[..]].concat();
+        let over_budget: Vec<(&str, usize, Vec<&[u8]>)> = vec![
+            ("last event id copied into each message", 1024, vec![&id_then_events[..]]),
+            ("invalid utf-8 triples when decoded", 400, vec![&invalid_type[..]]),
+            ("chunks of one read share one batch", 1024, vec![&large_event[..], &large_event[..]]),
+        ];
+        for (name, max, chunks) in over_budget {
+            let mut parser = EventStreamParser::new(String::new(), max);
+            let mut batch = EventStreamBatch::default();
+            let error = chunks.iter().try_for_each(|chunk| parser.feed(chunk, &mut batch)).unwrap_err();
+            assert!(error.contains(&format!("maximum of {max} pending bytes")), "{name}: {error}");
+        }
+        // The same shapes stay incremental once the amplifying copy is gone.
+        let in_budget: Vec<(&str, usize, &[u8], Vec<EventStreamMessage>)> = vec![
+            ("events without an id", 1024, &events[..], (0..8).map(|_| stream_message("message", "", "")).collect()),
+            ("ascii event type", 400, &ascii_type[..], vec![stream_message(&"x".repeat(100), "x", "")]),
+            ("one large event per read", 1024, &large_event[..], vec![stream_message("message", &"a".repeat(300), "")]),
+        ];
+        for (name, max, chunk, events) in in_budget {
+            let mut parser = EventStreamParser::new(String::new(), max);
+            let mut batch = EventStreamBatch::default();
+            parser.feed(chunk, &mut batch).unwrap();
+            assert_eq!(batch, EventStreamBatch { events, last_event_id: String::new(), retry: None }, "{name}");
+        }
+    }
+
+    // The parser charges the decoded size before it decodes. A mismatch with
+    // the standard lossy decoder would under-count or change event text.
+    #[test]
+    fn lossy_utf8_helpers_match_the_standard_lossy_decoder() {
+        let inputs: [&[u8]; 9] = [b"", b"ascii", b"caf\xC3\xA9", b"\xFF", b"\xF0\x9F\x98",
+            b"a\xF0\x9F\x98b", b"\xED\xA0\x80", b"\xC3", b"\xE2\x82\xAC\x80\xFF"];
+        for input in inputs {
+            let expected = String::from_utf8_lossy(input);
+            let mut decoded = String::from("prefix");
+            push_lossy_utf8(&mut decoded, input);
+            assert_eq!(decoded, format!("prefix{expected}"), "{input:?}");
+            assert_eq!(lossy_utf8_len(input), expected.len(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn event_stream_response_requires_status_200_and_the_event_stream_essence() {
+        let headers = |value: &str| -> std::collections::HashMap<String, String> {
+            [("Content-Type".to_string(), value.to_string())].into_iter().collect()
+        };
+        assert!(is_event_stream_response(200, &headers("Text/Event-Stream; charset=utf-8")));
+        assert!(!is_event_stream_response(204, &headers("text/event-stream")));
+        assert!(!is_event_stream_response(200, &headers("text/plain")));
+        assert!(!is_event_stream_response(200, &std::collections::HashMap::new()));
+    }
 
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
@@ -6730,8 +7292,7 @@ async fn op_sleep(state: Rc<RefCell<OpState>>, #[number] millis: u64, frame_id: 
     let cancel = {
         let state = state.borrow();
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
-        registry.cancel_inactive_frame_timers();
-        registry.frame_timers.get(&frame_id).map(|timers| timers.cancel.clone())
+        registry.active_frame_cancel(frame_id)
     };
     let Some(cancel) = cancel else { return false };
     sleep.or_cancel(cancel).await.is_ok()
@@ -8109,6 +8670,7 @@ pub fn build_extension() -> Extension {
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),
+        op_event_stream_read(),
         op_get_cookies(),
         op_set_cookie(),
         op_storage_access(),
@@ -8173,6 +8735,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
+        ops.push(op_layout_hit_list());
         ops.push(op_layout_caret());
         ops.push(op_layout_caret_rect());
         ops.push(op_resize_observer_measurements());
@@ -9277,6 +9840,29 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
     prepared
         .hit_test(dom, scroll, x as f32, y as f32)
         .map_or(-1, |id| id.index() as i32)
+}
+
+/// Renderer-backed CSSOM `elementsFromPoint()`. Returns a JSON array of native
+/// node ids, topmost first, or an empty string when no layout is available.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_hit_list(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let prepared = gs.prepared_render.as_ref()?;
+        let dom = gs.dom.as_ref()?;
+        let ids: Vec<usize> = prepared
+            .hit_list(dom, scroll, x as f32, y as f32)
+            .into_iter()
+            .map(|id| id.index())
+            .collect();
+        Some(serde_json::json!(ids).to_string())
+    })).ok().flatten().unwrap_or_default()
 }
 
 #[cfg(feature = "render")]

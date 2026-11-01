@@ -1092,6 +1092,10 @@ pub struct LayoutStyle {
     /// viewport, containing block, or computed font size and cannot be safely
     /// collapsed to pixels during stylesheet parsing.
     pub size_expressions: [Option<String>; 6],
+    /// A size, inset, margin, or padding expression resolved a `cq*` unit
+    /// in the last layout pass. Retained style reuse must re-resolve it when
+    /// container geometry changes.
+    pub(crate) uses_container_units: bool,
     /// `aspect-ratio` as width/height, or an image's intrinsic ratio resolved
     /// at layout. Lets a replaced element (or a padding-box card) derive the
     /// missing dimension from the given one, so a `width:100%` image gets a

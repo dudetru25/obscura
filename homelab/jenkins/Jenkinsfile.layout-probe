@@ -1,0 +1,26 @@
+// The fork folder pins the reviewed homelab library and source revision.
+@Library('homelab') _
+
+try {
+    homelabPipeline(
+        agentLabel: 'homelab-dev3-linux',
+        branch: 'feat/danse-workflow-support',
+        sourceRepository: 'https://github.com/dudetru25/obscura.git',
+        scmCredentialId: scm.userRemoteConfigs[0].credentialsId,
+        sourceRevisionParameter: 'SOURCE_SHA',
+        scriptPath: 'homelab/jenkins/Jenkinsfile.layout-probe',
+        pipelineRevision: params.SOURCE_SHA,
+        timeoutMinutes: 60,
+        queueProfile: 'small-web',
+        checkCommand: 'OBSCURA_CANDIDATE_PACKAGE=/mnt/g/GithubProjects/.jenkins-workspace/workspace/homelab-pilot/obscura-validation/committed-source@build-72/ci-output/obscura-07f560a929988c89c6864ac34e19d67875004504-x86_64-linux.tar.gz ' +
+            'OBSCURA_CANDIDATE_SHA256=280a8b7dc5b1eabb5663a1e640db89f0aeb54dfdce39312a431ec8d5ab579cf1 ' +
+            'OBSCURA_CANDIDATE_SOURCE=07f560a929988c89c6864ac34e19d67875004504 bash homelab/jenkins/jenkins-layout-probe.sh'
+    )
+} finally {
+    node('homelab-dev3-linux') {
+        ws("${pwd()}@build-${env.BUILD_NUMBER}") {
+            archiveArtifacts(artifacts: 'ci-output/**', excludes: 'ci-output/obscura-benchmark/**',
+                allowEmptyArchive: true, fingerprint: true)
+        }
+    }
+}

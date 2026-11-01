@@ -4884,13 +4884,16 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         if !stylesheet_cache_hit {
             return None;
         }
-        let active_containers = retained
-            .styles
-            .iter()
-            .filter_map(|(node, style)| {
-                (style.container_type != crate::ContainerType::Normal).then_some(*node)
-            })
-            .collect::<HashSet<_>>();
+        let mut active_containers = HashSet::new();
+        let mut container_unit_users = Vec::new();
+        for (node, style) in &retained.styles {
+            if style.container_type != crate::ContainerType::Normal {
+                active_containers.insert(*node);
+            }
+            if style.uses_container_units {
+                container_unit_users.push(*node);
+            }
+        }
         let connected = std::iter::once(tree.document())
             .chain(rendered_descendants(tree, tree.document()))
             .collect::<HashSet<_>>();
@@ -4915,6 +4918,14 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                         false,
                         &mut dirty,
                     );
+                }
+                // A retained cq length was resolved against earlier container
+                // geometry. Damage elsewhere can resize that container, so
+                // the user and its percentage-based subtree resolve again.
+                for node in container_unit_users {
+                    if connected.contains(&node) {
+                        add_style_subtree(tree, node, &mut dirty);
+                    }
                 }
                 // Once animation damage reaches at least half of the retained
                 // style graph, sparse HashMap reuse no longer offsets dirty-set
@@ -4951,8 +4962,11 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     // Query passes are speculative. Only the chosen layout may commit CSS
     // animation start/stop history; provisional display:none must not restart
     // an animation that is visible in the final container-query cascade.
+    // A page with cq units but no container queries only changes lengths
+    // between passes. Display and animation names stay the same, so repeated
+    // timeline sampling is idempotent and needs no restore copy.
     let animation_before = sheet.has_container_queries().then(|| animation_timeline.clone());
-    let (mut laid, _, mut query, mut cascade_time) = layout_dom_once(
+    let (mut laid, _, mut query, mut cascade_time, mut container_units) = layout_dom_once(
             tree,
             viewport,
             intrinsic,
@@ -4964,7 +4978,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             animation_sample,
             animation_timeline,
         );
-    if !sheet.has_container_queries() {
+    if !sheet.has_container_queries() && !container_units {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
             eprintln!(
@@ -5005,7 +5019,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     // one-pass path avoids a redundant whole-document layout.
     let inactive = if snapshot.boxes.is_empty() {
         Some(ContainerLayoutTermination::NoContainers)
-    } else if shadow_sheets.is_empty() && !has_container_query_subject(tree, &sheet) {
+    } else if !container_units
+        && shadow_sheets.is_empty()
+        && !has_container_query_subject(tree, &sheet)
+    {
         // Geometry cannot activate an unmatched selector. Recheck on every
         // flush so DOM/state changes can activate normal and pseudo rules.
         // Shadow scopes keep their existing convergence path.
@@ -5047,6 +5064,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     }
     let mut previous_candidate: Option<(DomLayout, crate::css::ContainerDecisionSignature, crate::AnimationTimelineState)> = None;
     let mut seen_signatures = Vec::new();
+    // Container-relative lengths depend on geometry, not only on applied
+    // query decisions. Equal signatures then prove nothing; only a stable
+    // snapshot ends the loop, and a repeated earlier snapshot is a cycle.
+    let mut seen_snapshots = Vec::new();
     let mut passes = 1;
     let mut termination = ContainerLayoutTermination::PassCapFallback;
     // Gecko permits at most one CQ-triggered update per container element in
@@ -5079,8 +5100,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     });
     let mut needs_fallback = false;
     for pass in 2..=max_passes {
-        *animation_timeline = animation_before.as_ref().expect("query timeline").clone();
-        let (next, signature, pass_query, pass_cascade) = layout_dom_once(
+        if let Some(before) = animation_before.as_ref() {
+            *animation_timeline = before.clone();
+        }
+        let (next, signature, pass_query, pass_cascade, pass_units) = layout_dom_once(
                 tree,
                 viewport,
                 intrinsic,
@@ -5097,6 +5120,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         query.cache_hits += pass_query.cache_hits;
         query.ancestor_steps += pass_query.ancestor_steps;
         cascade_time += pass_cascade;
+        container_units |= pass_units;
         let next_snapshot = container_snapshot(tree, &next);
         // The first query-enabled pass replaces the initial layout. Move its
         // query-disabled style maps into the owning preparation instead of
@@ -5117,7 +5141,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         if let Some(reason) = container_iteration_termination(
             next_snapshot == snapshot,
             &signature,
-            previous_candidate.as_ref().map(|(_, signature, _)| signature),
+            previous_candidate
+                .as_ref()
+                .filter(|_| !container_units)
+                .map(|(_, signature, _)| signature),
         ) {
             termination = reason;
             // Equal adjacent signatures prove that the *previous* candidate's
@@ -5135,14 +5162,22 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             };
             break;
         }
-        if seen_signatures.contains(&signature) {
+        let repeated = if container_units {
+            seen_snapshots.contains(&next_snapshot)
+        } else {
+            seen_signatures.contains(&signature)
+        };
+        if repeated {
             termination = ContainerLayoutTermination::OscillationFallback;
             needs_fallback = true;
             break;
         }
         seen_signatures.push(signature.clone());
         previous_candidate = Some((next, signature, animation_timeline.clone()));
-        snapshot = next_snapshot;
+        let previous_snapshot = std::mem::replace(&mut snapshot, next_snapshot);
+        if container_units {
+            seen_snapshots.push(previous_snapshot);
+        }
         if pass == max_passes {
             needs_fallback = true;
         }
@@ -5153,8 +5188,10 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
         // we return a layout whose conditional declarations contradict the
         // geometry used to choose them. Disable the unstable conditional
         // rules for this render and expose the downgrade in telemetry.
-        *animation_timeline = animation_before.as_ref().expect("query timeline").clone();
-        let (fallback, _, fallback_query, fallback_cascade) = layout_dom_once(
+        if let Some(before) = animation_before.as_ref() {
+            *animation_timeline = before.clone();
+        }
+        let (fallback, _, fallback_query, fallback_cascade, _) = layout_dom_once(
                 tree,
                 viewport,
                 intrinsic,
@@ -5226,6 +5263,7 @@ fn layout_dom_once(
     Option<crate::css::ContainerDecisionSignature>,
     crate::css::ContainerQueryStats,
     std::time::Duration,
+    bool,
 ) {
     let t1 = std::time::Instant::now();
     let mut matcher = tree.matcher();
@@ -5320,6 +5358,9 @@ fn layout_dom_once(
     // engine item index (they have no DOM id to key `rects` by).
     let mut anon_rects: HashMap<usize, Rect> = HashMap::new();
     let mut generated_rects: Vec<Option<Rect>> = Vec::new();
+    // Some resolved cq length used a query container's geometry. Its value is
+    // provisional until that geometry converges.
+    let mut container_units_dependent = false;
     if let Some(root_id) = root {
         // Headless Chromium's classic scrollbar gutter is 15 CSS pixels.
         // `scrollbar-gutter:stable` reserves it even when the scrollbar track
@@ -5398,6 +5439,7 @@ fn layout_dom_once(
             /// A definite post-flexing height whose numeric basis is only
             /// available during layout. Keep descendant percentages intact.
             cb_height_deferred: bool,
+            container_units: ContainerUnitScope,
         }
         impl Default for Inherited {
             fn default() -> Self {
@@ -5448,6 +5490,12 @@ fn layout_dom_once(
                     cb_height: 0.0,
                     cb_height_definite: false,
                     cb_height_deferred: false,
+                    container_units: ContainerUnitScope {
+                        width: 0.0,
+                        height: 0.0,
+                        width_is_container: false,
+                        height_is_container: false,
+                    },
                 }
             }
         }
@@ -5484,6 +5532,14 @@ fn layout_dom_once(
         root_inh.cb_width = initial_cb_width;
         root_inh.cb_height = viewport.1;
         root_inh.cb_height_definite = true;
+        // Without an eligible query container, cq units use the small
+        // viewport size. Obscura has one viewport size for all three.
+        root_inh.container_units = ContainerUnitScope {
+            width: viewport.0,
+            height: viewport.1,
+            width_is_container: false,
+                        height_is_container: false,
+        };
         // This set records computed definiteness after walking the real
         // containing-block chain. Merely retaining `height:Percent` is not
         // sufficient: under an auto-height containing block it computes to
@@ -5692,6 +5748,8 @@ fn layout_dom_once(
                 inh.cb_height = child_cb_height;
                 inh.cb_height_definite = child_cb_height_definite;
                 inh.cb_height_deferred = child_cb_height_deferred;
+                inh.container_units =
+                    descendant_container_units(id, styles.get(&id), snapshot, inh.container_units);
                 for child in style_children(tree, id).into_iter().rev() {
                     queue.push((child, inh.clone()));
                 }
@@ -5891,6 +5949,14 @@ fn layout_dom_once(
                     style.line_height = Some(crate::LineHeight::Px(pixels));
                 }
                 let cb_w = inh.cb_width;
+                let container_units = crate::style::ContainerUnits {
+                    width: inh.container_units.width,
+                    height: inh.container_units.height,
+                    width_is_container: inh.container_units.width_is_container,
+                    height_is_container: inh.container_units.height_is_container,
+                    dependent: std::cell::Cell::new(false),
+                    used: std::cell::Cell::new(false),
+                };
                 for index in 0..6 {
                     let Some(expression) = style.size_expressions[index].as_deref() else {
                         continue;
@@ -5923,13 +5989,14 @@ fn layout_dom_once(
                     } else {
                         cb_w
                     };
-                    let Some(px) = crate::style::resolve_contextual_length(
+                    let Some(px) = crate::style::resolve_container_relative_length(
                         expression,
                         em_px,
                         root_fs,
                         vw,
                         vh,
                         percent_base,
+                        &container_units,
                     ) else {
                         continue;
                     };
@@ -5975,13 +6042,14 @@ fn layout_dom_once(
                     } else {
                         viewport.1
                     };
-                    style.inset[index] = crate::style::resolve_contextual_length(
+                    style.inset[index] = crate::style::resolve_container_relative_length(
                         expression,
                         em_px,
                         root_fs,
                         vw,
                         vh,
                         percent_base,
+                        &container_units,
                     )
                     .map(crate::Dimension::Px);
                 }
@@ -6146,8 +6214,8 @@ fn layout_dom_once(
                 // back into `LayoutStyle` after the final layout.
                 for i in 0..4 {
                     if let Some(expression) = style.padding_expressions[i].as_deref() {
-                        if let Some(px) = crate::style::resolve_contextual_length(
-                            expression, em_px, root_fs, vw, vh, cb_w,
+                        if let Some(px) = crate::style::resolve_container_relative_length(
+                            expression, em_px, root_fs, vw, vh, cb_w, &container_units,
                         ) {
                             match i {
                                 0 => style.padding.top = px.max(0.0),
@@ -6158,8 +6226,8 @@ fn layout_dom_once(
                         }
                     }
                     if let Some(expression) = style.margin_expressions[i].as_deref() {
-                        if let Some(px) = crate::style::resolve_contextual_length(
-                            expression, em_px, root_fs, vw, vh, cb_w,
+                        if let Some(px) = crate::style::resolve_container_relative_length(
+                            expression, em_px, root_fs, vw, vh, cb_w, &container_units,
                         ) {
                             match i {
                                 0 => style.margin.top = px,
@@ -6199,6 +6267,8 @@ fn layout_dom_once(
                         }
                     }
                 }
+                style.uses_container_units = container_units.used.get();
+                container_units_dependent |= container_units.dependent.get();
 
                 // Pseudo-elements inherit the originating element's COMPUTED
                 // values. They were cascaded beside the host before this
@@ -6519,6 +6589,8 @@ fn layout_dom_once(
             inh.cb_height = child_cb_height;
             inh.cb_height_definite = child_cb_height_definite;
             inh.cb_height_deferred = child_cb_height_deferred;
+            inh.container_units =
+                descendant_container_units(id, styles.get(&id), snapshot, inh.container_units);
             for child in style_children(tree, id).into_iter().rev() {
                 queue.push((child, inh.clone()));
             }
@@ -7965,6 +8037,7 @@ fn layout_dom_once(
         signature,
         query_stats,
         cascade_time,
+        container_units_dependent,
     )
 }
 
@@ -9955,6 +10028,27 @@ fn style_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     children
 }
 
+/// Borrow a dirty HTML `<textarea>`'s live value: the text its inline
+/// formatting context shapes in place of the default child text.
+pub(crate) fn dirty_textarea_value<R>(
+    tree: &DomTree,
+    id: NodeId,
+    f: impl FnOnce(&str) -> R,
+) -> Option<R> {
+    let is_html_textarea = tree
+        .with_node(id, |node| {
+            node.as_element().is_some_and(|name| {
+                name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                    && name.local.as_ref() == "textarea"
+            })
+        })
+        .unwrap_or(false);
+    if !is_html_textarea {
+        return None;
+    }
+    tree.with_form_control_value(id, f)
+}
+
 /// Resolve the named-slot assignment for one `<slot>` in a native shadow tree.
 ///
 /// Slot names are exact strings (the empty string is the default slot), and
@@ -9974,17 +10068,25 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         return assigned_or_fallback;
     }
 
-    // Box-tree traversal needs only this predicate, not an owned copy of the
-    // node's text and attributes.
-    let Some(is_closed_html_details) = tree.with_node(id, |node| {
-        node.as_element().is_some_and(|name| {
-            name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
-                && name.local.as_ref() == "details"
-                && node.get_attribute("open").is_none()
+    // Box-tree traversal needs only these predicates, not an owned copy of
+    // the node's text and attributes.
+    let Some((is_closed_html_details, is_html_textarea)) = tree.with_node(id, |node| {
+        node.as_element().map_or((false, false), |name| {
+            let html = name.ns.as_ref() == "http://www.w3.org/1999/xhtml";
+            (
+                html && name.local.as_ref() == "details" && node.get_attribute("open").is_none(),
+                html && name.local.as_ref() == "textarea",
+            )
         })
     }) else {
         return Vec::new();
     };
+    // A dirty <textarea> shows its live value, not its child text (the
+    // default value). The value is shaped as the element's own inline text
+    // (see `dirty_textarea_value`), so the child text generates no boxes.
+    if is_html_textarea && tree.with_form_control_value(id, |_| ()).is_some() {
+        return Vec::new();
+    }
     if !is_closed_html_details {
         return tree.children(id);
     }
@@ -12184,6 +12286,50 @@ fn build_table(
     Some(table_node)
 }
 
+/// Query-container content sizes that resolve `cq*` units for the children
+/// of one element. Each axis holds the nearest ancestor container that is
+/// eligible for size queries on that axis, else the viewport size.
+#[derive(Clone, Copy)]
+struct ContainerUnitScope {
+    width: f32,
+    height: f32,
+    /// Whether each axis depends on a query container rather than the viewport.
+    width_is_container: bool,
+    height_is_container: bool,
+}
+
+fn descendant_container_units(
+    id: NodeId,
+    style: Option<&crate::LayoutStyle>,
+    snapshot: Option<&crate::css::ContainerSnapshot>,
+    inherited: ContainerUnitScope,
+) -> ContainerUnitScope {
+    let Some(style) = style.filter(|style| !style.display_contents) else {
+        return inherited;
+    };
+    let container_type = effective_container_type(style);
+    if container_type == crate::ContainerType::Normal {
+        return inherited;
+    }
+    let mut scope = ContainerUnitScope {
+        width_is_container: true,
+        height_is_container: inherited.height_is_container
+            || container_type == crate::ContainerType::Size,
+        ..inherited
+    };
+    // Pass 1 has no geometry. Its provisional values keep the outer basis and
+    // the convergence loop replaces them with the measured content box.
+    if let Some(container) = snapshot.and_then(|snapshot| snapshot.boxes.get(&id)) {
+        if container.available_type != crate::ContainerType::Normal {
+            scope.width = container.content_width;
+        }
+        if container.available_type == crate::ContainerType::Size {
+            scope.height = container.content_height;
+        }
+    }
+    scope
+}
+
 /// Effective size-query containment for this generated box.
 ///
 /// CSS size containment has no effect on a non-atomic inline box or an
@@ -13363,7 +13509,11 @@ fn build(
     let is_closed_html_details = _name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
         && _name.local.as_ref() == "details"
         && !is_open;
-    if !is_closed_html_details && !ifc_items.float_aware_blocks.contains(&id) {
+    if !is_closed_html_details
+        && (!ifc_items.float_aware_blocks.contains(&id)
+            || (_name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+                && _name.local.as_ref() == "textarea"))
+    {
         if let Some(item) = engine.try_build(tree, id, styles) {
             if style.display == crate::Display::Block && style.width == crate::Dimension::Auto {
                 // A pure-text block is still a fill-available block. Its shaped
@@ -16720,8 +16870,29 @@ mod tests {
                 #target { width:1px; height:1px }
                 @container (width >= 440px) { #target { width:44px } }
                 @container (width > 499px) { #target { width:50px } }
+                #unit-var { --quarter: calc(100cqw / 4); width: var(--quarter) }
+                #unit-bare { width:25cqw }
+                #unit-skip { display:contents; container-type:inline-size }
+                #unit-contents { width:10cqw }
+                #unit-block-axis { width:10cqmin; height:10cqh }
+                #unit-max { width:10cqmax }
+                #unit-inner { container-type:inline-size; width:200px }
+                #unit-nested { width:50cqi }
+                #unit-margin { width:1px; margin-left:10cqw }
+                #unit-inset { width:1px; position:relative; left:5cqw }
+                #unit-infinite { width:infcqw }
+                #unit-nan { width:nancqw }
+                #unit-overflow { width:1e39cqw }
             </style></head><body>
-                <div id="container"><div id="target"></div></div>
+                <div id="container"><div id="target"></div>
+                    <div id="unit-var"></div><div id="unit-bare"></div>
+                    <div id="unit-skip"><div id="unit-contents"></div></div>
+                    <div id="unit-block-axis"></div><div id="unit-max"></div>
+                    <div id="unit-inner"><div id="unit-nested"></div></div>
+                    <div id="unit-margin"></div><div id="unit-inset"></div>
+                    <div id="unit-infinite"></div><div id="unit-nan"></div>
+                    <div id="unit-overflow"></div>
+                </div>
             </body></html>"#,
         );
         let (laid, telemetry) =
@@ -16730,11 +16901,57 @@ mod tests {
         let target = tree.get_element_by_id("target").unwrap();
         assert!((laid.rects[&container].width - 500.0).abs() < 0.1);
         assert_eq!(laid.styles[&target].width, crate::Dimension::Px(44.0));
+        // cq units resolve against the 440px content box of the nearest
+        // eligible container. The inline-size container has no block axis,
+        // so cqh falls back to the 720px viewport height.
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let content_x = laid.rects[&container].x + 30.0;
+        for (id, width) in [
+            ("unit-var", 110.0),
+            ("unit-bare", 110.0),
+            ("unit-contents", 44.0),
+            ("unit-block-axis", 44.0),
+            ("unit-max", 72.0),
+            ("unit-nested", 100.0),
+        ] {
+            assert!((rect(id).width - width).abs() < 0.1, "{id}: {:?}", rect(id));
+        }
+        assert!((rect("unit-block-axis").height - 72.0).abs() < 0.1);
+        assert!((rect("unit-margin").x - (content_x + 44.0)).abs() < 0.1);
+        assert!((rect("unit-inset").x - (content_x + 22.0)).abs() < 0.1);
+        for id in ["unit-infinite", "unit-nan", "unit-overflow"] {
+            assert!((rect(id).width - 440.0).abs() < 0.1, "{id}: {:?}", rect(id));
+        }
         assert_eq!(telemetry.passes, 2);
         assert_eq!(
             telemetry.termination,
             ContainerLayoutTermination::GeometryStable
         );
+
+        // Pass 3 resolves 10cqi against the inner box's final 250px width.
+        // Inline-size snapshots ignore the changed block size. A size
+        // container records that height and needs one more stable pass;
+        // unchanged query decisions alone cannot end that case early.
+        for (late_style, expected_passes) in [("", 3), ("container-type:size; width:1px", 4)] {
+            let tree = parse_html(&format!(
+                r#"<style>
+                    #outer {{ container-type:inline-size; width:500px }}
+                    #inner {{ container-type:inline-size }}
+                    #late {{ {late_style} }}
+                    @container (width > 400px) {{ #inner {{ width:250px }} }}
+                    @container (width > 100px) {{ #late {{ height:10cqi }} }}
+                </style><div id="outer"><div id="inner"><div id="late"></div></div></div>"#,
+            ));
+            let (laid, telemetry) =
+                layout_dom_with_web_fonts_measured(&tree, (1280.0, 720.0), &HashMap::new(), &[]);
+            let target = tree.get_element_by_id("late").unwrap();
+            assert!((laid.rects[&target].height - 25.0).abs() < 0.1, "{late_style}");
+            assert_eq!(telemetry.passes, expected_passes, "{late_style}");
+            assert_eq!(
+                telemetry.termination,
+                ContainerLayoutTermination::GeometryStable
+            );
+        }
     }
 
     #[test]
@@ -17773,11 +17990,15 @@ mod tests {
     #[test]
     fn layout_without_container_queries_keeps_one_pass_fast_path() {
         let tree = parse_html(
-            r#"<html><head><style>#target{width:25px}</style></head>
-               <body><div id="target"></div></body></html>"#,
+            r#"<html><head><style>#target{width:25px}#units{width:10cqw}</style></head>
+               <body><div id="target"></div><div id="units"></div></body></html>"#,
         );
-        let (_, telemetry) =
+        let (laid, telemetry) =
             layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+        // Without an eligible container, cq units use the viewport and need
+        // no container-query pass.
+        let units = tree.get_element_by_id("units").unwrap();
+        assert!((laid.rects[&units].width - 80.0).abs() < 0.1);
         assert_eq!(
             telemetry,
             ContainerLayoutTelemetry {
@@ -17789,6 +18010,26 @@ mod tests {
                 retained_fallback: 0,
             }
         );
+
+        // Danse uses container units without @container rules. A query
+        // container is enough to require geometry convergence. A fallback
+        // axis alone must keep the one-pass path.
+        for (declaration, width, height, passes, termination) in [
+            ("width:25cqw", 125.0, 0.0, 2, ContainerLayoutTermination::GeometryStable),
+            ("height:10cqh", 500.0, 60.0, 1, ContainerLayoutTermination::NoQueries),
+        ] {
+            let tree = parse_html(&format!(
+                r#"<style>#container{{container-type:inline-size;width:500px}}
+                #unit{{{declaration}}}</style><div id="container"><div id="unit"></div></div>"#,
+            ));
+            let (laid, telemetry) =
+                layout_dom_with_web_fonts_measured(&tree, (800.0, 600.0), &HashMap::new(), &[]);
+            let unit = tree.get_element_by_id("unit").unwrap();
+            assert!((laid.rects[&unit].width - width).abs() < 0.1, "{declaration}");
+            assert!((laid.rects[&unit].height - height).abs() < 0.1, "{declaration}");
+            assert_eq!(telemetry.passes, passes, "{declaration}");
+            assert_eq!(telemetry.termination, termination, "{declaration}");
+        }
     }
 
     #[test]

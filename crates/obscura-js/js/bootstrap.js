@@ -5049,7 +5049,9 @@ class Element extends Node {
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
     if (_formValues[this._nid] !== undefined) return _sanitizeEmailValue(this, _formValues[this._nid]);
-    if (tag === 'textarea') return this.textContent;
+    // A pristine textarea's raw value follows its child text (defaultValue);
+    // the API value normalizes CRLF and CR to LF.
+    if (tag === 'textarea') return this.textContent.replace(/\r\n?/g, '\n');
     if (tag === 'option') {
       const attr = this.getAttribute('value');
       return attr !== null ? attr : this.textContent;
@@ -5099,12 +5101,12 @@ class Element extends Node {
       }
       return;
     }
-    const value = _sanitizeEmailValue(this, String(v));
+    // A textarea's dirty value is native form state, painted from layout; its
+    // child text stays the default value.
+    const text = String(v);
+    const value = tag === 'textarea' ? text.replace(/\r\n?/g, '\n') : _sanitizeEmailValue(this, text);
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
-    if (tag === 'textarea') {
-      this.textContent = value;
-    }
   }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
@@ -5628,7 +5630,7 @@ class Element extends Node {
         const opt = f.querySelector('option[selected]') || f.querySelector('option');
         val = opt ? (opt.getAttribute('value') !== null ? opt.getAttribute('value') : opt.textContent) : '';
       } else if (tag === 'textarea') {
-        val = f.value || f.textContent || '';
+        val = f.value;
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
@@ -14336,6 +14338,12 @@ globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = class HTMLInputElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+  // The defaults reflect the content attributes. A pristine control follows
+  // them; a dirty value or checkedness stays in native form state.
+  get defaultValue() { const v = this.getAttribute('value'); return v === null ? '' : v; }
+  set defaultValue(v) { this.setAttribute('value', String(v)); }
+  get defaultChecked() { return this.hasAttribute('checked'); }
+  set defaultChecked(v) { if (v) this.setAttribute('checked', ''); else this.removeAttribute('checked'); }
 };
 // Framework value trackers read own prototype descriptors, not inherited ones.
 Object.defineProperties(HTMLInputElement.prototype, {
@@ -14384,6 +14392,10 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
     return Number.isFinite(v) && v > 0 ? v : 20;
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
+  // The default value is the child text (raw, without newline
+  // normalization). It is a DOMString, so null and undefined stringify.
+  get defaultValue() { return this.textContent; }
+  set defaultValue(v) { this.textContent = String(v); }
 };
 globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
@@ -17750,7 +17762,7 @@ if (typeof FileReader === 'undefined') {
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
 
-// Real network sockets aren't implemented; we don't have a runtime WS / SSE
+// Real network sockets aren't implemented; we don't have a runtime WebSocket
 // client in V8. But pages that wait for an `open` event (Vite HMR clients
 // embedded on docs sites, live-dashboards, anything calling
 // `await new Promise(r => ws.addEventListener('open', r))`) silently hang
@@ -17760,7 +17772,7 @@ if (typeof FileReader === 'undefined') {
 // Minimal EventTarget shared by socket-like classes. Real `EventTarget` is
 // currently aliased to `Node`, which would drag DOM-tree assumptions into a
 // `WebSocket`. Defining a private shim avoids that.
-function _makeListenerBox(self) {
+function _makeListenerBox(self, reportError) {
   const map = new Map();
   self.addEventListener = function (type, fn) {
     if (typeof fn !== 'function') return;
@@ -17778,30 +17790,113 @@ function _makeListenerBox(self) {
     const bucket = map.get(event.type);
     if (!bucket) return true;
     for (const fn of bucket.slice()) {
-      try { fn.call(self, event); } catch (e) { /* swallow */ }
+      try { fn.call(self, event); } catch (e) { if (reportError) reportError(e); }
     }
     return true;
   };
 }
 
 if (typeof EventSource === 'undefined') {
+  // HTML EventSource over the scripted-fetch transport. The native op parses
+  // the open response incrementally; close() cancels the request. A frame's
+  // stream stops with the frame's timers, and its retired realm gets no events.
+  const CONNECTING = 0, OPEN = 1, CLOSED = 2;
   globalThis.EventSource = class EventSource {
+    #generation = 0; #cancelRid; #streamRid; #timer = null;
+    #retry = 3000; #lastEventId = ''; #origin = '';
     constructor(url, init) {
-      this.url = url;
-      this.readyState = 0; // CONNECTING
+      let resolved;
+      try { resolved = new URL(_resolveUrl(url)).href; } catch (e) {
+        throw new DOMException("Failed to construct 'EventSource': The URL '" + url + "' is invalid.", 'SyntaxError');
+      }
+      this.url = resolved;
+      this.readyState = CONNECTING;
       this.withCredentials = !!(init && init.withCredentials);
       this.onopen = null; this.onmessage = null; this.onerror = null;
-      _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
-        this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
-      });
+      _makeListenerBox(this, _reportMutationObserverError);
+      this.#connect();
     }
-    close() { this.readyState = 2; }
-    static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+    close() {
+      this.#generation++;
+      this.readyState = CLOSED;
+      if (this.#timer !== null) { clearTimeout(this.#timer); this.#timer = null; }
+      this.#release();
+    }
+    #fire(event) {
+      event.target = event.currentTarget = this;
+      const handler = event.type === 'open' || event.type === 'message' || event.type === 'error'
+        ? this['on' + event.type] : null;
+      if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) { _reportMutationObserverError(e); } }
+      this.dispatchEvent(event);
+    }
+    #retired() {
+      if (_browserPostedTaskGeneration() >= 0) return false;
+      this.close();
+      return true;
+    }
+    #release() {
+      if (this.#streamRid !== undefined) { __obscuraCore.ops.op_try_close(this.#streamRid); this.#streamRid = undefined; }
+      if (this.#cancelRid !== undefined) { __obscuraCore.ops.op_try_close(this.#cancelRid); this.#cancelRid = undefined; }
+    }
+    async #connect() {
+      const generation = ++this.#generation;
+      const cancelRid = this.#cancelRid = __obscuraCore.ops.op_fetch_cancel_handle();
+      const headers = { Accept: 'text/event-stream' };
+      if (this.#lastEventId) headers['Last-Event-ID'] = this.#lastEventId;
+      const pageOrigin = (function() { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch(e) { return ""; } })();
+      let response;
+      try {
+        response = JSON.parse(await __obscuraCore.ops.op_fetch_url(this.url, 'GET', JSON.stringify(headers),
+          new Uint8Array(0), pageOrigin, 'cors', this.withCredentials ? 'include' : 'same-origin',
+          { cancel_rid: cancelRid, destination: 'EventSource', frame_id: _realmFrameId }));
+      } catch (e) {
+        return this.#reconnect(generation);
+      }
+      if (generation !== this.#generation || this.#retired()) {
+        if (response.streamRid != null) __obscuraCore.ops.op_try_close(response.streamRid);
+        return;
+      }
+      // Policy blocks, CORS failures, non-200 status and other MIME types
+      // fail the connection without a stream.
+      if (response.streamRid == null) return this.#fail(generation);
+      this.#streamRid = response.streamRid;
+      this.#origin = new URL(response.url).origin;
+      this.readyState = OPEN;
+      this.#fire(new Event('open'));
+      while (generation === this.#generation) {
+        let batch = null;
+        try { batch = await __obscuraCore.ops.op_event_stream_read(response.streamRid); } catch (e) {}
+        if (generation !== this.#generation || batch === null) break;
+        if (batch.retry != null) this.#retry = batch.retry;
+        for (const message of batch.events) {
+          if (generation !== this.#generation || this.#retired()) return;
+          this.#lastEventId = message.lastEventId;
+          this.#fire(new MessageEvent(message.type, {
+            data: message.data, origin: this.#origin, lastEventId: message.lastEventId,
+          }));
+        }
+        if (generation === this.#generation) this.#lastEventId = batch.lastEventId;
+      }
+      this.#reconnect(generation);
+    }
+    #reconnect(generation) {
+      if (generation !== this.#generation || this.readyState === CLOSED || this.#retired()) return;
+      this.#release();
+      this.readyState = CONNECTING;
+      this.#fire(new Event('error'));
+      if (generation !== this.#generation || this.readyState !== CONNECTING) return;
+      this.#timer = setTimeout(() => {
+        this.#timer = null;
+        if (generation === this.#generation && this.readyState === CONNECTING) this.#connect();
+      }, Math.min(this.#retry, 2147483647));
+    }
+    #fail(generation) {
+      if (generation !== this.#generation || this.readyState === CLOSED || this.#retired()) return;
+      this.#release();
+      this.readyState = CLOSED;
+      this.#fire(new Event('error'));
+    }
+    static CONNECTING = CONNECTING; static OPEN = OPEN; static CLOSED = CLOSED;
   };
 }
 
@@ -18492,14 +18587,20 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       // before renderer-backed hit testing was available.
       return this.body || this.documentElement || null;
     }
-    var all = this.querySelectorAll('*');
+    return _syntheticHit(this, x, y, null) || this.body || this.documentElement || null;
+  };
+  // Synthetic-geometry hit test for builds without the renderer. Returns the
+  // topmost element; when hits is an array, it also receives every element
+  // under the point in tree order.
+  function _syntheticHit(doc, x, y, hits) {
+    var all = doc.querySelectorAll('*');
     var best = null;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
       // documentElement / body span the viewport; skip them so we pick a
       // real descendant instead of falling back to <html>/<body>.
-      if (el === this.documentElement || el === this.body) continue;
+      if (el === doc.documentElement || el === doc.body) continue;
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       // The renderer resolves this inherited property and carries it with the
@@ -18513,7 +18614,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         // instead of the page behind it.
         var visible = true;
         var ancestor = el.parentElement;
-        while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
+        while (ancestor && ancestor !== doc.documentElement && ancestor !== doc.body) {
           var style = null;
           try { style = getComputedStyle(ancestor); } catch (_e) {}
           var ox = style ? (style.overflowX || style.overflow || '') : '';
@@ -18540,6 +18641,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
+        if (hits) hits.push(el);
         if (!best || best.contains(el)) {
           best = el;
         } else if (!el.contains(best)) {
@@ -18552,11 +18654,35 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         }
       }
     }
-    return best || this.body || this.documentElement || null;
-  };
+    return best;
+  }
+  // CSSOM View: every hit-testable element at the point, topmost first, with
+  // the document element last. Unlike elementFromPoint, the root is not
+  // replaced with the body.
   Document.prototype.elementsFromPoint = function(x, y) {
-    var el = this.elementFromPoint(x, y);
-    return el ? [el] : [];
+    const method = _documentRealmMember(this, 'elementsFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return [];
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    if (x < 0 || y < 0 || x > w || y > h) return [];
+    var hits = [];
+    if (typeof __obscuraCore.ops.op_layout_hit_list === 'function') {
+      var raw = __obscuraCore.ops.op_layout_hit_list(x, y, _realmFrameId);
+      if (raw) hits = JSON.parse(raw).map(_wrapEl).filter(Boolean);
+    } else {
+      // Later synthetic boxes cover earlier ones; the elementFromPoint winner
+      // stays first. The viewport-sized body and root are under every point.
+      var best = _syntheticHit(this, x, y, hits);
+      hits.reverse();
+      if (best) hits.unshift(hits.splice(hits.indexOf(best), 1)[0]);
+      if (this.body) hits.push(this.body);
+    }
+    var root = this.documentElement;
+    if (root && hits[hits.length - 1] !== root) hits.push(root);
+    return hits;
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
@@ -18678,7 +18804,7 @@ const _installCaretGeometry = (function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported', 'importNode', 'adoptNode'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'elementsFromPoint', 'queryCommandSupported', 'importNode', 'adoptNode'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
