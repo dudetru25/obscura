@@ -25,6 +25,24 @@ LATENCY_FAILURE_DELTA_MS = 10.0
 RSS_FAILURE_RATIO = 1.15
 RSS_FAILURE_DELTA_KIB = 8 * 1024
 HTML = b"<!doctype html><html><body><main id='root'></main></body></html>"
+# Hit-test page: a 20-deep container chain with a leaf, 1500 in-flow rows and a
+# fixed z-index 5 overlay above (50, 50). Probes check exact, topmost-first hits.
+HIT_PAGE = (
+    "let p=document.getElementById('root'),ids=[];"
+    "for(let i=1;i<=20;i++){let d=document.createElement('div');d.id='c'+i;d.style.padding='2px';p.append(d);ids.unshift(d.id);p=d;}"
+    "let leaf=document.createElement('div');leaf.id='leaf';leaf.style.height='20px';p.append(leaf);"
+    "for(let i=0;i<1500;i++){let r=document.createElement('div');r.className='row';r.style.height='20px';r.textContent='row-'+i;document.getElementById('root').append(r);}"
+    "let ghost=document.createElement('div');ghost.id='ghost';ghost.style.cssText='position:fixed;left:0;top:0;width:60px;height:60px;z-index:5';document.body.append(ghost);"
+    "let want=['ghost','leaf',...ids,'root','BODY','HTML'].join();"
+)
+HIT_ONE = "document.elementFromPoint(50,50)===ghost"
+HIT_LIST = "document.elementsFromPoint(50,50).map(e=>e.id||e.tagName).join()===want"
+
+
+def hit_scenario(probe: str, calls: int) -> tuple[str, int]:
+    return f"(() => {{{HIT_PAGE}let n=0;for(let i=0;i<{calls};i++)if({probe})n++;return n;}})()", calls
+
+
 SCENARIOS = {
     "dom-build": (
         "(function(){var r=document.getElementById('root');for(var i=0;i<5000;i++){var e=document.createElement('div');e.className='row';e.textContent='item-'+i;r.appendChild(e);}return r.children.length;})()",
@@ -68,12 +86,20 @@ SCENARIOS = {
         "(() => {let r=document.getElementById('root');r.innerHTML='<div></div>'.repeat(200);let a=r.querySelectorAll('div');let n=0;for(let i=0;i<1000;i++){let d=a[i%200];d.textContent='v'+i+' '+i*7;if(d.offsetHeight>0)n++;}for(let i=0;i<200;i++)if(a[i].textContent==='v'+(800+i)+' '+(800+i)*7)n++;return n;})()",
         1200,
     ),
+    # Same page and one geometry read: the shared startup and layout control.
+    "hit-layout-control": hit_scenario("leaf.offsetHeight===20", 1),
+    "hit-one-1": hit_scenario(HIT_ONE, 1),
+    "hit-one-200": hit_scenario(HIT_ONE, 200),
+    "hit-list-1": hit_scenario(HIT_LIST, 1),
+    "hit-list-200": hit_scenario(HIT_LIST, 200),
 }
+# Exact hit order proves the geometry; hit tests have no container-query telemetry.
+HIT_SCENARIOS = {"hit-layout-control", "hit-one-1", "hit-one-200", "hit-list-1", "hit-list-200"}
 
 
-# The base engine predates this feature. Measure only the candidate feature
+# The base engine predates these features. Measure only the candidate feature
 # cost; shared controls retain the paired regression thresholds.
-CANDIDATE_ONLY = {"container-units-layout"}
+CANDIDATE_ONLY = {"container-units-layout", "hit-list-1", "hit-list-200"}
 FALLBACK_TERMINATIONS = {"PassCapFallback", "OscillationFallback"}
 TIMING_LINE = re.compile(
     r"^\[timing\] .*\bcq_passes=(\d+) cq_termination=(\S+) .*\bretained_fallback=(\d+)$"
@@ -279,6 +305,8 @@ def main() -> None:
                     samples[scenario][label]["cpu_ms"].append(cpu_ms)
                     samples[scenario][label]["rss_kib"].append(rss_kib)
             probes[scenario] = {}
+            if scenario in HIT_SCENARIOS:
+                continue
             for label, binary in engines:
                 result, telemetry = probe_layout(binary, url, expression, expected)
                 probes[scenario][label] = {"result": result, **telemetry}
@@ -299,24 +327,25 @@ def main() -> None:
     ]
     failures = []
     for scenario in scenarios:
-        candidate_probe = probes[scenario]["candidate"]
-        if FALLBACK_TERMINATIONS & set(candidate_probe["cq_termination"]):
-            failures.append(f"{scenario} candidate layout fell back: {candidate_probe['cq_termination']}")
-        if scenario not in CANDIDATE_ONLY:
-            for label in ("base", "candidate"):
-                if set(probes[scenario][label]["cq_passes"]) != {"1"}:
-                    failures.append(f"{scenario} {label} left the one-pass layout path")
-        if scenario in CANDIDATE_ONLY and (
-            candidate_probe["cq_passes"].get("2", 0) < 1000
-            or set(candidate_probe["cq_passes"]) - {"1", "2"}
-            or "GeometryStable" not in candidate_probe["cq_termination"]
-        ):
-            failures.append(f"{scenario} candidate did not use the expected two-pass layout path")
+        if scenario not in HIT_SCENARIOS:
+            candidate_probe = probes[scenario]["candidate"]
+            if FALLBACK_TERMINATIONS & set(candidate_probe["cq_termination"]):
+                failures.append(f"{scenario} candidate layout fell back: {candidate_probe['cq_termination']}")
+            if scenario not in CANDIDATE_ONLY:
+                for label in ("base", "candidate"):
+                    if set(probes[scenario][label]["cq_passes"]) != {"1"}:
+                        failures.append(f"{scenario} {label} left the one-pass layout path")
+            if scenario in CANDIDATE_ONLY and (
+                candidate_probe["cq_passes"].get("2", 0) < 1000
+                or set(candidate_probe["cq_passes"]) - {"1", "2"}
+                or "GeometryStable" not in candidate_probe["cq_termination"]
+            ):
+                failures.append(f"{scenario} candidate did not use the expected two-pass layout path")
+            if scenario not in CANDIDATE_ONLY and (
+                candidate_probe["retained_fallback"] > probes[scenario]["base"]["retained_fallback"]
+            ):
+                failures.append(f"{scenario} candidate increased retained layout fallbacks")
         comparable = scenario not in CANDIDATE_ONLY
-        if comparable and (
-            candidate_probe["retained_fallback"] > probes[scenario]["base"]["retained_fallback"]
-        ):
-            failures.append(f"{scenario} candidate increased retained layout fallbacks")
         base_latency = median(samples[scenario]["base"]["latency_ms"]) if comparable else None
         pr_latency = median(samples[scenario]["candidate"]["latency_ms"])
         base_rss = median(samples[scenario]["base"]["rss_kib"]) if comparable else None

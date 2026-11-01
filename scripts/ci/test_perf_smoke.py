@@ -146,6 +146,38 @@ class ProcessMeasurementTests(unittest.TestCase):
                 perf_smoke.main()
             errors.assert_any_call("::error::div-text-layout candidate increased retained layout fallbacks")
 
+    def test_hit_tests_skip_layout_telemetry_and_report_before_failing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base, candidate, output = root / "base", root / "candidate", root / "results.json"
+            base.touch()
+            candidate.touch()
+
+            def measure(binary, url, expression, expected, screenshot):
+                return (130.0 if binary == candidate else 100.0), 8192, 50.0, expected, ""
+
+            arguments = ["perf_smoke.py", "--base", str(base), "--candidate", str(candidate),
+                         "--output", str(output), "--scenario", "hit-one-200", "--scenario", "hit-list-200"]
+            with patch.object(sys, "argv", arguments), patch.object(perf_smoke, "ROUNDS", 2), \
+                    patch.object(perf_smoke, "run_once", side_effect=measure), \
+                    patch.object(perf_smoke, "probe_layout") as probe, \
+                    patch.object(perf_smoke, "add_summary"), patch("builtins.print") as errors, \
+                    self.assertRaises(SystemExit):
+                perf_smoke.main()
+            probe.assert_not_called()
+            report = json.loads(output.read_text())["scenarios"]
+            single, listed = report["hit-one-200"], report["hit-list-200"]
+            self.assertEqual(single["pair_order"], [["base", "candidate"], ["candidate", "base"]])
+            self.assertEqual(single["evaluations"], {"base": [200, 200], "candidate": [200, 200]})
+            self.assertEqual(single["samples"]["candidate"]["cpu_ms"], [50.0, 50.0])
+            self.assertAlmostEqual(single["latency_ratio"], 1.3)
+            self.assertEqual(listed["pair_order"], [["candidate"], ["candidate"]])
+            self.assertEqual(listed["evaluations"], {"candidate": [200, 200]})
+            self.assertIsNone(listed["latency_ratio"])
+            self.assertEqual(listed["telemetry"], {})
+            failures = [call.args[0] for call in errors.call_args_list if str(call.args[0]).startswith("::error::")]
+            self.assertEqual(failures, ["::error::hit-one-200 latency is 1.30x the base"])
+
 
 if __name__ == "__main__":
     unittest.main()
